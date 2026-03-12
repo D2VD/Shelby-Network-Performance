@@ -21,49 +21,38 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: `Init failed: ${err.message}` }, { status: 500 });
   }
 
-  const blobData         = generatePayload(bytes);
-  const blobName         = `bench-${bytes}-${Date.now()}`;
-  const expirationMicros = (Date.now() + 2 * 60 * 60 * 1000) * 1000;
+  const blobData = generatePayload(bytes);
+
+  // blobName: simple string, no slash at end, max 1024 chars
+  const blobName = `bench-${bytes}-${Date.now()}`;
+
+  // expirationMicros must be BigInt to avoid JS integer overflow
+  // Date.now() is ms, microseconds = ms * 1000
+  // Add 2 hours (2 * 60 * 60 * 1e6 microseconds)
+  const nowMicros = BigInt(Date.now()) * 1000n;
+  const twoHoursMicros = 2n * 60n * 60n * 1_000_000n;
+  const expirationMicros = nowMicros + twoHoursMicros;
 
   const t0 = performance.now();
   try {
-    let result: any;
-    const errors: string[] = [];
-
-    // Try 1: full args with blobName
-    try {
-      result = await client.upload({ blobData, signer: account, blobName, expirationMicros });
-    } catch (e1: any) {
-      errors.push(`v1: ${e1.message}`);
-      // Try 2: with 'name' key instead of 'blobName'
-      try {
-        result = await client.upload({ blobData, signer: account, name: blobName, expirationMicros });
-      } catch (e2: any) {
-        errors.push(`v2: ${e2.message}`);
-        // Try 3: minimal args
-        try {
-          result = await client.upload({ blobData, signer: account, expirationMicros });
-        } catch (e3: any) {
-          errors.push(`v3: ${e3.message}`);
-          throw new Error(`All upload attempts failed:\n${errors.join("\n")}`);
-        }
-      }
-    }
+    await client.upload({
+      blobData,
+      signer: account,
+      blobName,
+      expirationMicros,
+    });
 
     const elapsed  = performance.now() - t0;
     const speedKbs = (bytes / 1024) / (elapsed / 1000);
 
-    const txHash = result?.transaction?.hash ?? result?.txHash ?? result?.hash ?? result?.tx_hash ?? null;
-    const actualBlobName = result?.blobName ?? result?.name ?? result?.blob_name ?? blobName;
-    const blobId   = result?.blobId   ?? result?.blob_id   ?? result?.id   ?? null;
-    const blobSize = result?.size      ?? result?.blobSize  ?? bytes;
-    const status   = result?.status   ?? "uploaded";
-
     return NextResponse.json({
-      bytes, elapsed, speedKbs,
-      blobName: actualBlobName,
-      blobId, txHash, status,
-      blobSize,
+      bytes,
+      elapsed,
+      speedKbs,
+      blobName,
+      txHash: null, // upload() returns void per SDK type
+      status: "uploaded",
+      blobSize: bytes,
     });
   } catch (err: any) {
     return NextResponse.json({ error: err.message ?? "Upload failed" }, { status: 500 });

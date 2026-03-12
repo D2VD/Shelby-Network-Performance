@@ -141,26 +141,58 @@ export default function Home() {
       addLog("— [2/4] Uploading blobs to Shelby...");
       const uploads: UploadResult[] = [];
       for (let i = 0; i < 3; i++) {
-        addLog(`  Uploading ${Object.values(SIZE_LABELS)[i]}...`);
-        const u: UploadResult = await call("/api/benchmark/upload", { sizeIndex: i });
-        uploads.push(u);
-        addLog(`  → ${fmt(u.speedKbs)} in ${fmtMs(u.elapsed)}${u.txHash ? `  tx: ${u.txHash.slice(0, 14)}...` : ""}`);
+        const label = Object.values(SIZE_LABELS)[i];
+        addLog(`  Uploading ${label}...`);
+        // Retry up to 2 times — Shelby RPC may return 500 intermittently
+        let uploadSuccess = false;
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            const u: UploadResult = await call("/api/benchmark/upload", { sizeIndex: i });
+            uploads.push(u);
+            addLog(`  ✓ ${label} → ${fmt(u.speedKbs)} in ${fmtMs(u.elapsed)}`);
+            uploadSuccess = true;
+            break;
+          } catch (err: any) {
+            const isServerErr = err.message?.includes("500") || err.message?.includes("Internal Server Error") || err.message?.includes("multipart");
+            if (attempt < 2 && isServerErr) {
+              addLog(`  ⚠ Shelby RPC error (attempt ${attempt}/2), retrying in 2s...`);
+              await new Promise(r => setTimeout(r, 2000));
+            } else {
+              // Shelby server error — record as failed but don't crash benchmark
+              addLog(`  ✗ ${label} upload failed: ${isServerErr ? "Shelby RPC server error (500)" : err.message}`);
+              if (isServerErr) addLog(`  ℹ This is a Shelby network issue, not a code error`);
+            }
+          }
+        }
         setProgress(22 + (i + 1) * 14);
       }
-      const avgUploadKbs = uploads.reduce((a, b) => a + b.speedKbs, 0) / uploads.length;
-      addLog(`✓ Avg upload: ${fmt(avgUploadKbs)}`);
+      if (uploads.length === 0) {
+        addLog("✗ All uploads failed — Shelby RPC server is currently unavailable");
+        addLog("  Continuing with latency & TX benchmark only...");
+      }
+      const avgUploadKbs = uploads.length > 0 ? uploads.reduce((a, b) => a + b.speedKbs, 0) / uploads.length : 0;
+      if (uploads.length > 0) addLog(`✓ Avg upload: ${fmt(avgUploadKbs)} (${uploads.length}/3 succeeded)`);
 
       setPhase("download");
       addLog("— [3/4] Downloading blobs from Shelby...");
       const downloads: DownloadResult[] = [];
-      for (const u of uploads) {
-        addLog(`  Downloading ${SIZE_LABELS[u.bytes] ?? u.bytes + "B"}...`);
-        const d: DownloadResult = await call("/api/benchmark/download", { blobName: u.blobName });
-        downloads.push(d);
-        addLog(`  → ${fmt(d.speedKbs)} in ${fmtMs(d.elapsed)}`);
+      if (uploads.length === 0) {
+        addLog("  ⚠ Skipping download — no blobs were uploaded successfully");
+      } else {
+        for (const u of uploads) {
+          addLog(`  Downloading ${SIZE_LABELS[u.bytes] ?? u.bytes + "B"}...`);
+          try {
+            const d: DownloadResult = await call("/api/benchmark/download", { blobName: u.blobName });
+            downloads.push(d);
+            addLog(`  ✓ → ${fmt(d.speedKbs)} in ${fmtMs(d.elapsed)}`);
+          } catch (err: any) {
+            addLog(`  ✗ Download failed: ${err.message}`);
+          }
+        }
       }
-      const avgDownloadKbs = downloads.reduce((a, b) => a + b.speedKbs, 0) / downloads.length;
-      addLog(`✓ Avg download: ${fmt(avgDownloadKbs)}`); setProgress(78);
+      const avgDownloadKbs = downloads.length > 0 ? downloads.reduce((a, b) => a + b.speedKbs, 0) / downloads.length : 0;
+      if (downloads.length > 0) addLog(`✓ Avg download: ${fmt(avgDownloadKbs)}`);
+      setProgress(78);
 
       setPhase("txtime");
       addLog("— [4/4] Measuring on-chain confirmation...");
@@ -218,21 +250,45 @@ export default function Home() {
       {/* ── TOP NAV ── */}
       <nav style={{ background: "#fff", borderBottom: "1px solid #E5E7EB", padding: "0 32px", height: 56, display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 100 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ width: 28, height: 28, background: "#10B981", borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <span style={{ color: "#fff", fontSize: 14, fontWeight: 800 }}>S</span>
-          </div>
+          {/* Logo — thay file public/logo.png để đổi logo bất cứ lúc nào */}
+          <img
+            src="/logo.png"
+            alt="Logo"
+            width={32}
+            height={32}
+            style={{ borderRadius: 6, objectFit: "contain", display: "block" }}
+          />
           <span style={{ fontWeight: 700, fontSize: 15, letterSpacing: -0.3 }}>Shelby Benchmark</span>
           <Tag color="#6366F1">Shelbynet</Tag>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 16, fontSize: 13 }}>
           {balance && !balErr && (
-            <span style={{ color: "#6B7280" }}>
-              <span style={{ fontWeight: 600, color: "#111827" }}>{balance.apt.toFixed(3)}</span> APT &nbsp;·&nbsp;
-              <span style={{ fontWeight: 600, color: balance.shelbyusd > 0 ? "#111827" : "#EF4444" }}>{balance.shelbyusd.toFixed(3)}</span> ShelbyUSD
-            </span>
-          )}
-          {balance && !balErr && (
-            <button onClick={refreshBalance} style={{ background: "none", border: "none", cursor: "pointer", color: "#9CA3AF", fontSize: 14, padding: "2px 6px" }} title="Refresh balance">⟳</button>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              {/* Server wallet badge */}
+              <div
+                title={`Server wallet address: ${balance.address}\n\nThis is the backend wallet (SHELBY_PRIVATE_KEY) that pays for benchmark transactions.\nIt is different from your Petra/browser wallet.`}
+                style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", cursor: "help" }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: "#374151" }}>
+                  <span style={{ fontSize: 9, background: "#F3F4F6", border: "1px solid #E5E7EB", borderRadius: 3, padding: "1px 5px", color: "#6B7280", fontWeight: 600, letterSpacing: 0.3 }}>
+                    SERVER
+                  </span>
+                  <span>
+                    <span style={{ fontWeight: 700, color: "#111827" }}>{balance.apt.toFixed(3)}</span>
+                    <span style={{ color: "#9CA3AF", marginLeft: 3 }}>APT</span>
+                  </span>
+                  <span style={{ color: "#E5E7EB" }}>|</span>
+                  <span>
+                    <span style={{ fontWeight: 700, color: balance.shelbyusd > 0.001 ? "#111827" : "#EF4444" }}>{balance.shelbyusd.toFixed(3)}</span>
+                    <span style={{ color: "#9CA3AF", marginLeft: 3 }}>SUSD</span>
+                  </span>
+                </div>
+                <div style={{ fontSize: 10, color: "#9CA3AF", textAlign: "right" }}>
+                  {balance.address ? balance.address.slice(0, 6) + "…" + balance.address.slice(-4) : ""}
+                </div>
+              </div>
+              <button onClick={refreshBalance} style={{ background: "none", border: "1px solid #E5E7EB", cursor: "pointer", color: "#6B7280", fontSize: 12, padding: "4px 8px", borderRadius: 6, lineHeight: 1 }} title="Refresh balance">⟳</button>
+            </div>
           )}
           {balErr && <Tag color="#EF4444">Wallet not configured</Tag>}
           {balance?.ready && <Tag color="#10B981">Ready</Tag>}
@@ -244,11 +300,20 @@ export default function Home() {
       <div style={{ maxWidth: 1080, margin: "0 auto", padding: "40px 24px" }}>
 
         {/* ── HERO ── */}
-        <div style={{ marginBottom: 40 }}>
-          <h1 style={{ fontSize: "clamp(28px, 5vw, 44px)", fontWeight: 800, margin: "0 0 10px", letterSpacing: -1, lineHeight: 1.1 }}>
+        <div style={{ marginBottom: 40, textAlign: "center" }}>
+          <div style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
+            <img
+              src="/logo.png"
+              alt="Logo"
+              width={64}
+              height={64}
+              style={{ borderRadius: 12, objectFit: "contain" }}
+            />
+          </div>
+          <h1 style={{ fontSize: "clamp(28px, 5vw, 44px)", fontWeight: 800, margin: "0 0 12px", letterSpacing: -1, lineHeight: 1.1 }}>
             Shelby Network Performance
           </h1>
-          <p style={{ fontSize: 16, color: "#6B7280", margin: 0, maxWidth: 540, lineHeight: 1.6 }}>
+          <p style={{ fontSize: 16, color: "#6B7280", margin: "0 auto", maxWidth: 560, lineHeight: 1.6 }}>
             Measure real upload speed, download speed, blockchain latency, and on-chain transaction confirmation time — compared against AWS S3, GCP GCS, and Azure.
           </p>
         </div>

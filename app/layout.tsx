@@ -1,19 +1,20 @@
+// 📁 app/layout.tsx
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Shelby Benchmark — Đo Hiệu Năng Mạng Lưu Trữ Phi Tập Trung",
-  description: "Công cụ đo hiệu năng Shelby Protocol trên Shelbynet — upload speed, download speed, blockchain latency. So sánh với AWS S3, GCP, Azure.",
-  openGraph: {
-    title: "Shelby Benchmark",
-    description: "Đo hiệu năng mạng lưu trữ phi tập trung Shelby vs Cloud",
-    type: "website",
-  },
+  title: "Shelby Benchmark — Shelbynet Performance",
+  description: "Measure real upload speed, download speed, blockchain latency on Shelby Protocol.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="vi">
-      <body style={{ margin: 0, padding: 0, background: "#020810" }}>
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+        <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+      </head>
+      <body suppressHydrationWarning style={{ margin: 0, padding: 0, background: "#FAFAFA" }}>
         {children}
       </body>
     </html>

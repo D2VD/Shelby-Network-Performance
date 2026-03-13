@@ -123,7 +123,7 @@ export default function ChartsPage() {
             <div style={{ fontSize: 12, color: "#AAA", marginTop: 2 }}>Real transfer measurements — requires running a benchmark</div>
           </div>
           <div style={{ padding: "40px 24px", textAlign: "center" }}>
-            <div style={{ fontSize: 36, marginBottom: 12 }}>📊</div>
+            <div style={{ fontSize: 36, marginBottom: 12 }}></div>
             <div style={{ fontSize: 14, color: "#BBB", marginBottom: 20 }}>No speed data yet — run a benchmark to populate this chart with real transfer measurements</div>
             <a href="/" style={{ padding: "10px 24px", background: "#059669", color: "#fff", borderRadius: 10, fontWeight: 600, fontSize: 13.5, textDecoration: "none" }}>
               Run Benchmark →

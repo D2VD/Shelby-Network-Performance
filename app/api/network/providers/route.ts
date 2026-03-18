@@ -67,9 +67,9 @@ async function readFromKV(
     );
 
     const providers = nodeStrings
-      .filter(Boolean)
-      .map((s: string): StorageProvider => {
-        const r: KVNodeRecord = JSON.parse(s!);
+      .filter((s): s is string => s !== null && s !== undefined)
+      .map((s): StorageProvider => {
+        const r: KVNodeRecord = JSON.parse(s);
         return {
           address:          r.address,
           addressShort:     r.addressShort,

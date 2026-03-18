@@ -1,330 +1,182 @@
-// app/dashboard/providers/page.tsx
-// Storage Providers page — shows REAL data from Shelby RPC + explorer
-// All data is fetched live; if the API is unreachable, an error is shown
 "use client";
-import { useState, useEffect, useCallback, useMemo } from "react";
-import { Nav } from "@/components/nav";
-import { StatCard, ErrorBanner, StatusBadge } from "@/components/ui";
-import { MiniBar } from "@/components/charts";
-import { ProviderMap } from "@/components/provider-map";
-import type { StorageProvider, ApiResult } from "@/lib/types";
+// app/dashboard/providers/page.tsx v3
+// Globe vẫn dùng canvas tối (đẹp hơn cho globe), UI xung quanh light
+
+import { useState, useMemo } from "react";
+import dynamic from "next/dynamic";
+import { useNetwork } from "@/components/network-context";
+import { useProviders } from "@/lib/use-providers";
+import type { StorageProvider } from "@/lib/types";
 import { ZONE_META } from "@/lib/types";
 
-type SortKey = "address" | "availabilityZone" | "state" | "health";
+const GlobeMap = dynamic(() => import("@/components/map-wrapper"), {
+  ssr: false,
+  loading: () => (
+    <div style={{ width:"100%", height:"100%", display:"flex", alignItems:"center", justifyContent:"center", background:"#0d1117", color:"#4b5563", fontFamily:"var(--font-mono)", fontSize:13, gap:10, flexDirection:"column" }}>
+      <style>{`@keyframes spin4{to{transform:rotate(360deg)}}`}</style>
+      <svg width="36" height="36" viewBox="0 0 36 36" fill="none">
+        <circle cx="18" cy="18" r="14" stroke="#1f2937" strokeWidth="2"/>
+        <circle cx="18" cy="18" r="14" stroke="#3b82f6" strokeWidth="2" strokeDasharray="22 66" strokeLinecap="round" style={{transformOrigin:"18px 18px",animation:"spin4 1.2s linear infinite"}}/>
+      </svg>
+      Loading globe…
+    </div>
+  ),
+});
 
-// ── Type helpers ──────────────────────────────────────────────────────────────
-type StateVariant  = "active" | "waiting" | "frozen" | "neutral";
-type HealthVariant = "healthy" | "faulty" | "neutral";
-
-function stateVariant(s: string): StateVariant {
-  const map: Record<string, StateVariant> = { Active: "active", Waitlisted: "waiting", Frozen: "frozen", Leaving: "neutral" };
-  return map[s] ?? "neutral";
+function Badge({ label, ok }: { label:string; ok:boolean }) {
+  return <span className={`badge badge-${ok?"green":"red"}`}><span className="badge-dot"/>{label}</span>;
 }
-function healthVariant(h: string): HealthVariant {
-  return h === "Healthy" ? "healthy" : h === "Faulty" ? "faulty" : "neutral";
+
+function GeoTag({ source }: { source?:string }) {
+  const isGeo = source === "geo-ip";
+  return <span className={`badge badge-${isGeo?"blue":"amber"}`} style={{ fontSize:10 }}>{isGeo?"Geo-IP":"Zone est."}</span>;
 }
 
-// ── Zone summary ──────────────────────────────────────────────────────────────
-function ZonePill({ zone, count, color }: { zone: string; count: number; color: string }) {
-  const meta = ZONE_META[zone];
+function ProviderPanel({ p, accentColor, network, onClose }: { p: StorageProvider&{fullBlsKey?:string}; accentColor:string; network:string; onClose:()=>void }) {
   return (
-    <div style={{ background: color + "12", border: `1px solid ${color}30`, borderRadius: 10, padding: "10px 16px" }}>
-      <div style={{ fontSize: 10, fontWeight: 600, color, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 4 }}>
-        {meta?.label ?? zone}
+    <div style={{ position:"absolute", top:16, right:16, zIndex:30, width:300, background:"rgba(13,17,23,0.96)", backdropFilter:"blur(16px)", border:`1px solid ${accentColor}44`, borderRadius:14, padding:"18px 20px", boxShadow:"0 16px 48px rgba(0,0,0,0.7)" }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
+        <div>
+          <div style={{ fontSize:9, color:"#6b7280", textTransform:"uppercase", letterSpacing:"0.12em", marginBottom:3 }}>Storage Provider</div>
+          <div style={{ fontFamily:"var(--font-mono)", fontSize:13, color:accentColor }}>{p.addressShort}</div>
+        </div>
+        <button onClick={onClose} style={{ background:"none", border:"none", cursor:"pointer", color:"#6b7280", fontSize:20, lineHeight:1 }}>×</button>
       </div>
-      <div style={{ fontSize: 22, fontWeight: 700, fontFamily: "'DM Mono', monospace", color: "#0A0A0A" }}>{count}</div>
-      <div style={{ fontSize: 11, color: "#AAA" }}>providers</div>
+      <div style={{ display:"flex", gap:6, marginBottom:12, flexWrap:"wrap" }}>
+        <Badge label={p.state} ok={p.state==="Active"}/>
+        <Badge label={p.health} ok={p.health==="Healthy"}/>
+        {p.geo && <GeoTag source={p.geo.source}/>}
+      </div>
+      {p.geo?.city && (
+        <div style={{ marginBottom:12, padding:"10px 12px", background:"rgba(255,255,255,0.04)", borderRadius:8 }}>
+          <div style={{ fontSize:9, color:"#6b7280", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:3 }}>Location</div>
+          <div style={{ fontFamily:"var(--font-mono)", fontSize:12, color:"#e5e7eb" }}>{[p.geo.city, p.geo.countryCode].filter(Boolean).join(", ")}</div>
+          <div style={{ fontSize:10, color:"#4b5563", marginTop:2 }}>{p.geo.lat.toFixed(4)}°, {p.geo.lng.toFixed(4)}°</div>
+        </div>
+      )}
+      {[
+        { l:"Zone",     v: ZONE_META[p.availabilityZone]?.label ?? p.availabilityZone },
+        { l:"Capacity", v: p.capacityTiB ? `${p.capacityTiB.toFixed(2)} TiB` : "—" },
+        { l:"Net IP",   v: p.netAddress || "—", mono:true },
+      ].map(({ l, v, mono }) => (
+        <div key={l} style={{ display:"flex", justifyContent:"space-between", marginBottom:7 }}>
+          <span style={{ fontSize:9, color:"#6b7280", textTransform:"uppercase", letterSpacing:"0.1em" }}>{l}</span>
+          <span style={{ fontFamily: mono?"var(--font-mono)":"inherit", fontSize:11, color:"#9ca3af", maxWidth:"65%", textAlign:"right", wordBreak:"break-all" }}>{v}</span>
+        </div>
+      ))}
+      <div style={{ marginTop:8, marginBottom:12, padding:"8px 10px", background:"rgba(255,255,255,0.04)", borderRadius:6 }}>
+        <div style={{ fontSize:8, color:"#6b7280", letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:3 }}>Full Address</div>
+        <div style={{ fontFamily:"var(--font-mono)", fontSize:9.5, color:"#4b5563", wordBreak:"break-all", lineHeight:1.5 }}>{p.address}</div>
+      </div>
+      <a href={`https://explorer.aptoslabs.com/account/${p.address}?network=${network}`} target="_blank" rel="noreferrer"
+        style={{ display:"block", textAlign:"center", padding:"8px 0", borderRadius:8, fontSize:11, background:`${accentColor}18`, border:`1px solid ${accentColor}33`, color:accentColor, textDecoration:"none", fontFamily:"var(--font-mono)" }}>
+        View on Explorer ↗
+      </a>
     </div>
   );
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
 export default function ProvidersPage() {
-  const [providers,   setProviders]   = useState<StorageProvider[]>([]);
-  const [loading,     setLoading]     = useState(true);
-  const [error,       setError]       = useState<string | null>(null);
-  const [fetchedAt,   setFetchedAt]   = useState<string | null>(null);
-  const [sort,        setSort]        = useState<SortKey>("availabilityZone");
-  const [sortDir,     setSortDir]     = useState<1 | -1>(1);
-  const [filterZone,  setFilterZone]  = useState<string>("all");
-  const [filterText,  setFilterText]  = useState("");
+  const { network, config } = useNetwork();
+  const { providers, loading, error, source, fetchedAt, refresh } = useProviders();
+  const [selected, setSelected]  = useState<StorageProvider|null>(null);
+  const [showTable, setShowTable] = useState(false);
 
-  const fetchProviders = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res  = await fetch("/api/network/providers");
-      const json: ApiResult<{ providers: StorageProvider[]; count: number }> = await res.json();
-      if (!json.ok) {
-        setError(json.error);
-        setProviders([]);
-      } else {
-        setProviders(json.data.providers);
-        setError(null);
-      }
-      setFetchedAt(json.fetchedAt);
-    } catch (err: any) {
-      setError(`Network error: ${err.message}`);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchProviders();
-    const id = setInterval(fetchProviders, 60_000);
-    return () => clearInterval(id);
-  }, [fetchProviders]);
-
-  // Derived aggregates
-  const zones = useMemo(() => {
-    const m = new Map<string, number>();
-    providers.forEach(p => m.set(p.availabilityZone, (m.get(p.availabilityZone) ?? 0) + 1));
-    return m;
-  }, [providers]);
-
-  const activeCount   = providers.filter(p => p.state   === "Active" ).length;
-  const healthyCount  = providers.filter(p => p.health  === "Healthy").length;
-  const zoneKeys      = Array.from(zones.keys()).sort();
-  const ZONE_COLORS   = ["#059669", "#3B82F6", "#8B5CF6", "#D97706", "#F97316"];
-
-  const toggleSort = (k: SortKey) => {
-    if (sort === k) setSortDir(d => d === 1 ? -1 : 1);
-    else { setSort(k); setSortDir(1); }
-  };
-
-  const sorted = useMemo(() => {
-    return [...providers]
-      .filter(p => {
-        const zoneMatch = filterZone === "all" || p.availabilityZone === filterZone;
-        const textMatch = !filterText || p.address.toLowerCase().includes(filterText.toLowerCase());
-        return zoneMatch && textMatch;
-      })
-      .sort((a, b) => {
-        const av = a[sort] ?? "", bv = b[sort] ?? "";
-        return av > bv ? sortDir : av < bv ? -sortDir : 0;
-      });
-  }, [providers, sort, sortDir, filterZone, filterText]);
-
-  const SortIcon = ({ k }: { k: SortKey }) => (
-    <span style={{ fontSize: 9, color: sort === k ? "#059669" : "#D0D0D0", marginLeft: 4 }}>
-      {sort === k ? (sortDir === 1 ? "▲" : "▼") : "⇅"}
-    </span>
-  );
+  const zones        = useMemo(() => { const m=new Map<string,number>(); providers.forEach(p=>m.set(p.availabilityZone,(m.get(p.availabilityZone)??0)+1)); return m; }, [providers]);
+  const activeCount  = providers.filter(p=>p.state==="Active").length;
+  const healthyCount = providers.filter(p=>p.health==="Healthy").length;
+  const geoCount     = providers.filter(p=>p.geo?.source==="geo-ip").length;
 
   return (
-    <div style={{ minHeight: "100vh", background: "#FAFAFA", fontFamily: "'Outfit', sans-serif", color: "#0A0A0A" }}>
-      <Nav />
-
-      <div style={{ maxWidth: 1240, margin: "0 auto", padding: "40px 24px 80px" }}>
-
-        {/* Header */}
-        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 28, flexWrap: "wrap", gap: 12 }}>
-          <div>
-            <h1 style={{ fontSize: 30, fontWeight: 800, margin: 0, letterSpacing: -1 }}>Storage Providers</h1>
-            <p style={{ fontSize: 13.5, color: "#AAA", margin: "6px 0 0" }}>
-              Live data from Shelbynet · auto-refreshes every 60s
-              {fetchedAt && (
-                <span style={{ marginLeft: 8, fontFamily: "'DM Mono', monospace", fontSize: 12, color: "#CCC" }}>
-                  · {new Date(fetchedAt).toLocaleTimeString()}
-                </span>
-              )}
-            </p>
-          </div>
-          <button onClick={fetchProviders} disabled={loading} style={{
-            padding: "8px 18px", background: "#F4F4F4", border: "1px solid #E8E8E8",
-            borderRadius: 10, cursor: "pointer", fontSize: 13, color: "#555",
-          }}>
-            {loading ? "Loading…" : "⟳ Refresh"}
-          </button>
+    <div>
+      {/* Header */}
+      <div className="page-header" style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", flexWrap:"wrap", gap:12 }}>
+        <div>
+          <h1 className="page-title">Globe View</h1>
+          <p className="page-subtitle">
+            {providers.length} storage providers on <strong>{config.label}</strong>
+            {geoCount > 0 && ` · ${geoCount} Geo-IP resolved`}
+            {fetchedAt && ` · ${new Date(fetchedAt).toLocaleTimeString()}`}
+          </p>
         </div>
-
-        {/* Error */}
-        {error && !loading && (
-          <div style={{ marginBottom: 20 }}>
-            <ErrorBanner
-              message="Cannot fetch storage provider data"
-              detail={error}
-              onRetry={fetchProviders}
-            />
-          </div>
-        )}
-
-        {/* Loading skeleton */}
-        {loading && providers.length === 0 && (
-          <div style={{ background: "#fff", border: "1px solid #EBEBEB", borderRadius: 16, padding: 40, textAlign: "center", color: "#CCC", marginBottom: 20 }}>
-            Loading provider data from Shelbynet…
-          </div>
-        )}
-
-        {/* Summary stats */}
-        {providers.length > 0 && (
-          <>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 14, marginBottom: 20 }}>
-              <StatCard label="Total Providers"  value={providers.length}     sub="On Shelbynet"                 color="#059669" />
-              <StatCard label="Active"           value={activeCount}          sub={`${Math.round(activeCount/providers.length*100)}% of total`}  color="#059669" />
-              <StatCard label="Healthy"          value={healthyCount}         sub={`${Math.round(healthyCount/providers.length*100)}% active health`} color="#3B82F6" />
-              <StatCard label="Regions"          value={zones.size}           sub="Availability zones"           color="#8B5CF6" />
-            </div>
-
-            {/* Zone breakdown */}
-            <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(zoneKeys.length, 5)}, 1fr)`, gap: 10, marginBottom: 24 }}>
-              {zoneKeys.map((z, i) => (
-                <ZonePill key={z} zone={z} count={zones.get(z) ?? 0} color={ZONE_COLORS[i % ZONE_COLORS.length]} />
-              ))}
-            </div>
-
-            {/* Map */}
-            <div style={{ background: "#fff", border: "1px solid #EBEBEB", borderRadius: 16, padding: "22px 24px", marginBottom: 20 }}>
-              <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4 }}>Geographic Distribution</div>
-              <div style={{ fontSize: 12.5, color: "#AAA", marginBottom: 16 }}>
-                Provider locations by availability zone · dots scale with provider count
-              </div>
-              <ProviderMap providers={providers} />
-            </div>
-
-            {/* State / health breakdown */}
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
-              <div style={{ background: "#fff", border: "1px solid #EBEBEB", borderRadius: 16, padding: "20px 24px" }}>
-                <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 14 }}>State Mix</div>
-                {["Active", "Waitlisted", "Frozen", "Leaving"].map(s => {
-                  const cnt = providers.filter(p => p.state === s).length;
-                  const pct = providers.length ? Math.round(cnt / providers.length * 1000) / 10 : 0;
-                  return (
-                    <div key={s} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-                      <span style={{ width: 80, fontSize: 13, color: "#555" }}>{s}</span>
-                      <div style={{ flex: 1, height: 6, background: "#F4F4F4", borderRadius: 3, overflow: "hidden" }}>
-                        <div style={{ height: "100%", width: `${pct}%`, background: s === "Active" ? "#059669" : s === "Waitlisted" ? "#D97706" : "#3B82F6", borderRadius: 3 }} />
-                      </div>
-                      <span style={{ width: 50, textAlign: "right", fontFamily: "'DM Mono', monospace", fontSize: 12, color: "#555" }}>{pct}%</span>
-                    </div>
-                  );
-                })}
-              </div>
-
-              <div style={{ background: "#fff", border: "1px solid #EBEBEB", borderRadius: 16, padding: "20px 24px" }}>
-                <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 14 }}>Active Health</div>
-                {["Healthy", "Faulty", "Leaving"].map(h => {
-                  const cnt = providers.filter(p => p.health === h).length;
-                  const pct = providers.length ? Math.round(cnt / providers.length * 1000) / 10 : 0;
-                  return (
-                    <div key={h} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-                      <span style={{ width: 80, fontSize: 13, color: "#555" }}>{h}</span>
-                      <div style={{ flex: 1, height: 6, background: "#F4F4F4", borderRadius: 3, overflow: "hidden" }}>
-                        <div style={{ height: "100%", width: `${pct}%`, background: h === "Healthy" ? "#059669" : "#DC2626", borderRadius: 3 }} />
-                      </div>
-                      <span style={{ width: 50, textAlign: "right", fontFamily: "'DM Mono', monospace", fontSize: 12, color: "#555" }}>{pct}%</span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Table controls */}
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 10 }}>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button onClick={() => setFilterZone("all")} style={{
-                  padding: "6px 14px", borderRadius: 8, fontSize: 13, border: "1px solid",
-                  borderColor: filterZone === "all" ? "#059669" : "#E8E8E8",
-                  background: filterZone === "all" ? "#F0FDF4" : "#fff",
-                  color: filterZone === "all" ? "#059669" : "#666", cursor: "pointer",
-                }}>
-                  All ({providers.length})
-                </button>
-                {zoneKeys.map((z, i) => {
-                  const meta = ZONE_META[z];
-                  return (
-                    <button key={z} onClick={() => setFilterZone(z)} style={{
-                      padding: "6px 14px", borderRadius: 8, fontSize: 13, border: "1px solid",
-                      borderColor: filterZone === z ? ZONE_COLORS[i % ZONE_COLORS.length] : "#E8E8E8",
-                      background: filterZone === z ? ZONE_COLORS[i % ZONE_COLORS.length] + "12" : "#fff",
-                      color: filterZone === z ? ZONE_COLORS[i % ZONE_COLORS.length] : "#666",
-                      cursor: "pointer",
-                    }}>
-                      {meta?.shortLabel ?? z} ({zones.get(z) ?? 0})
-                    </button>
-                  );
-                })}
-              </div>
-              <input value={filterText} onChange={e => setFilterText(e.target.value)}
-                placeholder="Filter by address…"
-                style={{ padding: "8px 14px", borderRadius: 10, fontSize: 13, fontFamily: "'DM Mono', monospace", background: "#fff", border: "1px solid #E8E8E8", color: "#0A0A0A", outline: "none", width: 240 }}
-              />
-            </div>
-
-            {/* Provider directory table */}
-            <div style={{ background: "#fff", border: "1px solid #EBEBEB", borderRadius: 16, overflow: "hidden" }}>
-              <div style={{ padding: "14px 20px", borderBottom: "1px solid #F0F0F0", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <div style={{ fontWeight: 700, fontSize: 14 }}>Storage Providers Directory</div>
-                <span style={{ fontSize: 12, color: "#AAA" }}>Showing {sorted.length} of {providers.length}</span>
-              </div>
-
-              {/* Table header */}
-              <div style={{ display: "grid", gridTemplateColumns: "200px 1fr 140px 90px 90px 120px", padding: "10px 20px", background: "#FAFAFA", borderBottom: "1px solid #F0F0F0" }}>
-                {[
-                  { label: "Address",           key: "address"          as SortKey },
-                  { label: "Availability Zone", key: "availabilityZone" as SortKey },
-                  { label: "BLS Key",           key: null },
-                  { label: "State",             key: "state"            as SortKey },
-                  { label: "Health",            key: "health"           as SortKey },
-                ].map((col, i) => (
-                  <div key={i} onClick={col.key ? () => toggleSort(col.key!) : undefined}
-                    style={{ fontSize: 10, fontWeight: 600, color: "#BBB", textTransform: "uppercase", letterSpacing: "0.06em", cursor: col.key ? "pointer" : "default", userSelect: "none", display: "flex", alignItems: "center" }}>
-                    {col.label} {col.key && <SortIcon k={col.key} />}
-                  </div>
-                ))}
-              </div>
-
-              {/* Rows */}
-              {sorted.length === 0 && (
-                <div style={{ padding: "32px 20px", textAlign: "center", color: "#CCC", fontSize: 13 }}>
-                  No providers match current filter
-                </div>
-              )}
-              {sorted.map((p, i) => {
-                const zoneIdx = zoneKeys.indexOf(p.availabilityZone);
-                const zoneMeta = ZONE_META[p.availabilityZone];
-                return (
-                  <div key={p.address} style={{ display: "grid", gridTemplateColumns: "200px 1fr 140px 90px 90px 120px", padding: "13px 20px", borderBottom: i < sorted.length - 1 ? "1px solid #F8F8F8" : "none", alignItems: "center", transition: "background .12s" }}
-                    onMouseEnter={e => (e.currentTarget.style.background = "#FAFAFA")}
-                    onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
-                  >
-                    {/* Address */}
-                    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12.5, color: "#3B82F6", fontWeight: 500 }}>
-                      {p.addressShort || p.address}
-                    </div>
-
-                    {/* Zone */}
-                    <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-                      <div style={{ width: 8, height: 8, borderRadius: "50%", background: ZONE_COLORS[zoneIdx % ZONE_COLORS.length], flexShrink: 0 }} />
-                      <div>
-                        <div style={{ fontSize: 13, color: "#0A0A0A" }}>{zoneMeta?.label ?? p.availabilityZone}</div>
-                        <div style={{ fontSize: 10.5, color: "#CCC", fontFamily: "'DM Mono', monospace" }}>{p.availabilityZone}</div>
-                      </div>
-                    </div>
-
-                    {/* BLS Key */}
-                    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "#AAA" }}>
-                      {p.blsKey || "—"}
-                    </div>
-
-                    {/* State */}
-                    <div><StatusBadge label={p.state} variant={stateVariant(p.state)} /></div>
-
-                    {/* Health */}
-                    <div><StatusBadge label={p.health} variant={healthVariant(p.health)} /></div>
-                  </div>
-                );
-              })}
-            </div>
-          </>
-        )}
-
-        {/* Data source note */}
-        <div style={{ marginTop: 16, fontSize: 12.5, color: "#CCC", textAlign: "center", fontFamily: "'DM Mono', monospace" }}>
-          Data fetched live from Shelbynet RPC · shelby_getStorageProviders
+        <div style={{ display:"flex", gap:8 }}>
+          <button onClick={()=>setShowTable(v=>!v)} className="btn btn-secondary">{showTable?"Hide Table":"Show Table"}</button>
+          <button onClick={refresh} className="btn btn-secondary">{loading?"⟳ Loading…":"⟳ Refresh"}</button>
         </div>
       </div>
+
+      {error && <div className="alert alert-error" style={{ marginBottom:16 }}>⚠ {error}</div>}
+
+      {/* Stats row */}
+      {providers.length > 0 && (
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginBottom:16 }}>
+          {[
+            { l:"Total",   v:providers.length, color:"var(--info)"    },
+            { l:"Active",  v:activeCount,      color:"var(--success)" },
+            { l:"Healthy", v:healthyCount,     color:"#9333ea"        },
+            { l:"Regions", v:zones.size,       color:"#d97706"        },
+          ].map(({l,v,color}) => (
+            <div key={l} className="stat-card" style={{ borderTop:`3px solid ${color}`, padding:"12px 16px" }}>
+              <div className="stat-card-label">{l}</div>
+              <div className="stat-card-value" style={{ fontSize:22, color }}>{v}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Source indicator */}
+      {!loading && (
+        <div style={{ marginBottom:12, display:"flex", alignItems:"center", gap:8 }}>
+          <span style={{ fontSize:12, color:"var(--gray-400)" }}>Data source:</span>
+          <span className={`badge badge-${source==="kv-geo"?"blue":source==="indexer"?"green":"gray"}`}>
+            {source==="kv-geo" ? "KV + Geo-IP" : source==="indexer" ? "Indexer" : source==="rpc" ? "RPC on-chain" : "Unknown"}
+          </span>
+          {source !== "kv-geo" && <span style={{ fontSize:11, color:"var(--gray-400)" }}>— coordinates are zone estimates (run Worker to get precise geo)</span>}
+        </div>
+      )}
+
+      {/* Globe */}
+      <div className="card" style={{ marginBottom:16, overflow:"hidden" }}>
+        <div style={{ position:"relative", height:460 }}>
+          <GlobeMap providers={providers} onProviderClick={setSelected}/>
+          {selected && (
+            <ProviderPanel p={selected as any} accentColor={config.color} network={network} onClose={()=>setSelected(null)}/>
+          )}
+        </div>
+      </div>
+
+      {/* Table */}
+      {showTable && providers.length > 0 && (
+        <div className="card">
+          <div className="card-header">
+            <div className="card-title">Provider Directory</div>
+            <span className="text-sm text-muted">{providers.length} nodes</span>
+          </div>
+          <div style={{ overflowX:"auto" }}>
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Address</th><th>Location</th><th>Source</th>
+                  <th>State</th><th>Health</th><th>Capacity</th><th>Zone</th>
+                </tr>
+              </thead>
+              <tbody>
+                {providers.map(p => (
+                  <tr key={p.address} onClick={()=>setSelected(p)} style={{ cursor:"pointer" }}>
+                    <td><span className="mono" style={{ color:"var(--info)", fontSize:12 }}>{p.addressShort}</span></td>
+                    <td style={{ fontSize:12 }}>{p.geo?.city ? `${p.geo.city}, ${p.geo.countryCode}` : "—"}</td>
+                    <td><GeoTag source={p.geo?.source}/></td>
+                    <td><Badge label={p.state}  ok={p.state==="Active"}/></td>
+                    <td><Badge label={p.health} ok={p.health==="Healthy"}/></td>
+                    <td><span className="mono text-sm">{p.capacityTiB ? `${p.capacityTiB.toFixed(2)} TiB`:"—"}</span></td>
+                    <td><span className="text-sm text-muted">{ZONE_META[p.availabilityZone]?.shortLabel ?? p.availabilityZone}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

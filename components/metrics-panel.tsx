@@ -1,0 +1,171 @@
+"use client";
+// components/metrics-panel.tsx v3
+// Sidebar nhỏ bên phải, sticky, collapsible
+// Hiển thị 6 network metrics + block height + live indicator
+
+import { useState, useEffect, useRef, useCallback } from "react";
+import { useNetwork } from "./network-context";
+
+interface Stats {
+  totalBlobs:            number | null;
+  totalStorageUsedBytes: number | null;
+  totalBlobEvents:       number | null;
+  slices:                number | null;
+  placementGroups:       number | null;
+  storageProviders:      number | null;
+}
+
+interface NodeInfo { blockHeight: number; ledgerVersion: number; chainId: number; }
+
+function fmt(v: number | null): string {
+  if (v == null) return "—";
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000)     return `${(v / 1_000).toFixed(1)}K`;
+  return String(v);
+}
+
+function fmtBytes(b: number | null): string {
+  if (b == null) return "—";
+  if (b >= 1e12) return `${(b / 1e12).toFixed(2)} TB`;
+  if (b >= 1e9)  return `${(b / 1e9).toFixed(1)} GB`;
+  if (b >= 1e6)  return `${(b / 1e6).toFixed(1)} MB`;
+  return `${b} B`;
+}
+
+const METRICS = [
+  { key: "totalBlobs",            label: "Total Blobs",       accent: "accent-blue",   fmt: fmt       },
+  { key: "slices",                label: "Slices",            accent: "accent-amber",  fmt: fmt       },
+  { key: "storageProviders",      label: "Providers",         accent: "accent-green",  fmt: fmt       },
+  { key: "placementGroups",       label: "Pl. Groups",        accent: "accent-purple", fmt: fmt       },
+  { key: "totalStorageUsedBytes", label: "Storage Used",      accent: "accent-blue",   fmt: fmtBytes  },
+  { key: "totalBlobEvents",       label: "Blob Events",       accent: "accent-green",  fmt: fmt       },
+] as const;
+
+export function MetricsPanel() {
+  const { network } = useNetwork();
+  const [collapsed, setCollapsed] = useState(false);
+  const [stats,  setStats]  = useState<Stats>({ totalBlobs: null, totalStorageUsedBytes: null, totalBlobEvents: null, slices: null, placementGroups: null, storageProviders: null });
+  const [node,   setNode]   = useState<NodeInfo | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [lastAt,  setLastAt]  = useState<string>("");
+  const prevVals = useRef<Record<string, string>>({});
+  const [pulses,  setPulses]  = useState<Record<string, boolean>>({});
+
+  const fetchStats = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/network/stats?network=${network}`);
+      if (!res.ok) return;
+      const d = await res.json();
+      if (d.data?.stats) {
+        const newStats = d.data.stats as Stats;
+        // Detect changes → pulse animation
+        const changed: Record<string, boolean> = {};
+        METRICS.forEach(m => {
+          const newVal = String(newStats[m.key as keyof Stats] ?? "");
+          if (prevVals.current[m.key] !== undefined && prevVals.current[m.key] !== newVal && newVal !== "null") {
+            changed[m.key] = true;
+          }
+          prevVals.current[m.key] = newVal;
+        });
+        if (Object.keys(changed).length > 0) {
+          setPulses(changed);
+          setTimeout(() => setPulses({}), 1000);
+        }
+        setStats(newStats);
+        setNode(d.data.node ?? null);
+        setLastAt(new Date().toLocaleTimeString());
+      }
+    } catch { /* silent */ }
+    finally { setLoading(false); }
+  }, [network]);
+
+  useEffect(() => {
+    setLoading(true);
+    setStats({ totalBlobs: null, totalStorageUsedBytes: null, totalBlobEvents: null, slices: null, placementGroups: null, storageProviders: null });
+    setNode(null);
+    fetchStats();
+    const id = setInterval(fetchStats, 15_000);
+    return () => clearInterval(id);
+  }, [fetchStats]);
+
+  if (collapsed) {
+    return (
+      <div className="metrics-panel" style={{ width: 44 }}>
+        <button
+          onClick={() => setCollapsed(false)}
+          className="panel-toggle"
+          title="Show metrics"
+          style={{ width: "100%", height: 36 }}
+        >
+          ◀
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="metrics-panel">
+      {/* Header */}
+      <div className="metrics-panel-header">
+        <span className="metrics-panel-title">Network</span>
+        <button className="panel-toggle" onClick={() => setCollapsed(true)} title="Collapse">
+          ▶
+        </button>
+      </div>
+
+      {/* Live indicator */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <div className="live-dot">
+          <span className="live-dot-circle" />
+          <span style={{ fontSize: 12, color: "var(--gray-500)" }}>{loading ? "Syncing…" : "Live"}</span>
+        </div>
+        {lastAt && <span style={{ fontSize: 11, color: "var(--gray-400)", fontFamily: "var(--font-mono)" }}>{lastAt}</span>}
+      </div>
+
+      {/* Block height */}
+      {node && (
+        <div className="block-ticker">
+          <span className="block-ticker-label">Block</span>
+          <span className="block-ticker-value">#{node.blockHeight.toLocaleString()}</span>
+        </div>
+      )}
+      {!node && loading && <div className="skeleton" style={{ height: 40, marginBottom: 8 }} />}
+
+      {/* 6 metrics */}
+      {METRICS.map(m => {
+        const rawVal = stats[m.key as keyof Stats];
+        const display = loading && rawVal == null ? "…" : m.fmt(rawVal as any);
+        const isPulsing = pulses[m.key];
+        return (
+          <div key={m.key} className={`metric-item ${m.accent}`}>
+            <div className="metric-item-label">{m.label}</div>
+            <div
+              className="metric-item-value"
+              style={{
+                transition: "color 0.3s",
+                color: isPulsing ? "var(--net-color)" : undefined,
+              }}
+            >
+              {display}
+            </div>
+          </div>
+        );
+      })}
+
+      {/* Chain info footer */}
+      {node && (
+        <div style={{ padding: "10px 2px 0", borderTop: "1px solid var(--gray-100)", marginTop: 4 }}>
+          {[
+            { label: "Chain ID", value: String(node.chainId) },
+            { label: "Ledger",   value: node.ledgerVersion.toLocaleString() },
+          ].map(({ label, value }) => (
+            <div key={label} style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+              <span style={{ fontSize: 11, color: "var(--gray-400)", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</span>
+              <span style={{ fontSize: 12, fontFamily: "var(--font-mono)", color: "var(--gray-600)" }}>{value}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

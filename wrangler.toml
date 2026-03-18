@@ -1,0 +1,46 @@
+# ═══════════════════════════════════════════════════════════════
+# wrangler.toml — Shelby Analytics v2.0
+# Cloudflare Pages (frontend) + Workers (geo-sync) cùng project
+# ═══════════════════════════════════════════════════════════════
+
+name                   = "shelby-analytics"
+compatibility_date     = "2024-09-23"
+compatibility_flags    = ["nodejs_compat"]
+pages_build_output_dir = ".vercel/output/static"
+
+# ── KV Namespaces ──────────────────────────────────────────────
+# Tạo bằng: npx wrangler kv:namespace create "SHELBY_KV_MAINNET"
+# Sau đó paste ID (không phải preview_id) vào đây
+
+[[kv_namespaces]]
+binding = "SHELBY_KV_MAINNET"
+id      = "5cb5ee699b924052812beda7ae936569"
+
+[[kv_namespaces]]
+binding = "SHELBY_KV_TESTNET"
+id      = "416bad6c5ca74ffb8281261b64692f3e"
+
+# ── R2 Bucket (snapshots lịch sử cho analytics charts) ────────
+# Tạo bằng: npx wrangler r2 bucket create shelby-analytics-snapshots
+
+[[r2_buckets]]
+binding     = "SHELBY_R2"
+bucket_name = "shelby-analytics-snapshots"
+
+
+
+# ── Pages Functions (API routes chạy tại edge) ─────────────────
+# Next.js App Router API routes được bundle thành CF Pages Functions
+# bởi @cloudflare/next-on-pages. Không cần config thêm.
+
+# ── Environment Variables ──────────────────────────────────────
+# Thiết lập tại: CF Dashboard → Pages project → Settings → Env Vars
+# Hoặc dùng: npx wrangler pages secret put <KEY> --project-name shelby-analytics
+#
+# REQUIRED:
+#   SHELBY_PRIVATE_KEY     = "ed25519-priv-0x<64-char-hex>"
+#
+# OPTIONAL:
+#   SHELBY_API_KEY         = "<testnet geomi key>"
+#   SYNC_SECRET            = "<random 32-char string để bảo vệ /sync>"
+#   SHELBY_NODE_URL        = "https://api.shelbynet.shelby.xyz/v1"

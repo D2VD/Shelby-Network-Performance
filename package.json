@@ -1,24 +1,35 @@
 {
-  "name": "shelby-benchmark",
-  "version": "1.0.0",
+  "name": "shelby-analytics",
+  "version": "3.0.0",
   "private": true,
+  "description": "Shelby Protocol Analytics Dashboard",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start"
+    "dev":            "next dev",
+    "build":          "next build",
+    "start":          "next start",
+    "type-check":     "tsc --noEmit",
+    "pages:build":    "npx @cloudflare/next-on-pages",
+    "pages:deploy":   "npm run pages:build && npx wrangler pages deploy .vercel/output/static",
+    "worker:deploy":  "npx wrangler deploy workers/geo-sync.ts --name shelby-geo-sync",
+    "cf:dev":         "npx wrangler pages dev .vercel/output/static",
+    "deploy":         "npm run pages:deploy && npm run worker:deploy"
   },
   "dependencies": {
-    "next": "^15.2.3",
-    "react": "^19",
-    "react-dom": "^19",
+    "@aptos-labs/ts-sdk":   "^5.2.1",
     "@shelby-protocol/sdk": "^0.2.4",
-    "@aptos-labs/ts-sdk": "^5.2.1",
-    "got": "^14.4.6"
+    "got":                  "^14.4.6",
+    "next":                 "^15.2.3",
+    "react":                "^19",
+    "react-dom":            "^19",
+    "swr":                  "^2.4.1"
   },
   "devDependencies": {
-    "@types/node": "^20",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "typescript": "^5"
-  }
+    "@cloudflare/next-on-pages": "^1.13.16",
+    "@types/node":               "^20",
+    "@types/react":              "^19",
+    "@types/react-dom":          "^19",
+    "typescript":                "^5",
+    "wrangler":                  "^4.74.0"
+  },
+  "engines": { "node": ">=20.0.0" }
 }

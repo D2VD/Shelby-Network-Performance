@@ -4,15 +4,20 @@
   "private": true,
   "description": "Shelby Protocol Analytics Dashboard",
   "scripts": {
-    "dev":            "next dev",
-    "build":          "next build",
-    "start":          "next start",
-    "type-check":     "tsc --noEmit",
-    "pages:build":    "npx @cloudflare/next-on-pages",
-    "pages:deploy":   "npm run pages:build && npx wrangler pages deploy .vercel/output/static",
-    "worker:deploy":  "npx wrangler deploy workers/geo-sync.ts --name shelby-geo-sync",
-    "cf:dev":         "npx wrangler pages dev .vercel/output/static",
-    "deploy":         "npm run pages:deploy && npm run worker:deploy"
+    "dev":           "next dev",
+    "build":         "next build",
+    "start":         "next start",
+    "type-check":    "tsc --noEmit",
+
+    "pages:build":   "npx @cloudflare/next-on-pages",
+    "pages:deploy":  "npm run pages:build && npx wrangler pages deploy .vercel/output/static",
+
+    "worker:deploy": "npx wrangler deploy workers/geo-sync.ts --config workers/wrangler.worker.toml",
+    "worker:dev":    "npx wrangler dev workers/geo-sync.ts --config workers/wrangler.worker.toml",
+
+    "cf:dev":        "npx wrangler pages dev .vercel/output/static",
+
+    "deploy":        "npm run pages:deploy && npm run worker:deploy"
   },
   "dependencies": {
     "@aptos-labs/ts-sdk":   "^5.2.1",
@@ -25,6 +30,7 @@
   },
   "devDependencies": {
     "@cloudflare/next-on-pages": "^1.13.16",
+    "@cloudflare/workers-types": "^4.20250109.0",
     "@types/node":               "^20",
     "@types/react":              "^19",
     "@types/react-dom":          "^19",

@@ -16,7 +16,7 @@ export async function GET(req: NextRequest) {
   try {
     // Đọc trực tiếp từ Cloudflare R2 qua binding (chỉ hoạt động trên CF edge)
     // Không dùng R2Bucket type ở đây vì file này chạy trong Next.js context
-    // (không có @cloudflare/workers-types). Dùng any để tránh ts(2304).
+    // (không có @cloudflare/workers-types). Dùng any để tránh ts(2304)
     const r2 = (process.env as any).SHELBY_R2 as any | undefined;
 
     if (!r2) {

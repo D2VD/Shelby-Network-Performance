@@ -1,13 +1,13 @@
 // app/api/benchmark/upload/route.ts
-// ✅ Edge runtime — gọi Shelby RPC HTTP API thay vì @shelby-protocol/sdk
-// SDK dùng WASM + Node.js crypto không tương thích CF edge
-// Thay thế: gọi trực tiếp REST API của Shelby RPC server
+// FIX: Endpoint đúng PUT /shelby/v1/blobs/{account}/{blobName} (path params)
+// FIX: Thêm Content-Length header
+// FIX: export const runtime = "edge" (bắt buộc cho CF Pages)
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "edge";
 
 const SHELBY_RPC = "https://api.shelbynet.shelby.xyz/shelby";
-const TEST_SIZES  = [1_024, 10_240, 102_400];
+const TEST_SIZES = [1_024, 10_240, 102_400];
 
 function generatePayload(bytes: number): Uint8Array {
   const buf = new Uint8Array(bytes);
@@ -17,13 +17,12 @@ function generatePayload(bytes: number): Uint8Array {
 
 export async function POST(req: NextRequest) {
   const { sizeIndex = 0 } = await req.json().catch(() => ({}));
-  const bytes    = TEST_SIZES[sizeIndex] ?? TEST_SIZES[0];
-  const address  = process.env.SHELBY_WALLET_ADDRESS;
-  const apiKey   = process.env.SHELBY_API_KEY;
+  const bytes   = TEST_SIZES[sizeIndex] ?? TEST_SIZES[0];
+  const address = process.env.SHELBY_WALLET_ADDRESS;
 
   if (!address) {
     return NextResponse.json(
-      { error: "SHELBY_WALLET_ADDRESS not configured" },
+      { error: "SHELBY_WALLET_ADDRESS not set — add it in CF Dashboard → Settings → Env Vars" },
       { status: 500 }
     );
   }
@@ -32,64 +31,56 @@ export async function POST(req: NextRequest) {
   const blobName = `bench-${bytes}-${Date.now()}`;
   const t0       = performance.now();
 
-  try {
-    // Gọi Shelby RPC REST API trực tiếp
-    const headers: Record<string, string> = {
-      "Content-Type":      "application/octet-stream",
-      "X-Blob-Name":       blobName,
-      "X-Account-Address": address,
-    };
-    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+  // ✅ Endpoint đúng: PUT /shelby/v1/blobs/{account}/{blobName}
+  const url = `${SHELBY_RPC}/v1/blobs/${address}/${encodeURIComponent(blobName)}`;
 
-    const r = await fetch(`${SHELBY_RPC}/v1/blobs`, {
-      method:  "PUT",
-      headers,
+  try {
+    const r = await fetch(url, {
+      method: "PUT",
+      headers: {
+        "Content-Type":   "application/octet-stream",
+        "Content-Length": String(payload.length),
+      },
       body: new Blob([payload as any]),
-      signal:  AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(30_000),
     });
 
     const elapsed  = performance.now() - t0;
     const speedKbs = (bytes / 1024) / (elapsed / 1000);
 
-    if (!r.ok) {
-      const errText = await r.text().catch(() => `HTTP ${r.status}`);
-      return NextResponse.json(
-        { error: `Shelby RPC error: ${errText}` },
-        { status: 500 }
-      );
+    if (r.ok) {
+      const data   = await r.json().catch(() => ({}));
+      const txHash = data?.transaction_hash ?? data?.txHash ?? null;
+      return NextResponse.json({ bytes, elapsed, speedKbs, blobName, txHash, status: "uploaded", blobSize: bytes });
     }
 
-    const data = await r.json().catch(() => ({}));
-    const txHash = data?.transaction_hash ?? data?.txHash ?? null;
-
-    return NextResponse.json({
-      bytes, elapsed, speedKbs, blobName, txHash,
-      status: "uploaded", blobSize: bytes,
-    });
+    const errText = await r.text().catch(() => `HTTP ${r.status}`);
+    console.warn(`[upload] PUT ${r.status}: ${errText} — starting recovery poll`);
   } catch (err: any) {
-    // Polling fallback: kiểm tra blob đã tồn tại chưa
-    for (let i = 0; i < 5; i++) {
-      await new Promise(r => setTimeout(r, 3000));
-      try {
-        const checkRes = await fetch(
-          `https://api.shelbynet.shelby.xyz/shelby/v1/blobs/${address}/${blobName}`,
-          { signal: AbortSignal.timeout(3000) }
-        );
-        if (checkRes.ok) {
-          const d = await checkRes.json();
-          const elapsed  = performance.now() - t0;
-          const speedKbs = (bytes / 1024) / (elapsed / 1000);
-          return NextResponse.json({
-            bytes, elapsed, speedKbs, blobName,
-            txHash: d?.transaction_hash ?? null,
-            status: "recovered", blobSize: bytes,
-          });
-        }
-      } catch {}
-    }
-    return NextResponse.json(
-      { error: `Upload failed: ${err.message}` },
-      { status: 500 }
-    );
+    console.warn(`[upload] fetch threw: ${err.message} — starting recovery poll`);
   }
+
+  // Recovery: blob có thể đã commit on-chain dù RPC trả lỗi
+  const checkUrl = `${SHELBY_RPC}/v1/blobs/${address}/${encodeURIComponent(blobName)}`;
+  for (let i = 0; i < 5; i++) {
+    await new Promise(r => setTimeout(r, 3_000));
+    try {
+      const res = await fetch(checkUrl, { signal: AbortSignal.timeout(4_000) });
+      if (res.ok) {
+        const d        = await res.json();
+        const elapsed  = performance.now() - t0;
+        const speedKbs = (bytes / 1024) / (elapsed / 1000);
+        return NextResponse.json({
+          bytes, elapsed, speedKbs, blobName,
+          txHash: d?.transaction_hash ?? d?.txHash ?? null,
+          status: "recovered", blobSize: bytes,
+        });
+      }
+    } catch {}
+  }
+
+  return NextResponse.json(
+    { error: "Upload failed and blob not found on-chain after 15s" },
+    { status: 500 }
+  );
 }

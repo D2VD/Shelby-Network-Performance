@@ -1,22 +1,29 @@
 // app/api/benchmark/faucet/route.ts
-// ✅ Edge runtime — không dùng @aptos-labs/ts-sdk
-// Dùng SHELBY_WALLET_ADDRESS env var thay vì derive từ private key
+// FIX: export const runtime = "edge"
+// FIX: Dùng SHELBY_WALLET_ADDRESS thay vì derive từ private key
+// FIX: Đúng faucet endpoint shelbynet
 import { NextResponse } from "next/server";
 
 export const runtime = "edge";
 
-const FAUCET_URL = "https://faucet.shelbynet.shelby.xyz";
-const APTOS_NODE = "https://api.shelbynet.shelby.xyz/v1";
+// Shelbynet faucet (từ docs.shelby.xyz)
+const FAUCET_APT      = "https://faucet.shelbynet.shelby.xyz/mint";
+const FAUCET_SHELBYUSD = "https://faucet.shelbynet.shelby.xyz/mint";
+const APTOS_NODE      = "https://api.shelbynet.shelby.xyz/v1";
 
-async function fetchWithRetry(url: string, options: RequestInit, retries = 3): Promise<Response> {
+async function tryFaucet(url: string, retries = 3): Promise<boolean> {
   for (let i = 0; i < retries; i++) {
     try {
-      const res = await fetch(url, { ...options, signal: AbortSignal.timeout(8000) });
-      if (res.ok) return res;
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (r.ok) return true;
     } catch {}
-    if (i < retries - 1) await new Promise(r => setTimeout(r, 1500));
+    if (i < retries - 1) await new Promise(r => setTimeout(r, 1_500));
   }
-  throw new Error(`Faucet failed after ${retries} attempts`);
+  return false;
 }
 
 export async function POST() {
@@ -28,43 +35,27 @@ export async function POST() {
     );
   }
 
-  const results = { apt: false, shelbyusd: false, errors: [] as string[] };
+  const [aptOk, usdOk] = await Promise.all([
+    tryFaucet(`${FAUCET_APT}?address=${address}&amount=100000000`),
+    tryFaucet(`${FAUCET_SHELBYUSD}?address=${address}&amount=10000000&token=shelbyusd`),
+  ]);
 
-  try {
-    await fetchWithRetry(`${FAUCET_URL}/mint?address=${address}&amount=100000000`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-    });
-    results.apt = true;
-  } catch (e: any) { results.errors.push(`APT faucet failed: ${e.message}`); }
-
-  try {
-    await fetchWithRetry(`${FAUCET_URL}/mint?address=${address}&amount=10000000&token=shelbyusd`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-    });
-    results.shelbyusd = true;
-  } catch (e: any) { results.errors.push(`ShelbyUSD faucet failed: ${e.message}`); }
-
-  await new Promise(r => setTimeout(r, 3000));
+  // Đợi blockchain confirm
+  await new Promise(r => setTimeout(r, 3_000));
 
   let newApt = 0;
   try {
     const r = await fetch(
       `${APTOS_NODE}/accounts/${address}/resource/0x1::coin::CoinStore%3C0x1::aptos_coin::AptosCoin%3E`
     );
-    if (r.ok) {
-      const d = await r.json();
-      newApt = Number(d?.data?.coin?.value ?? 0) / 1e8;
-    }
+    if (r.ok) { const d = await r.json(); newApt = Number(d?.data?.coin?.value ?? 0) / 1e8; }
   } catch {}
 
   return NextResponse.json({
     address,
-    aptFauceted:       results.apt,
-    shelbyusdFauceted: results.shelbyusd,
-    errors:            results.errors,
+    aptFauceted: aptOk,
+    shelbyusdFauceted: usdOk,
     newApt,
-    message: results.apt || results.shelbyusd
-      ? "Faucet request sent successfully."
-      : "Faucet requests failed — please try again.",
+    message: (aptOk || usdOk) ? "Faucet OK" : "Faucet failed — shelbynet faucet may be down",
   });
 }

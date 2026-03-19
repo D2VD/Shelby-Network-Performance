@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { getShelbyAccount } from "@/lib/shelby";
 
+export const runtime = "nodejs";
+
 const NODE = "https://api.shelbynet.shelby.xyz/v1";
 const SHELBYUSD_META = "0x1b18363a9f1fe5e6ebf247daba5cc1c18052bb232efdc4c50f556053922d98e1";
 

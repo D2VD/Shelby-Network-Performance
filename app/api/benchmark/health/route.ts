@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+export const runtime = "edge";
+
 const NODE        = "https://api.shelbynet.shelby.xyz/v1";
 const EXPLORER    = "https://explorer.shelby.xyz";
 

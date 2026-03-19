@@ -2,6 +2,8 @@
 import { NextResponse } from "next/server";
 import { getShelbyClient, getShelbyAccount, getAptosClient } from "@/lib/shelby";
 
+export const runtime = "nodejs";
+
 export async function GET() {
   const aptos = getAptosClient();
   const account = getShelbyAccount();

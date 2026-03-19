@@ -3,6 +3,8 @@
 // The dashboard page now calls /api/network/stats directly
 import { NextResponse } from "next/server";
 
+export const runtime = "edge";
+
 export async function GET(req: Request) {
   // Forward to the new consolidated endpoint
   const url = new URL(req.url);

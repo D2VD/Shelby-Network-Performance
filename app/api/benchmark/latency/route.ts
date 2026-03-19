@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { getAptosClient } from "@/lib/shelby";
 
+export const runtime = "nodejs";
+
 export async function GET() {
   const aptos = getAptosClient();
   const rounds = 5;

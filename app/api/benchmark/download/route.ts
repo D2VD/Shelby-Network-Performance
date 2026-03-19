@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getShelbyClient, getShelbyAccount } from "@/lib/shelby";
 
+export const runtime = "nodejs";
+
 export async function POST(req: NextRequest) {
   const { blobName } = await req.json();
   if (!blobName) {

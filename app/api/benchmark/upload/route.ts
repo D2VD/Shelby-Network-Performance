@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getShelbyClient, getShelbyAccount } from "@/lib/shelby";
 
+export const runtime = "nodejs";
+
 const TEST_SIZES =[1_024, 10_240, 102_400];
 
 function generatePayload(bytes: number): Uint8Array {

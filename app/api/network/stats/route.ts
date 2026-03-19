@@ -6,6 +6,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { NetworkStats, ApiResult } from "@/lib/types";
 
+export const runtime    = "edge";
 export const revalidate = 15;
 
 // ── Network config ─────────────────────────────────────────────────────────────

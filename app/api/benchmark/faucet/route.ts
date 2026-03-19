@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { getShelbyAccount } from "@/lib/shelby";
 
+export const runtime = "nodejs";
+
 const FAUCET_URL  = "https://faucet.shelbynet.shelby.xyz";
 const APTOS_NODE  = "https://api.shelbynet.shelby.xyz/v1";
 

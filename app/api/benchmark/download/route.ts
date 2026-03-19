@@ -1,7 +1,10 @@
+// app/api/benchmark/download/route.ts
+// ✅ Edge runtime — gọi Shelby RPC HTTP API thay vì @shelby-protocol/sdk
 import { NextRequest, NextResponse } from "next/server";
-import { getShelbyClient, getShelbyAccount } from "@/lib/shelby";
 
-export const runtime = "nodejs";
+export const runtime = "edge";
+
+const SHELBY_RPC = "https://api.shelbynet.shelby.xyz/shelby";
 
 export async function POST(req: NextRequest) {
   const { blobName } = await req.json();
@@ -9,27 +12,37 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "blobName required" }, { status: 400 });
   }
 
-  const client = getShelbyClient();
-  const account = getShelbyAccount();
+  const address = process.env.SHELBY_WALLET_ADDRESS;
+  const apiKey  = process.env.SHELBY_API_KEY;
+
+  if (!address) {
+    return NextResponse.json(
+      { error: "SHELBY_WALLET_ADDRESS not configured" },
+      { status: 500 }
+    );
+  }
 
   const t0 = performance.now();
   try {
-    // Trả lại tên hàm đúng: download
-    const blob = await client.download({
-      account: account.accountAddress,
-      blobName,
-    });
-    
-    const elapsed = performance.now() - t0;
-    const raw = (blob as any)?.data ?? (blob as any)?.content ?? (blob as any)?.blob ?? blob;
-    
-    // Xử lý đếm byte an toàn cho cả Buffer, Uint8Array và Blob
-    const bytes = raw instanceof Uint8Array ? raw.byteLength
-      : Buffer.isBuffer(raw) ? raw.byteLength
-      : typeof raw === "string" ? raw.length
-      : raw instanceof Blob ? raw.size
-      : 0;
-      
+    const headers: Record<string, string> = {};
+    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+    const r = await fetch(
+      `${SHELBY_RPC}/v1/blobs/${address}/${encodeURIComponent(blobName)}`,
+      { headers, signal: AbortSignal.timeout(30_000) }
+    );
+
+    if (!r.ok) {
+      const errText = await r.text().catch(() => `HTTP ${r.status}`);
+      return NextResponse.json(
+        { error: `Download failed: ${errText}` },
+        { status: 500 }
+      );
+    }
+
+    const blob     = await r.arrayBuffer();
+    const elapsed  = performance.now() - t0;
+    const bytes    = blob.byteLength;
     const speedKbs = bytes > 0 ? (bytes / 1024) / (elapsed / 1000) : 0;
 
     return NextResponse.json({ bytes, elapsed, speedKbs, blobName });

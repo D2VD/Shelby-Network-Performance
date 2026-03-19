@@ -1,68 +1,103 @@
 // app/api/benchmark/txtime/route.ts
+// ✅ Edge runtime — gọi Shelby RPC HTTP + Aptos REST thay vì SDK
 import { NextResponse } from "next/server";
-import { getShelbyClient, getShelbyAccount, getAptosClient } from "@/lib/shelby";
 
-export const runtime = "nodejs";
+export const runtime = "edge";
+
+const SHELBY_RPC = "https://api.shelbynet.shelby.xyz/shelby";
+const APTOS_NODE = "https://api.shelbynet.shelby.xyz/v1";
 
 export async function GET() {
-  const aptos = getAptosClient();
-  const account = getShelbyAccount();
-  const client = getShelbyClient();
+  const address = process.env.SHELBY_WALLET_ADDRESS;
+  const apiKey  = process.env.SHELBY_API_KEY;
 
-  const rawData = new Uint8Array(512).fill(42);
-  const blobData = Buffer.from(rawData);
+  if (!address) {
+    return NextResponse.json(
+      { error: "SHELBY_WALLET_ADDRESS not configured" },
+      { status: 500 }
+    );
+  }
+
+  // Tạo payload nhỏ 512 bytes để đo TX time
+  const blobData = new Uint8Array(512).fill(42);
   const blobName = `bench/tx-timing-${Date.now()}.bin`;
-  const address = account.accountAddress.toString();
-  
-  // SỬA LỖI TYPESCRIPT Ở ĐÂY: Sử dụng Number thay vì BigInt
-  // Date.now() trả về mili-giây. Cộng thêm 1 giờ (60*60*1000 ms), sau đó nhân 1000 để ra micro-giây.
-  const expirationMicros = (Date.now() + 60 * 60 * 1000) * 1000;
+  const t0       = performance.now();
 
-  const t0 = performance.now();
-  let isSuccess = false;
-  let txHash = null;
-  let submitTime = 0;
+  let txHash: string | null = null;
+  let submitTime             = 0;
+  let isSuccess              = false;
 
+  // Upload blob nhỏ qua Shelby RPC REST
   try {
-    const result = await client.upload({
-      blobData,
-      signer: account,
-      blobName,
-      expirationMicros, // Đã truyền đúng kiểu 'number'
-    }) as any;
-    
+    const headers: Record<string, string> = {
+      "Content-Type":      "application/octet-stream",
+      "X-Blob-Name":       blobName,
+      "X-Account-Address": address,
+    };
+    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+    const r = await fetch(`${SHELBY_RPC}/v1/blobs`, {
+      method:  "PUT",
+      headers,
+      body:    blobData,
+      signal:  AbortSignal.timeout(30_000),
+    });
+
     submitTime = performance.now() - t0;
-    txHash = result?.transaction?.hash ?? result?.txHash ?? result?.hash ?? null;
-    isSuccess = true;
-  } catch (err: any) {
-    // CƠ CHẾ RECOVERY (Polling)
+
+    if (r.ok) {
+      const d  = await r.json().catch(() => ({}));
+      txHash   = d?.transaction_hash ?? d?.txHash ?? null;
+      isSuccess = true;
+    }
+  } catch {}
+
+  // Polling fallback
+  if (!isSuccess) {
     for (let i = 0; i < 5; i++) {
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      await new Promise(r => setTimeout(r, 3000));
       try {
-        const checkUrl = `https://api.shelbynet.shelby.xyz/shelby/v1/blobs/${address}/${blobName}`;
-        const res = await fetch(checkUrl, { signal: AbortSignal.timeout(3000) });
-        if (res.ok) {
-          const data = await res.json();
-          txHash = data?.transaction_hash ?? data?.txHash ?? null;
+        const checkRes = await fetch(
+          `https://api.shelbynet.shelby.xyz/shelby/v1/blobs/${address}/${blobName}`,
+          { signal: AbortSignal.timeout(3000) }
+        );
+        if (checkRes.ok) {
+          const d  = await checkRes.json();
+          txHash   = d?.transaction_hash ?? d?.txHash ?? null;
           submitTime = performance.now() - t0;
-          isSuccess = true;
+          isSuccess  = true;
           break;
         }
-      } catch (e) {}
-    }
-
-    if (!isSuccess) {
-      return NextResponse.json({ error: `TX failed and not found on-chain: ${err.message}` }, { status: 500 });
+      } catch {}
     }
   }
 
-  // Check on-chain confirmation (Finality)
+  if (!isSuccess) {
+    return NextResponse.json(
+      { error: "TX failed and blob not found on-chain after 15s" },
+      { status: 500 }
+    );
+  }
+
+  // Đợi xác nhận on-chain qua Aptos REST
   let confirmTime = submitTime;
   if (txHash) {
     const tc = performance.now();
     try {
-      await aptos.waitForTransaction({ transactionHash: txHash });
-      confirmTime = submitTime + (performance.now() - tc);
+      // Poll cho đến khi transaction được confirm
+      for (let i = 0; i < 20; i++) {
+        await new Promise(r => setTimeout(r, 500));
+        const r = await fetch(`${APTOS_NODE}/transactions/by_hash/${txHash}`, {
+          signal: AbortSignal.timeout(3000),
+        });
+        if (r.ok) {
+          const d = await r.json();
+          if (d?.success === true || d?.vm_status === "Executed successfully") {
+            confirmTime = submitTime + (performance.now() - tc);
+            break;
+          }
+        }
+      }
     } catch {}
   }
 

@@ -13,7 +13,7 @@ dist/
 .vercel/
 .wrangler/
 
-# Environment variables — KHÔNG BAO GIỜ commit!
+# Environment variables
 .env
 .env.local
 .env.*.local
@@ -47,7 +47,7 @@ next-env.d.ts
 .turbo/
 .cache/
 
-# Wrangler state (local dev)
+# Wrangler state 
 .wrangler/state/
 
 # Test

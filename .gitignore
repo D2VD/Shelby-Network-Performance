@@ -1,64 +1,55 @@
-# ─── Dependencies ────────────────────────────────────────────────────────────
+# Dependencies
 node_modules/
 .pnp
 .pnp.js
 
-# ─── Next.js build output ────────────────────────────────────────────────────
+# Next.js build output
 .next/
 out/
 build/
 dist/
 
-# ─── Environment variables (QUAN TRỌNG: không commit key!) ───────────────────
+# Cloudflare / Vercel build output
+.vercel/
+.wrangler/
+
+# Environment variables
 .env
 .env.local
 .env.*.local
 .env.development
 .env.production
 .env.test
-
-# Chỉ commit file example (không có giá trị thật)
 !.env.example
 
-# ─── Vercel ──────────────────────────────────────────────────────────────────
-.vercel
-
-# ─── Cache ───────────────────────────────────────────────────────────────────
-.cache/
-.eslintcache
-.turbo/
-*.tsbuildinfo
-next-env.d.ts
-
-# ─── OS files ────────────────────────────────────────────────────────────────
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-Thumbs.db
-desktop.ini
-
-# ─── Editor ──────────────────────────────────────────────────────────────────
-.vscode/settings.json
-.idea/
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-
-# ─── Logs ────────────────────────────────────────────────────────────────────
+# Logs
 npm-debug.log*
 yarn-debug.log*
-yarn-error.log*
 pnpm-debug.log*
 *.log
 
-# ─── Test coverage ───────────────────────────────────────────────────────────
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/settings.json
+.idea/
+*.suo
+*.sw?
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# Cache
+.eslintcache
+.turbo/
+.cache/
+
+# Wrangler state 
+.wrangler/state/
+
+# Test
 coverage/
 .nyc_output/
-
-# ─── Misc ────────────────────────────────────────────────────────────────────
-*.pem
-.yarn/install-state.gz

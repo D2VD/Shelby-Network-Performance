@@ -80,7 +80,7 @@ export default function ProvidersPage() {
   const { network, config } = useNetwork();
   const { providers, loading, error, source, fetchedAt, refresh } = useProviders();
   const [selected, setSelected]  = useState<StorageProvider|null>(null);
-  const [showTable, setShowTable] = useState(false);
+  const [showTable, setShowTable] = useState(true); // mặc định hiện table
 
   const zones        = useMemo(() => { const m=new Map<string,number>(); providers.forEach(p=>m.set(p.availabilityZone,(m.get(p.availabilityZone)??0)+1)); return m; }, [providers]);
   const activeCount  = providers.filter(p=>p.state==="Active").length;

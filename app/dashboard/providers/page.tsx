@@ -1,8 +1,8 @@
 "use client";
-// app/dashboard/providers/page.tsx v3
-// Globe vẫn dùng canvas tối (đẹp hơn cho globe), UI xung quanh light
+// app/dashboard/providers/page.tsx v3.1
+// FIX: Table hover tooltip (giống panel trên globe) + cột BLS Key
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef, useCallback } from "react";
 import dynamic from "next/dynamic";
 import { useNetwork } from "@/components/network-context";
 import { useProviders } from "@/lib/use-providers";
@@ -32,6 +32,7 @@ function GeoTag({ source }: { source?:string }) {
   return <span className={`badge badge-${isGeo?"blue":"amber"}`} style={{ fontSize:10 }}>{isGeo?"Geo-IP":"Zone est."}</span>;
 }
 
+// ── Panel khi click node trên globe ──────────────────────────────────────────
 function ProviderPanel({ p, accentColor, network, onClose }: { p: StorageProvider&{fullBlsKey?:string}; accentColor:string; network:string; onClose:()=>void }) {
   return (
     <div style={{ position:"absolute", top:16, right:16, zIndex:30, width:300, background:"rgba(13,17,23,0.96)", backdropFilter:"blur(16px)", border:`1px solid ${accentColor}44`, borderRadius:14, padding:"18px 20px", boxShadow:"0 16px 48px rgba(0,0,0,0.7)" }}>
@@ -64,7 +65,13 @@ function ProviderPanel({ p, accentColor, network, onClose }: { p: StorageProvide
           <span style={{ fontFamily: mono?"var(--font-mono)":"inherit", fontSize:11, color:"#9ca3af", maxWidth:"65%", textAlign:"right", wordBreak:"break-all" }}>{v}</span>
         </div>
       ))}
-      <div style={{ marginTop:8, marginBottom:12, padding:"8px 10px", background:"rgba(255,255,255,0.04)", borderRadius:6 }}>
+      {p.blsKey && p.blsKey !== "—" && (
+        <div style={{ marginBottom:12, padding:"8px 10px", background:"rgba(255,255,255,0.04)", borderRadius:6 }}>
+          <div style={{ fontSize:8, color:"#6b7280", letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:3 }}>BLS Key</div>
+          <div style={{ fontFamily:"var(--font-mono)", fontSize:9.5, color:"#4b5563", wordBreak:"break-all", lineHeight:1.5 }}>{p.fullBlsKey || p.blsKey}</div>
+        </div>
+      )}
+      <div style={{ marginBottom:12, padding:"8px 10px", background:"rgba(255,255,255,0.04)", borderRadius:6 }}>
         <div style={{ fontSize:8, color:"#6b7280", letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:3 }}>Full Address</div>
         <div style={{ fontFamily:"var(--font-mono)", fontSize:9.5, color:"#4b5563", wordBreak:"break-all", lineHeight:1.5 }}>{p.address}</div>
       </div>
@@ -76,11 +83,147 @@ function ProviderPanel({ p, accentColor, network, onClose }: { p: StorageProvide
   );
 }
 
+// ── Table row hover tooltip (light theme) ────────────────────────────────────
+function RowTooltip({ p, anchorRef, accentColor, network }: {
+  p: StorageProvider & { fullBlsKey?: string };
+  anchorRef: React.RefObject<HTMLTableRowElement | null>;
+  accentColor: string;
+  network: string;
+}) {
+  return (
+    <div style={{
+      position: "fixed",
+      zIndex: 999,
+      pointerEvents: "none",
+    }}>
+      {/* Tooltip được position bằng JS, xem RowWithTooltip */}
+    </div>
+  );
+}
+
+// ── Table row với hover tooltip inline (không dùng portal) ───────────────────
+function RowWithTooltip({
+  p, accentColor, network, onClick,
+}: {
+  p: StorageProvider & { fullBlsKey?: string };
+  accentColor: string;
+  network: string;
+  onClick: () => void;
+}) {
+  const [hovered, setHovered] = useState(false);
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const rowRef = useRef<HTMLTableRowElement>(null);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    setPos({ x: e.clientX, y: e.clientY });
+  }, []);
+
+  return (
+    <>
+      <tr
+        ref={rowRef}
+        onClick={onClick}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        onMouseMove={handleMouseMove}
+        style={{ cursor: "pointer" }}
+      >
+        <td><span className="mono" style={{ color:"var(--info)", fontSize:12 }}>{p.addressShort}</span></td>
+        <td style={{ fontSize:12 }}>{p.geo?.city ? `${p.geo.city}, ${p.geo.countryCode}` : "—"}</td>
+        <td><GeoTag source={p.geo?.source}/></td>
+        <td><Badge label={p.state}  ok={p.state==="Active"}/></td>
+        <td><Badge label={p.health} ok={p.health==="Healthy"}/></td>
+        <td><span className="mono text-sm">{p.capacityTiB ? `${p.capacityTiB.toFixed(2)} TiB` : "—"}</span></td>
+        <td>
+          <span className="mono text-sm text-muted" style={{ fontSize:11 }}>
+            {p.blsKey && p.blsKey !== "—" ? p.blsKey : "—"}
+          </span>
+        </td>
+        <td><span className="text-sm text-muted">{ZONE_META[p.availabilityZone]?.shortLabel ?? p.availabilityZone}</span></td>
+      </tr>
+
+      {/* Hover tooltip — rendered via fixed portal vibe với inline style */}
+      {hovered && (
+        <tr style={{ height: 0, border: "none", padding: 0 }}>
+          <td colSpan={8} style={{ padding: 0, border: "none", height: 0 }}>
+            <div style={{
+              position: "fixed",
+              left: pos.x + 18,
+              top: pos.y - 10,
+              zIndex: 9999,
+              pointerEvents: "none",
+              width: 260,
+              background: "rgba(13,17,23,0.97)",
+              backdropFilter: "blur(16px)",
+              border: `1px solid ${accentColor}44`,
+              borderRadius: 12,
+              padding: "14px 16px",
+              boxShadow: "0 16px 40px rgba(0,0,0,0.55)",
+            }}>
+              {/* Header */}
+              <div style={{ fontSize:9, color:"#6b7280", textTransform:"uppercase", letterSpacing:"0.12em", marginBottom:4 }}>Storage Provider</div>
+              <div style={{ fontFamily:"var(--font-mono)", fontSize:12.5, color:accentColor, marginBottom:10, wordBreak:"break-all" }}>{p.addressShort}</div>
+
+              {/* Badges */}
+              <div style={{ display:"flex", gap:5, flexWrap:"wrap", marginBottom:10 }}>
+                <Badge label={p.state}  ok={p.state==="Active"}/>
+                <Badge label={p.health} ok={p.health==="Healthy"}/>
+                {p.geo && <GeoTag source={p.geo.source}/>}
+              </div>
+
+              {/* Location */}
+              {p.geo?.city && (
+                <div style={{ marginBottom:8, padding:"8px 10px", background:"rgba(255,255,255,0.05)", borderRadius:7 }}>
+                  <div style={{ fontSize:8, color:"#6b7280", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:2 }}>Location</div>
+                  <div style={{ fontFamily:"var(--font-mono)", fontSize:11, color:"#e5e7eb" }}>
+                    {[p.geo.city, p.geo.countryCode].filter(Boolean).join(", ")}
+                  </div>
+                  <div style={{ fontSize:10, color:"#4b5563", marginTop:1 }}>
+                    {p.geo.lat.toFixed(4)}°, {p.geo.lng.toFixed(4)}°
+                  </div>
+                </div>
+              )}
+
+              {/* Key-value rows */}
+              {[
+                { l:"Zone",     v: ZONE_META[p.availabilityZone]?.label ?? p.availabilityZone },
+                { l:"Capacity", v: p.capacityTiB ? `${p.capacityTiB.toFixed(2)} TiB` : "—" },
+                { l:"Net IP",   v: p.netAddress || "—" },
+              ].map(({ l, v }) => (
+                <div key={l} style={{ display:"flex", justifyContent:"space-between", marginBottom:5 }}>
+                  <span style={{ fontSize:9, color:"#6b7280", textTransform:"uppercase", letterSpacing:"0.1em" }}>{l}</span>
+                  <span style={{ fontFamily:"var(--font-mono)", fontSize:10.5, color:"#9ca3af", maxWidth:"58%", textAlign:"right", wordBreak:"break-all" }}>{v}</span>
+                </div>
+              ))}
+
+              {/* BLS Key */}
+              {p.blsKey && p.blsKey !== "—" && (
+                <div style={{ marginTop:6, padding:"7px 9px", background:"rgba(255,255,255,0.04)", borderRadius:6 }}>
+                  <div style={{ fontSize:8, color:"#6b7280", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:2 }}>BLS Key</div>
+                  <div style={{ fontFamily:"var(--font-mono)", fontSize:9, color:"#4b5563", wordBreak:"break-all", lineHeight:1.5 }}>
+                    {p.fullBlsKey || p.blsKey}
+                  </div>
+                </div>
+              )}
+
+              {/* Hint */}
+              <div style={{ marginTop:8, fontSize:9, color:"#4b5563", textAlign:"center" }}>
+                Click to open detail panel
+              </div>
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+// ── Main Page ─────────────────────────────────────────────────────────────────
 export default function ProvidersPage() {
   const { network, config } = useNetwork();
   const { providers, loading, error, source, fetchedAt, refresh } = useProviders();
   const [selected, setSelected]  = useState<StorageProvider|null>(null);
-  const [showTable, setShowTable] = useState(true); // mặc định hiện table
+  const [showTable, setShowTable] = useState(true);
 
   const zones        = useMemo(() => { const m=new Map<string,number>(); providers.forEach(p=>m.set(p.availabilityZone,(m.get(p.availabilityZone)??0)+1)); return m; }, [providers]);
   const activeCount  = providers.filter(p=>p.state==="Active").length;
@@ -145,7 +288,7 @@ export default function ProvidersPage() {
         </div>
       </div>
 
-      {/* Table */}
+      {/* Table với hover tooltip + BLS Key column */}
       {showTable && providers.length > 0 && (
         <div className="card">
           <div className="card-header">
@@ -156,21 +299,25 @@ export default function ProvidersPage() {
             <table className="data-table">
               <thead>
                 <tr>
-                  <th>Address</th><th>Location</th><th>Source</th>
-                  <th>State</th><th>Health</th><th>Capacity</th><th>Zone</th>
+                  <th>Address</th>
+                  <th>Location</th>
+                  <th>Source</th>
+                  <th>State</th>
+                  <th>Health</th>
+                  <th>Capacity</th>
+                  <th>BLS Key</th>
+                  <th>Zone</th>
                 </tr>
               </thead>
               <tbody>
                 {providers.map(p => (
-                  <tr key={p.address} onClick={()=>setSelected(p)} style={{ cursor:"pointer" }}>
-                    <td><span className="mono" style={{ color:"var(--info)", fontSize:12 }}>{p.addressShort}</span></td>
-                    <td style={{ fontSize:12 }}>{p.geo?.city ? `${p.geo.city}, ${p.geo.countryCode}` : "—"}</td>
-                    <td><GeoTag source={p.geo?.source}/></td>
-                    <td><Badge label={p.state}  ok={p.state==="Active"}/></td>
-                    <td><Badge label={p.health} ok={p.health==="Healthy"}/></td>
-                    <td><span className="mono text-sm">{p.capacityTiB ? `${p.capacityTiB.toFixed(2)} TiB`:"—"}</span></td>
-                    <td><span className="text-sm text-muted">{ZONE_META[p.availabilityZone]?.shortLabel ?? p.availabilityZone}</span></td>
-                  </tr>
+                  <RowWithTooltip
+                    key={p.address}
+                    p={p as any}
+                    accentColor={config.color}
+                    network={network}
+                    onClick={() => setSelected(p)}
+                  />
                 ))}
               </tbody>
             </table>

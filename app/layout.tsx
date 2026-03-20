@@ -1,6 +1,5 @@
 // app/layout.tsx
-// FIX: Xóa Suspense bọc NetworkProvider — useSearchParams đã được wrap bên trong
-// network-context.tsx rồi. Để Suspense ở đây gây lỗi với Next.js 15 strict mode.
+// FIX: MetricsPanel sticky khi scroll (position: sticky, top: 60px, height: calc)
 
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
@@ -31,15 +30,39 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         />
       </head>
       <body suppressHydrationWarning>
-        {/* NetworkProvider tự wrap Suspense bên trong cho useSearchParams */}
         <NetworkProvider>
           <div className="app-shell">
+            {/* Nav sticky ở top */}
             <Nav />
-            <div className="body-layout">
-              <main className="main-content">
+
+            {/* Body: main content + sticky right panel */}
+            <div style={{ display: "flex", flex: 1, minHeight: "calc(100vh - 60px)" }}>
+
+              {/* Main scrollable content */}
+              <main style={{
+                flex: 1,
+                minWidth: 0,
+                padding: "32px 36px 60px",
+                maxWidth: 1200,
+                width: "100%",
+                margin: "0 auto",
+              }}>
                 {children}
               </main>
-              <MetricsPanel />
+
+              {/* ✅ MetricsPanel — sticky, không cuộn cùng page */}
+              <div style={{
+                position: "sticky",
+                top: 60,           /* chiều cao nav */
+                height: "calc(100vh - 60px)",
+                overflowY: "auto",
+                flexShrink: 0,
+                borderLeft: "1px solid #EBEBEB",
+                background: "#fff",
+              }}>
+                <MetricsPanel />
+              </div>
+
             </div>
           </div>
         </NetworkProvider>

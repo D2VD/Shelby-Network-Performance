@@ -262,9 +262,11 @@ export default function GlobeEngine({
       const H    = canvas.height / dpr;
       const { lon: viewLon, lat: viewLat, zoom } = viewRef.current;
 
+      // ✅ FIX BUG 1: clearRect dùng pixel thực (TRƯỚC save/scale)
+      // canvas.width/height là kích thước pixel vật lý, không bị ảnh hưởng bởi DPR scale
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.save();
       ctx.scale(dpr, dpr);
-      ctx.clearRect(0, 0, W, H);
 
       const radius = Math.min(W, H) * 0.42 * zoom;
       const cx = W / 2, cy = H / 2;
@@ -510,6 +512,23 @@ export default function GlobeEngine({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dots, providers, rgb, hoveredSP, spawnArcs]);
 
+  // ✅ FIX BUG 2: Wheel zoom dùng addEventListener với { passive: false }
+  // React synthetic onWheel event là passive: true trên modern browsers → không thể preventDefault
+  // → page vẫn scroll. Giải pháp: attach native listener thủ công sau khi canvas mount.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const handler = (e: WheelEvent) => {
+      e.preventDefault();
+      setViewState(v => ({
+        ...v,
+        zoom: Math.max(0.6, Math.min(3.0, v.zoom - e.deltaY * 0.001)),
+      }));
+    };
+    canvas.addEventListener("wheel", handler, { passive: false });
+    return () => canvas.removeEventListener("wheel", handler);
+  }, []);
+
   // ── Mouse handlers ────────────────────────────────────────────────────────────
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     isDragging.current = true;
@@ -565,15 +584,11 @@ export default function GlobeEngine({
     setViewState(v => ({ ...v, lon: 110, lat: 15, autoRotate: true }));
   }, []);
 
-  const handleWheel = useCallback((e: React.WheelEvent) => {
-    e.preventDefault();
-    setViewState(v => ({ ...v, zoom: Math.max(0.6, Math.min(3.0, v.zoom - e.deltaY * 0.001)) }));
-  }, []);
-
   // ── Render ────────────────────────────────────────────────────────────────────
   return (
     <div style={{ position: "relative", width: "100%", height: "100%", background: "#030507", userSelect: "none" }}>
 
+      {/* ✅ onWheel removed — handled by native addEventListener above */}
       <canvas
         ref={canvasRef}
         style={{ display: "block", width: "100%", height: "100%", cursor: "grab" }}
@@ -583,7 +598,6 @@ export default function GlobeEngine({
         onMouseLeave={handleMouseLeave}
         onClick={handleClick}
         onDoubleClick={handleDblClick}
-        onWheel={handleWheel}
       />
 
       {/* Scanline overlay */}

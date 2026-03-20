@@ -5,7 +5,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 // Node.js runtime — SDK + WASM
-// export const runtime = "edge"; // BỎ
+export const runtime = "edge"; // BỎ
 
 const TEST_SIZES = [1_024, 10_240, 102_400];
 

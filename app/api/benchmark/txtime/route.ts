@@ -4,7 +4,7 @@
 import { NextResponse } from "next/server";
 
 // Node.js runtime
-// export const runtime = "edge"; // BỎ
+export const runtime = "edge"; // BỎ
 
 function bufferToBlob(buf: Buffer): Blob {
   return new Blob([Uint8Array.from(buf)]);

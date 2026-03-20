@@ -6,7 +6,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 // Node.js runtime — SDK + WASM
-// export const runtime = "edge"; // BỎ
+export const runtime = "edge"; // BỎ
 
 export const revalidate = 15;
 

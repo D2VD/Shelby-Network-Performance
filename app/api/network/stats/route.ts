@@ -1,19 +1,17 @@
-// app/api/network/stats/route.ts — FINAL v7
-// ✅ edge runtime (CF Pages bắt buộc)
-//
-// Priority chain:
-// 1. GET Worker /stats  → Worker gọi Explorer OK (không bị block)
-// 2. GET Explorer trực tiếp → OK trên local, có thể bị block trên CF Pages
-// 3. On-chain RPC fallback  → Số liệu kém chính xác nhưng không crash
-//
-// Setup: Thêm SHELBY_WORKER_URL vào CF Pages env vars
-// Value: https://shelby-geo-sync.<your-subdomain>.workers.dev
-// Tìm URL: CF Dashboard → Workers & Pages → shelby-geo-sync → Settings → Domains
+// app/api/network/stats/route.ts — v8
+// FIX: Hardcode Worker URL (không phụ thuộc env var SHELBY_WORKER_URL)
+// FIX: Trả error detail trong response để debug
+// Worker URL: https://shelby-geo-sync.doanvandanh20000.workers.dev
 
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime    = "edge";
 export const revalidate = 15;
+
+// Worker URL hardcode — đổi nếu subdomain khác
+// Hoặc set env var SHELBY_WORKER_URL để override
+const WORKER_URL = process.env.SHELBY_WORKER_URL
+  ?? "https://shelby-geo-sync.doanvandanh20000.workers.dev";
 
 const CONFIGS = {
   shelbynet: {
@@ -29,18 +27,15 @@ const CONFIGS = {
 } as const;
 
 type NetKey = keyof typeof CONFIGS;
-
-const n = (v: any, fb = 0): number => {
-  const x = Number(v ?? fb);
-  return isNaN(x) ? fb : x;
-};
+const n = (v: any, fb = 0): number => { const x = Number(v ?? fb); return isNaN(x) ? fb : x; };
 
 export async function GET(req: NextRequest) {
   const networkParam = (new URL(req.url).searchParams.get("network") ?? "shelbynet") as NetKey;
   const cfg          = CONFIGS[networkParam] ?? CONFIGS.shelbynet;
   const fetchedAt    = new Date().toISOString();
+  const errors: string[] = [];
 
-  // ── Node info (không phụ thuộc priority) ─────────────────────────────────
+  // ── Node info ─────────────────────────────────────────────────────────────
   let node: any = null;
   try {
     const r = await fetch(`${cfg.nodeUrl}/`, { signal: AbortSignal.timeout(5_000) });
@@ -52,32 +47,46 @@ export async function GET(req: NextRequest) {
         chainId:       n(d.chain_id),
       };
     }
-  } catch {}
+  } catch (e: any) { errors.push(`node: ${e.message}`); }
 
   // ── Priority 1: Worker /stats ─────────────────────────────────────────────
-  // Worker (shelby-geo-sync) có thể gọi Explorer API không bị block
-  const workerUrl = process.env.SHELBY_WORKER_URL;
-  if (workerUrl) {
-    try {
-      const r = await fetch(
-        `${workerUrl}/stats?network=${networkParam}`,
-        { signal: AbortSignal.timeout(8_000) }
-      );
-      if (r.ok) {
-        const data = await r.json() as any;
-        if (data?.ok && data?.data?.stats) {
-          // Merge node info mới nhất (fresh từ request này)
-          if (node && data.data) data.data.node = node;
-          return NextResponse.json(data, {
-            headers: { "Cache-Control": "public, max-age=15, stale-while-revalidate=60" }
-          });
-        }
+  try {
+    const workerRes = await fetch(
+      `${WORKER_URL}/stats?network=${networkParam}`,
+      {
+        signal: AbortSignal.timeout(10_000),
+        headers: { "Accept": "application/json" },
       }
-    } catch { /* Worker không khả dụng hoặc chưa deploy */ }
+    );
+
+    if (workerRes.ok) {
+      const data = await workerRes.json() as any;
+
+      // Validate response có đủ data
+      const s = data?.data?.stats;
+      const hasRealData = s && (
+        (s.totalBlobs != null && s.totalBlobs > 10) ||
+        (s.storageProviders != null && s.storageProviders > 0) ||
+        (s.totalBlobEvents != null && s.totalBlobEvents > 0)
+      );
+
+      if (hasRealData) {
+        // Merge fresh node info
+        if (node && data.data) data.data.node = node;
+        return NextResponse.json(data, {
+          headers: { "Cache-Control": "public, max-age=15, stale-while-revalidate=60" }
+        });
+      } else {
+        errors.push(`worker: responded but no real data (blobs=${s?.totalBlobs})`);
+      }
+    } else {
+      errors.push(`worker: HTTP ${workerRes.status}`);
+    }
+  } catch (e: any) {
+    errors.push(`worker: ${e.message}`);
   }
 
   // ── Priority 2: Explorer API trực tiếp ───────────────────────────────────
-  // Hoạt động tốt trên local dev; trên CF Pages có thể bị block tùy region
   let stats: Record<string, number | null> = {
     totalBlobs: null, totalStorageUsedBytes: null, totalBlobEvents: null,
     storageProviders: null, placementGroups: null, slices: null,
@@ -92,7 +101,6 @@ export async function GET(req: NextRequest) {
     if (r.ok) {
       const d = await r.json() as any;
       const blobs = n(d.total_blobs ?? d.totalBlobs);
-      // Chỉ dùng nếu có data thực (không phải 0)
       if (blobs > 0) {
         stats = {
           totalBlobs:            blobs,
@@ -103,19 +111,24 @@ export async function GET(req: NextRequest) {
           slices:                n(d.slices),
         };
         statsSource = "explorer-direct";
+      } else {
+        errors.push(`explorer: blobs=0 (may be blocked)`);
       }
+    } else {
+      errors.push(`explorer: HTTP ${r.status}`);
     }
-  } catch { /* bị block trên CF Pages edge — tiếp tục fallback */ }
+  } catch (e: any) {
+    errors.push(`explorer: ${e.message}`);
+  }
 
-  // ── Priority 3: On-chain RPC (always runs for providers/PGs if missing) ──
-  if (!stats.storageProviders || !stats.placementGroups || statsSource === "none") {
+  // ── Priority 3: On-chain RPC ──────────────────────────────────────────────
+  if (statsSource === "none") {
     try {
       const [pgR, spR, slR] = await Promise.allSettled([
         fetch(`${cfg.nodeUrl}/accounts/${cfg.core}/resource/${cfg.core}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5_000) }),
         fetch(`${cfg.nodeUrl}/accounts/${cfg.core}/resource/${cfg.core}::storage_provider_registry::StorageProviders`, { signal: AbortSignal.timeout(5_000) }),
         fetch(`${cfg.nodeUrl}/accounts/${cfg.core}/resource/${cfg.core}::slice_registry::SliceRegistry`, { signal: AbortSignal.timeout(5_000) }),
       ]);
-
       if (pgR.status === "fulfilled" && pgR.value.ok) {
         const d = await pgR.value.json() as any;
         stats.placementGroups = n(d?.data?.next_unassigned_placement_group_index);
@@ -130,21 +143,19 @@ export async function GET(req: NextRequest) {
         const d = await slR.value.json() as any;
         const sl = n(d?.data?.slices?.big_vec?.vec?.[0]?.end_index)
                  + n(d?.data?.slices?.inline_vec?.length);
-        stats.slices = sl;
-        // Chỉ estimate blob count nếu Explorer không cung cấp
-        if (!stats.totalBlobs && sl > 0) {
-          stats.totalBlobs = Math.ceil(sl / 16);
-          statsSource = "on-chain-rpc";
-        }
+        stats.slices     = sl;
+        stats.totalBlobs = sl > 0 ? Math.ceil(sl / 16) : null;
       }
-
-      if (statsSource === "none") statsSource = "on-chain-rpc";
-    } catch { statsSource = "failed"; }
+      statsSource = "on-chain-rpc";
+    } catch (e: any) {
+      errors.push(`rpc: ${e.message}`);
+      statsSource = "failed";
+    }
   }
 
   return NextResponse.json({
     ok: true,
-    data: { node, stats, network: networkParam, statsSource },
+    data: { node, stats, network: networkParam, statsSource, _errors: errors },
     fetchedAt,
   });
 }

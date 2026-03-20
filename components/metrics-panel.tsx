@@ -1,7 +1,7 @@
 "use client";
-// components/metrics-panel.tsx v3
-// Sidebar nhỏ bên phải, sticky, collapsible
-// Hiển thị 6 network metrics + block height + live indicator
+// components/metrics-panel.tsx v3.1
+// FIX: Không hardcode width — lấy 100% từ container sticky div trong layout.tsx
+// Layout.tsx đã set container width=260px, panel chỉ cần width:100% height:100%
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useNetwork } from "./network-context";
@@ -33,19 +33,22 @@ function fmtBytes(b: number | null): string {
 }
 
 const METRICS = [
-  { key: "totalBlobs",            label: "Total Blobs",       accent: "accent-blue",   fmt: fmt       },
-  { key: "slices",                label: "Slices",            accent: "accent-amber",  fmt: fmt       },
-  { key: "storageProviders",      label: "Providers",         accent: "accent-green",  fmt: fmt       },
-  { key: "placementGroups",       label: "Pl. Groups",        accent: "accent-purple", fmt: fmt       },
-  { key: "totalStorageUsedBytes", label: "Storage Used",      accent: "accent-blue",   fmt: fmtBytes  },
-  { key: "totalBlobEvents",       label: "Blob Events",       accent: "accent-green",  fmt: fmt       },
+  { key: "totalBlobs",            label: "Total Blobs",  accent: "accent-blue",   fmt: fmt       },
+  { key: "slices",                label: "Slices",       accent: "accent-amber",  fmt: fmt       },
+  { key: "storageProviders",      label: "Providers",    accent: "accent-green",  fmt: fmt       },
+  { key: "placementGroups",       label: "Pl. Groups",   accent: "accent-purple", fmt: fmt       },
+  { key: "totalStorageUsedBytes", label: "Storage Used", accent: "accent-blue",   fmt: fmtBytes  },
+  { key: "totalBlobEvents",       label: "Blob Events",  accent: "accent-green",  fmt: fmt       },
 ] as const;
 
 export function MetricsPanel() {
   const { network } = useNetwork();
   const [collapsed, setCollapsed] = useState(false);
-  const [stats,  setStats]  = useState<Stats>({ totalBlobs: null, totalStorageUsedBytes: null, totalBlobEvents: null, slices: null, placementGroups: null, storageProviders: null });
-  const [node,   setNode]   = useState<NodeInfo | null>(null);
+  const [stats,  setStats]  = useState<Stats>({
+    totalBlobs: null, totalStorageUsedBytes: null, totalBlobEvents: null,
+    slices: null, placementGroups: null, storageProviders: null,
+  });
+  const [node,    setNode]    = useState<NodeInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [lastAt,  setLastAt]  = useState<string>("");
   const prevVals = useRef<Record<string, string>>({});
@@ -58,7 +61,6 @@ export function MetricsPanel() {
       const d = await res.json();
       if (d.data?.stats) {
         const newStats = d.data.stats as Stats;
-        // Detect changes → pulse animation
         const changed: Record<string, boolean> = {};
         METRICS.forEach(m => {
           const newVal = String(newStats[m.key as keyof Stats] ?? "");
@@ -88,64 +90,123 @@ export function MetricsPanel() {
     return () => clearInterval(id);
   }, [fetchStats]);
 
+  // ── Collapsed state ────────────────────────────────────────────────────────
   if (collapsed) {
     return (
-      <div className="metrics-panel" style={{ width: 44 }}>
+      <div style={{
+        width: "100%", height: "100%",
+        display: "flex", flexDirection: "column", alignItems: "center",
+        paddingTop: 16, gap: 8,
+      }}>
         <button
           onClick={() => setCollapsed(false)}
-          className="panel-toggle"
           title="Show metrics"
-          style={{ width: "100%", height: 36 }}
-        >
-          ◀
-        </button>
+          style={{
+            background: "none", border: "1px solid #E8E8E8", borderRadius: 7,
+            cursor: "pointer", color: "#999", fontSize: 11, padding: "6px 8px",
+            width: 36, lineHeight: 1,
+          }}
+        >◀</button>
       </div>
     );
   }
 
+  // ── Expanded state ─────────────────────────────────────────────────────────
   return (
-    <div className="metrics-panel">
+    <div style={{
+      width: "100%",
+      height: "100%",
+      padding: "20px 18px",
+      display: "flex",
+      flexDirection: "column",
+      gap: 10,
+    }}>
+
       {/* Header */}
-      <div className="metrics-panel-header">
-        <span className="metrics-panel-title">Network</span>
-        <button className="panel-toggle" onClick={() => setCollapsed(true)} title="Collapse">
-          ▶
-        </button>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
+        <span style={{
+          fontSize: 11, fontWeight: 600, textTransform: "uppercase",
+          letterSpacing: "0.08em", color: "var(--gray-500)",
+        }}>
+          Network
+        </span>
+        <button
+          onClick={() => setCollapsed(true)}
+          title="Collapse"
+          style={{
+            background: "none", border: "1px solid #E8E8E8", borderRadius: 6,
+            cursor: "pointer", color: "#AAA", fontSize: 11, padding: "3px 6px",
+            lineHeight: 1, transition: "all 0.14s",
+          }}
+        >▶</button>
       </div>
 
       {/* Live indicator */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-        <div className="live-dot">
-          <span className="live-dot-circle" />
-          <span style={{ fontSize: 12, color: "var(--gray-500)" }}>{loading ? "Syncing…" : "Live"}</span>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{
+            width: 7, height: 7, borderRadius: "50%", background: "#22c55e", flexShrink: 0,
+            animation: "pulse 2s cubic-bezier(0.4,0,0.6,1) infinite",
+            boxShadow: "0 0 0 2px #dcfce7",
+          }} />
+          <span style={{ fontSize: 12, color: "var(--gray-500)" }}>
+            {loading ? "Syncing…" : "Live"}
+          </span>
         </div>
-        {lastAt && <span style={{ fontSize: 11, color: "var(--gray-400)", fontFamily: "var(--font-mono)" }}>{lastAt}</span>}
+        {lastAt && (
+          <span style={{ fontSize: 10, color: "var(--gray-400)", fontFamily: "var(--font-mono)" }}>
+            {lastAt}
+          </span>
+        )}
       </div>
 
-      {/* Block height */}
+      {/* Block ticker */}
       {node && (
-        <div className="block-ticker">
-          <span className="block-ticker-label">Block</span>
-          <span className="block-ticker-value">#{node.blockHeight.toLocaleString()}</span>
+        <div style={{
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          padding: "8px 12px", background: "var(--net-bg)", border: "1px solid var(--net-border)",
+          borderRadius: 8, marginBottom: 2,
+        }}>
+          <span style={{
+            fontSize: 10, fontWeight: 700, textTransform: "uppercase",
+            letterSpacing: "0.07em", color: "var(--net-text)",
+          }}>Block</span>
+          <span style={{
+            fontFamily: "var(--font-mono)", fontSize: 13,
+            fontWeight: 700, color: "var(--net-color)",
+          }}>
+            #{node.blockHeight.toLocaleString()}
+          </span>
         </div>
       )}
-      {!node && loading && <div className="skeleton" style={{ height: 40, marginBottom: 8 }} />}
+      {!node && loading && (
+        <div className="skeleton" style={{ height: 40, marginBottom: 4 }} />
+      )}
 
-      {/* 6 metrics */}
+      {/* 6 metric items */}
       {METRICS.map(m => {
         const rawVal = stats[m.key as keyof Stats];
         const display = loading && rawVal == null ? "…" : m.fmt(rawVal as any);
         const isPulsing = pulses[m.key];
         return (
-          <div key={m.key} className={`metric-item ${m.accent}`}>
-            <div className="metric-item-label">{m.label}</div>
-            <div
-              className="metric-item-value"
-              style={{
-                transition: "color 0.3s",
-                color: isPulsing ? "var(--net-color)" : undefined,
-              }}
-            >
+          <div key={m.key} style={{
+            padding: "10px 12px",
+            background: "var(--gray-50)",
+            border: "1px solid var(--gray-100)",
+            borderRadius: 10,
+          }}>
+            <div style={{
+              fontSize: 10, color: "var(--gray-500)", fontWeight: 600,
+              textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3,
+            }}>
+              {m.label}
+            </div>
+            <div style={{
+              fontFamily: "var(--font-mono)", fontSize: 18, fontWeight: 700,
+              color: isPulsing ? "var(--net-color)" : "var(--gray-900)",
+              transition: "color 0.3s",
+              lineHeight: 1.2,
+            }}>
               {display}
             </div>
           </div>
@@ -154,14 +215,18 @@ export function MetricsPanel() {
 
       {/* Chain info footer */}
       {node && (
-        <div style={{ padding: "10px 2px 0", borderTop: "1px solid var(--gray-100)", marginTop: 4 }}>
+        <div style={{ paddingTop: 10, borderTop: "1px solid var(--gray-100)", marginTop: 2 }}>
           {[
-            { label: "Chain ID", value: String(node.chainId) },
-            { label: "Ledger",   value: node.ledgerVersion.toLocaleString() },
+            { label: "Chain ID", value: String(node.chainId)                      },
+            { label: "Ledger",   value: node.ledgerVersion.toLocaleString()        },
           ].map(({ label, value }) => (
-            <div key={label} style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-              <span style={{ fontSize: 11, color: "var(--gray-400)", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</span>
-              <span style={{ fontSize: 12, fontFamily: "var(--font-mono)", color: "var(--gray-600)" }}>{value}</span>
+            <div key={label} style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+              <span style={{ fontSize: 11, color: "var(--gray-400)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                {label}
+              </span>
+              <span style={{ fontSize: 12, fontFamily: "var(--font-mono)", color: "var(--gray-600)" }}>
+                {value}
+              </span>
             </div>
           ))}
         </div>

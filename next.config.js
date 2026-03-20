@@ -1,5 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // SDK + WASM chạy server-side (Node.js runtime)
   serverExternalPackages: [
     "@shelby-protocol/sdk",
     "@shelby-protocol/clay-codes",
@@ -8,6 +9,7 @@ const nextConfig = {
     "got",
   ],
 
+  // Include WASM files trong bundle output cho Node.js routes
   outputFileTracingIncludes: {
     "/api/**": [
       "./node_modules/@shelby-protocol/clay-codes/dist/*.wasm",
@@ -27,8 +29,10 @@ const nextConfig = {
       },
       { source: "/_next/static/(.*)", headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }] },
       { source: "/geo/(.*)",          headers: [{ key: "Cache-Control", value: "public, max-age=604800" }] },
+      // stats dùng Node.js route — cache ngắn hơn
       { source: "/api/network/stats", headers: [{ key: "Cache-Control", value: "public, max-age=15, stale-while-revalidate=60" }] },
       { source: "/api/network/providers", headers: [{ key: "Cache-Control", value: "public, max-age=60, stale-while-revalidate=300" }] },
+      // benchmark routes không cache
       { source: "/api/benchmark/(.*)", headers: [{ key: "Cache-Control", value: "no-store" }] },
     ];
   },
@@ -40,6 +44,7 @@ const nextConfig = {
         stream: false, path: false, http: false, https: false, zlib: false,
       };
     }
+    // Enable asyncWebAssembly cho clay-codes WASM
     config.experiments = { ...config.experiments, asyncWebAssembly: true };
     return config;
   },

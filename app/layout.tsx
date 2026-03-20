@@ -1,5 +1,5 @@
 // app/layout.tsx
-// FIX: MetricsPanel sticky khi scroll (position: sticky, top: 60px, height: calc)
+// FIX: MetricsPanel sticky + wider (220px → 260px)
 
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
@@ -32,31 +32,28 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body suppressHydrationWarning>
         <NetworkProvider>
           <div className="app-shell">
-            {/* Nav sticky ở top */}
             <Nav />
 
-            {/* Body: main content + sticky right panel */}
-            <div style={{ display: "flex", flex: 1, minHeight: "calc(100vh - 60px)" }}>
+            {/* Body row: main + sticky right panel */}
+            <div style={{ display: "flex", flex: 1, minHeight: "calc(100vh - 60px)", alignItems: "flex-start" }}>
 
-              {/* Main scrollable content */}
+              {/* Scrollable main content */}
               <main style={{
                 flex: 1,
                 minWidth: 0,
                 padding: "32px 36px 60px",
-                maxWidth: 1200,
-                width: "100%",
-                margin: "0 auto",
               }}>
                 {children}
               </main>
 
-              {/* ✅ MetricsPanel — sticky, không cuộn cùng page */}
+              {/* ✅ Sticky right panel — rộng 260px, không cuộn cùng page */}
               <div style={{
+                width: 260,
+                flexShrink: 0,
                 position: "sticky",
-                top: 60,           /* chiều cao nav */
+                top: 60,                          // dính dưới nav 60px
                 height: "calc(100vh - 60px)",
                 overflowY: "auto",
-                flexShrink: 0,
                 borderLeft: "1px solid #EBEBEB",
                 background: "#fff",
               }}>

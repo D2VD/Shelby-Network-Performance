@@ -1,6 +1,15 @@
 /**
- * workers/geo-sync.ts — v2.6
- * Thêm /debug3 để tìm chính xác source của blob count/size/events
+ * workers/geo-sync.ts — v2.7 FINAL
+ *
+ * ROOT CAUSE ĐÃ TÌM RA:
+ * Shelby dùng BigOrderedMap (BPlusTreeMap) để store blobs.
+ * Move Table blob_data có N slots (table items), mỗi slot là 1 BPlusTreeMap node
+ * chứa nhiều blobs trong children.entries[].
+ *
+ * Để đếm totalBlobs: paginate qua current_table_items, sum len(entries) mỗi slot
+ * Để tính totalSize: sum blob_size từ mỗi entry.value.value.blob_size
+ *
+ * Indexer không support _aggregate → dùng limit/offset pagination
  */
 
 interface Env {
@@ -45,88 +54,172 @@ function trunc(addr: string, f = 6, b = 4) { if (!addr || addr.length <= f + b +
 function getKV(env: Env, n: NetworkId): KVNamespace { return n === "shelbynet" ? env.SHELBY_KV_MAINNET : env.SHELBY_KV_TESTNET; }
 function nb(v: any, fb = 0): number { const x = Number(v ?? fb); return isNaN(x) ? fb : x; }
 
-async function doGql(indexerUrl: string, query: string): Promise<any> {
+async function doGql(indexerUrl: string, query: string, variables?: any): Promise<any> {
   const r = await fetch(indexerUrl, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query }), signal: AbortSignal.timeout(12000),
+    body: JSON.stringify({ query, variables }), signal: AbortSignal.timeout(15000),
   });
   const text = await r.text();
-  if (!r.ok) throw new Error(`HTTP ${r.status}: ${text.slice(0, 300)}`);
-  return JSON.parse(text);
+  if (!r.ok) throw new Error(`HTTP ${r.status}: ${text.slice(0, 200)}`);
+  const j = JSON.parse(text);
+  if (j.errors?.length) throw new Error(j.errors[0].message);
+  return j.data;
 }
 
-// /debug3 — probe mọi nguồn có thể có blob data
-async function handleDebug3(url: URL): Promise<Response> {
-  const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
+// ── Core: đếm blobs bằng cách paginate qua current_table_items ──────────────
+// Mỗi table item = 1 BPlusTreeMap slot, chứa N blobs trong root.children.entries
+async function countBlobsFromTable(indexerUrl: string, handle: string): Promise<{
+  totalBlobs: number;
+  totalStorageUsedBytes: number;
+  slotCount: number;
+}> {
+  let totalBlobs = 0;
+  let totalStorageUsedBytes = 0;
+  let slotCount = 0;
+  let offset = 0;
+  const PAGE = 100; // items per page
+  const MAX_PAGES = 50; // max 5000 slots để tránh timeout
+
+  while (true) {
+    const query = `
+      query BlobSlots($handle: String!, $limit: Int!, $offset: Int!) {
+        current_table_items(
+          where: { table_handle: { _eq: $handle } }
+          limit: $limit
+          offset: $offset
+          order_by: { key: asc }
+        ) {
+          decoded_value
+        }
+      }
+    `;
+
+    const data = await doGql(indexerUrl, query, { handle, limit: PAGE, offset });
+    const items: any[] = data?.current_table_items ?? [];
+
+    if (items.length === 0) break;
+
+    for (const item of items) {
+      slotCount++;
+      const dv = item.decoded_value;
+
+      // Traverse BPlusTreeMap: root.children.entries[] và nodes.slots
+      // Leaf node: entries trực tiếp trong root.children.entries
+      // Inner node: children point to other nodes
+      const count = countEntriesInBPlusTree(dv);
+      const { blobCount, totalSize } = countBlobsInBPlusTree(dv);
+      totalBlobs += blobCount;
+      totalStorageUsedBytes += totalSize;
+    }
+
+    offset += items.length;
+    if (items.length < PAGE) break;
+    if (offset / PAGE >= MAX_PAGES) {
+      // Đã đọc MAX_PAGES, extrapolate nếu cần
+      // Lấy tổng slot count từ max_leaf_index của slot đầu tiên nếu có
+      break;
+    }
+  }
+
+  return { totalBlobs, totalStorageUsedBytes, slotCount };
+}
+
+// Đếm số entries trong 1 BPlusTreeMap node (recursive cho inner nodes)
+function countEntriesInBPlusTree(node: any): number {
+  if (!node) return 0;
+  let count = 0;
+
+  // Check root entries (leaf node)
+  const rootEntries = node?.root?.children?.entries ?? [];
+  count += rootEntries.length;
+
+  // Check nodes slots (inner nodes có thể có thêm entries)
+  const slots = node?.nodes?.slots?.vec ?? [];
+  for (const slot of slots) {
+    if (!slot) continue;
+    const slotEntries = slot?.children?.entries ?? slot?.value?.children?.entries ?? [];
+    count += slotEntries.length;
+  }
+
+  return count;
+}
+
+// Đếm blobs VÀ tổng size trong 1 BPlusTreeMap
+function countBlobsInBPlusTree(node: any): { blobCount: number; totalSize: number } {
+  if (!node) return { blobCount: 0, totalSize: 0 };
+  let blobCount = 0;
+  let totalSize = 0;
+
+  function processEntries(entries: any[]) {
+    for (const entry of entries) {
+      if (!entry) continue;
+      // entry.value.value.blob_size hoặc entry.value.blob_size
+      const blobData = entry?.value?.value ?? entry?.value ?? entry;
+      const size = nb(blobData?.blob_size ?? blobData?.size ?? 0);
+      if (size >= 0) {
+        blobCount++;
+        totalSize += size;
+      }
+    }
+  }
+
+  // Leaf: root.children.entries
+  processEntries(node?.root?.children?.entries ?? []);
+
+  // Inner nodes in slots
+  const slots = node?.nodes?.slots?.vec ?? [];
+  for (const slot of slots) {
+    if (!slot) continue;
+    processEntries(slot?.children?.entries ?? slot?.value?.children?.entries ?? []);
+  }
+
+  return { blobCount, totalSize };
+}
+
+// ── Fetch all network stats ────────────────────────────────────────────────────
+async function fetchNetworkStats(network: NetworkId): Promise<Partial<StatsSnapshot>> {
   const cfg = NETWORKS[network];
-  const handle = (cfg as any).blobTableHandle || "";
-  const res: Record<string, any> = { handle };
+  let blockHeight = 0, totalBlobs = 0, totalStorageUsedBytes = 0,
+      storageProviders = 0, placementGroups = 0, slices = 0, totalBlobEvents = 0;
 
-  // 1. current_table_items_aggregate với handle
   try {
-    res.q1_cti_agg = await doGql(cfg.indexerUrl,
-      `{ current_table_items_aggregate(where:{table_handle:{_eq:"${handle}"}}) { aggregate { count } } }`
-    );
-  } catch (e: any) { res.q1_cti_agg = { error: e.message }; }
+    const r = await fetch(`${cfg.nodeUrl}/`, { signal: AbortSignal.timeout(4000) });
+    if (r.ok) { const d: any = await r.json(); blockHeight = Number(d.block_height ?? 0); }
+  } catch {}
 
-  // 2. table_items_aggregate
+  // Blob count từ table items
+  const handle = (cfg as any).blobTableHandle as string ||
+    await (async () => {
+      try {
+        const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::blob_metadata::Blobs`, { signal: AbortSignal.timeout(5000) });
+        if (r.ok) { const d: any = await r.json(); return d?.data?.blob_data?.handle ?? ""; }
+      } catch {} return "";
+    })();
+
+  if (handle) {
+    try {
+      const { totalBlobs: tb, totalStorageUsedBytes: ts } = await countBlobsFromTable(cfg.indexerUrl, handle);
+      totalBlobs = tb;
+      totalStorageUsedBytes = ts;
+    } catch (e) { console.error("[stats] blob count failed:", e); }
+  }
+
+  // Providers, PGs, Slices
   try {
-    res.q2_ti_agg = await doGql(cfg.indexerUrl,
-      `{ table_items_aggregate(where:{table_handle:{_eq:"${handle}"}}) { aggregate { count } } }`
-    );
-  } catch (e: any) { res.q2_ti_agg = { error: e.message }; }
+    const [pgR, spR, slR] = await Promise.allSettled([
+      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5000) }),
+      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::storage_provider_registry::StorageProviders`, { signal: AbortSignal.timeout(5000) }),
+      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::slice_registry::SliceRegistry`, { signal: AbortSignal.timeout(5000) }),
+    ]);
+    if (pgR.status === "fulfilled" && pgR.value.ok) { const d: any = await pgR.value.json(); placementGroups = nb(d?.data?.next_unassigned_placement_group_index); }
+    if (spR.status === "fulfilled" && spR.value.ok) { const d: any = await spR.value.json(); (d?.data?.active_providers_by_az?.root?.children?.entries ?? []).forEach((z: any) => { storageProviders += (z.value?.value ?? []).length; }); }
+    if (slR.status === "fulfilled" && slR.value.ok) { const d: any = await slR.value.json(); slices = nb(d?.data?.slices?.big_vec?.vec?.[0]?.end_index) + nb(d?.data?.slices?.inline_vec?.length); }
+  } catch {}
 
-  // 3. Sample current_table_items — xem decoded_value structure
-  try {
-    res.q3_cti_sample = await doGql(cfg.indexerUrl,
-      `{ current_table_items(where:{table_handle:{_eq:"${handle}"}}, limit:2) { key decoded_key decoded_value } }`
-    );
-  } catch (e: any) { res.q3_cti_sample = { error: e.message }; }
-
-  // 4. table_items sample (lịch sử, không chỉ current)
-  try {
-    res.q4_ti_sample = await doGql(cfg.indexerUrl,
-      `{ table_items(where:{table_handle:{_eq:"${handle}"}}, limit:2, order_by:{transaction_version:desc}) { key decoded_value transaction_version } }`
-    );
-  } catch (e: any) { res.q4_ti_sample = { error: e.message }; }
-
-  // 5. blob_metadata::Blobs full data
-  try {
-    const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::blob_metadata::Blobs`, { signal: AbortSignal.timeout(5000) });
-    res.q5_blob_resource = r.ok ? await r.json() : `HTTP ${r.status}`;
-  } catch (e: any) { res.q5_blob_resource = { error: e.message }; }
-
-  // 6. global_metadata::MetadataStorage full
-  try {
-    const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::global_metadata::MetadataStorage`, { signal: AbortSignal.timeout(5000) });
-    res.q6_global_metadata = r.ok ? await r.json() : `HTTP ${r.status}`;
-  } catch (e: any) { res.q6_global_metadata = { error: e.message }; }
-
-  // 7. traffic_tracker::TrafficState
-  try {
-    const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::traffic_tracker::TrafficState`, { signal: AbortSignal.timeout(5000) });
-    res.q7_traffic = r.ok ? await r.json() : `HTTP ${r.status}`;
-  } catch (e: any) { res.q7_traffic = { error: e.message }; }
-
-  // 8. Aptos events API — write_blob_events
-  try {
-    const r = await fetch(
-      `${cfg.nodeUrl}/accounts/${cfg.coreAddress}/events/${cfg.coreAddress}::blob_metadata::Blobs/write_blob_events?limit=1`,
-      { signal: AbortSignal.timeout(5000) }
-    );
-    res.q8_write_blob_events = r.ok ? await r.json() : `HTTP ${r.status}`;
-  } catch (e: any) { res.q8_write_blob_events = { error: e.message }; }
-
-  // 9. user_transactions count với function filter (blob write txs)
-  try {
-    res.q9_user_txns_blob = await doGql(cfg.indexerUrl,
-      `{ user_transactions_aggregate(where:{entry_function_id_str:{_like:"%blob%"}}) { aggregate { count } } }`
-    );
-  } catch (e: any) { res.q9_user_txns_blob = { error: e.message }; }
-
-  return Response.json({ ok: true, network, results: res }, { headers: CORS });
+  return { blockHeight, totalBlobs, totalStorageUsedBytes, storageProviders, placementGroups, slices, totalBlobEvents };
 }
 
+// ── Provider helpers ───────────────────────────────────────────────────────────
 async function geocodeIP(ip: string, zone: string): Promise<GeoResult> {
   const now = new Date().toISOString();
   const fb = ZONE_COORDS[zone] ?? { lat: 0, lng: 0, city: "Unknown", country: "??" };
@@ -154,30 +247,14 @@ async function fetchRPC(nodeUrl: string, core: string): Promise<RawProvider[]> {
   return out;
 }
 
-async function fetchNetworkStats(network: NetworkId): Promise<Partial<StatsSnapshot>> {
-  const cfg = NETWORKS[network];
-  let blockHeight = 0, storageProviders = 0, placementGroups = 0, slices = 0;
-  try { const r = await fetch(`${cfg.nodeUrl}/`, { signal: AbortSignal.timeout(4000) }); if (r.ok) { const d: any = await r.json(); blockHeight = Number(d.block_height ?? 0); } } catch {}
-  try {
-    const [pgR, spR, slR] = await Promise.allSettled([
-      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5000) }),
-      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::storage_provider_registry::StorageProviders`, { signal: AbortSignal.timeout(5000) }),
-      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::slice_registry::SliceRegistry`, { signal: AbortSignal.timeout(5000) }),
-    ]);
-    if (pgR.status === "fulfilled" && pgR.value.ok) { const d: any = await pgR.value.json(); placementGroups = nb(d?.data?.next_unassigned_placement_group_index); }
-    if (spR.status === "fulfilled" && spR.value.ok) { const d: any = await spR.value.json(); (d?.data?.active_providers_by_az?.root?.children?.entries ?? []).forEach((z: any) => { storageProviders += (z.value?.value ?? []).length; }); }
-    if (slR.status === "fulfilled" && slR.value.ok) { const d: any = await slR.value.json(); slices = nb(d?.data?.slices?.big_vec?.vec?.[0]?.end_index) + nb(d?.data?.slices?.inline_vec?.length); }
-  } catch {}
-  return { blockHeight, totalBlobs: 0, totalStorageUsedBytes: 0, storageProviders, placementGroups, slices, totalBlobEvents: 0 };
-}
-
 async function writeR2Snapshot(env: Env, network: NetworkId, ctx: ExecutionContext) {
   try {
     const stats = await fetchNetworkStats(network); const now = new Date();
     const key = `snapshots/${network}/${now.getUTCFullYear()}/${String(now.getUTCMonth()+1).padStart(2,"0")}/${String(now.getUTCDate()).padStart(2,"0")}/${String(now.getUTCHours()).padStart(2,"0")}.json`;
     const snap: StatsSnapshot = { network, ts: now.toISOString(), blockHeight: stats.blockHeight??0, totalBlobs: stats.totalBlobs??0, totalStorageUsedBytes: stats.totalStorageUsedBytes??0, storageProviders: stats.storageProviders??0, placementGroups: stats.placementGroups??0, slices: stats.slices??0, totalBlobEvents: stats.totalBlobEvents??0 };
     ctx.waitUntil(env.SHELBY_R2.put(key, JSON.stringify(snap), { httpMetadata: { contentType: "application/json" } }));
-  } catch (e) { console.error("[r2] failed:", e); }
+    console.log(`[r2] blobs=${snap.totalBlobs} size=${snap.totalStorageUsedBytes}`);
+  } catch (e) { console.error("[r2]", e); }
 }
 
 async function syncNetwork(network: NetworkId, env: Env, ctx: ExecutionContext): Promise<{ synced: number; errors: string[] }> {
@@ -200,6 +277,7 @@ async function syncNetwork(network: NetworkId, env: Env, ctx: ExecutionContext):
   return { synced: records.length, errors };
 }
 
+// ── HTTP Handlers ──────────────────────────────────────────────────────────────
 async function handleNodes(url: URL, env: Env): Promise<Response> {
   const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
   const kv = getKV(env, network);
@@ -226,37 +304,48 @@ async function handleSnapshots(url: URL, env: Env): Promise<Response> {
 
 async function handleStats(url: URL, env: Env): Promise<Response> {
   const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
+  if (!NETWORKS[network]) return Response.json({ ok: false, error: "Unknown network" }, { status: 400, headers: CORS });
   const cfg = NETWORKS[network];
+
   let node = null;
   try { const r = await fetch(`${cfg.nodeUrl}/`, { signal: AbortSignal.timeout(5000) }); if (r.ok) { const d: any = await r.json(); node = { blockHeight: nb(d.block_height), ledgerVersion: nb(d.ledger_version), chainId: nb(d.chain_id) }; } } catch {}
+
   let stats: Record<string, number | null> = { totalBlobs: null, totalStorageUsedBytes: null, totalBlobEvents: null, storageProviders: null, placementGroups: null, slices: null };
   let source = "none";
+  let slotCount = 0;
+
+  // Priority 1: Count via BPlusTreeMap traversal
   const handle = (cfg as any).blobTableHandle as string;
   if (handle) {
     try {
-      const d = await doGql(cfg.indexerUrl, `{ current_table_items_aggregate(where:{table_handle:{_eq:"${handle}"}}) { aggregate { count } } }`);
-      const count = nb(d?.data?.current_table_items_aggregate?.aggregate?.count);
-      if (count > 0) { stats.totalBlobs = count; source = "graphql-table"; }
-    } catch {}
+      const result = await countBlobsFromTable(cfg.indexerUrl, handle);
+      if (result.totalBlobs > 0) {
+        stats.totalBlobs            = result.totalBlobs;
+        stats.totalStorageUsedBytes = result.totalStorageUsedBytes || null;
+        slotCount = result.slotCount;
+        source = "graphql-bptree";
+      }
+    } catch (e: any) { console.error("[stats] bptree count failed:", e.message); }
   }
+
+  // On-chain: providers, PGs, slices
   try {
-    const [pgR, spR, slR, blobR] = await Promise.allSettled([
+    const [pgR, spR, slR] = await Promise.allSettled([
       fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5000) }),
       fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::storage_provider_registry::StorageProviders`, { signal: AbortSignal.timeout(5000) }),
       fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::slice_registry::SliceRegistry`, { signal: AbortSignal.timeout(5000) }),
-      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::blob_metadata::Blobs`, { signal: AbortSignal.timeout(5000) }),
     ]);
     if (pgR.status === "fulfilled" && pgR.value.ok) { const d: any = await pgR.value.json(); stats.placementGroups = nb(d?.data?.next_unassigned_placement_group_index); }
     if (spR.status === "fulfilled" && spR.value.ok) { const d: any = await spR.value.json(); let c = 0; (d?.data?.active_providers_by_az?.root?.children?.entries ?? []).forEach((z: any) => { c += (z.value?.value ?? []).length; }); stats.storageProviders = c; }
     if (slR.status === "fulfilled" && slR.value.ok) { const d: any = await slR.value.json(); stats.slices = nb(d?.data?.slices?.big_vec?.vec?.[0]?.end_index) + nb(d?.data?.slices?.inline_vec?.length); }
-    if (blobR.status === "fulfilled" && blobR.value.ok) {
-      const d: any = await blobR.value.json(); const data = d?.data ?? {};
-      const ev = data?.write_blob_events?.counter ?? data?.blob_write_events?.counter ?? data?.create_blob_events?.counter;
-      if (ev !== undefined) stats.totalBlobEvents = nb(ev);
-    }
     if (source === "none") source = "on-chain";
   } catch {}
-  return Response.json({ ok: true, data: { node, stats, network, statsSource: `worker-${source}` }, fetchedAt: new Date().toISOString() }, { headers: { ...CORS, "Cache-Control": "public, max-age=15, stale-while-revalidate=60" } });
+
+  return Response.json({
+    ok: true,
+    data: { node, stats, network, statsSource: `worker-${source}`, _slotCount: slotCount },
+    fetchedAt: new Date().toISOString(),
+  }, { headers: { ...CORS, "Cache-Control": "public, max-age=15, stale-while-revalidate=60" } });
 }
 
 async function handleSync(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -272,11 +361,10 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "2.6.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "2.7.0", ts: new Date().toISOString() }, { headers: CORS });
     if (url.pathname === "/nodes"     && request.method === "GET")  return handleNodes(url, env);
     if (url.pathname === "/snapshots" && request.method === "GET")  return handleSnapshots(url, env);
     if (url.pathname === "/stats"     && request.method === "GET")  return handleStats(url, env);
-    if (url.pathname === "/debug3"    && request.method === "GET")  return handleDebug3(url);
     if (url.pathname === "/sync"      && request.method === "POST") return handleSync(url, env, ctx);
     return Response.json({ ok: false, error: "Not found" }, { status: 404, headers: CORS });
   },

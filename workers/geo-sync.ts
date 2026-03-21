@@ -1,14 +1,14 @@
 /**
- * workers/geo-sync.ts — v3.4
+ * workers/geo-sync.ts — v3.5
  *
- * FIX 1: Events = account_transactions_count × 2
- *   Mỗi blob write = 2 transactions (register_blob + confirm_blob)
- *   → totalBlobEvents ≈ account_tx_count × 2
+ * FIX STORAGE: Explorer chỉ tính storage cho blobs có is_written=true
+ * Ta đang tính tất cả blobs kể cả is_written=false → overestimate ~19%
  *
- * FIX 2: Storage sampling bias
- *   200 samples / 402K blobs = 0.05% → quá ít, bias về blobs nhỏ
- *   Fix: tăng lên 50 stratas × 100 samples = 5000 samples = 1.2%
- *   Với Indexer cap=100/query → 50 queries cho size sampling
+ * Debug3 sample: cả 2 blobs đều is_written: false
+ * Correction factor = 0.8392 = fraction of written blobs
+ *
+ * Fix: trong extractSizeFromSlot, chỉ cộng size nếu is_written=true
+ * Và đếm riêng: writtenBlobs vs totalBlobs
  */
 
 interface Env {
@@ -66,60 +66,59 @@ async function doGql(url: string, query: string): Promise<any> {
   return j.data;
 }
 
-function extractSizeFromSlot(dv: any): number {
-  let size = 0;
-  for (const e of (dv?.root?.children?.entries ?? [])) size += nb(e?.value?.value?.blob_size ?? 0);
+// Trả { size: number (chỉ is_written=true), totalInSlot: number }
+function extractFromSlot(dv: any): { writtenSize: number; totalCount: number; writtenCount: number } {
+  let writtenSize = 0, totalCount = 0, writtenCount = 0;
+
+  function processEntries(entries: any[]) {
+    for (const e of entries) {
+      const blob = e?.value?.value ?? {};
+      totalCount++;
+      if (blob?.is_written === true) {
+        writtenCount++;
+        writtenSize += nb(blob?.blob_size ?? 0);
+      }
+    }
+  }
+
+  processEntries(dv?.root?.children?.entries ?? []);
   for (const ns of (dv?.nodes?.slots?.vec ?? []))
-    for (const e of (ns?.children?.entries ?? ns?.value?.children?.entries ?? [])) size += nb(e?.value?.value?.blob_size ?? 0);
-  return size;
+    processEntries(ns?.children?.entries ?? ns?.value?.children?.entries ?? []);
+
+  return { writtenSize, totalCount: totalCount || 1, writtenCount };
 }
 
-// ── Step 1: Binary search để tìm tổng số slots (= totalBlobs) ────────────────
+// ── Binary search tổng slots ───────────────────────────────────────────────────
 async function findTotalSlots(indexerUrl: string, handle: string): Promise<number> {
   let lo = 0, hi = 10_000_000, lastValid = 0;
-
   while (hi - lo > 100) {
     const mid = Math.floor((lo + hi) / 2);
     try {
       const d = await doGql(indexerUrl, `{
-        current_table_items(
-          where: { table_handle: { _eq: "${handle}" } }
-          limit: 1
-          offset: ${mid}
-          order_by: { decoded_key: asc }
-        ) { decoded_key }
+        current_table_items(where:{table_handle:{_eq:"${handle}"}},limit:1,offset:${mid},order_by:{decoded_key:asc}){decoded_key}
       }`);
       if ((d?.current_table_items ?? []).length > 0) { lastValid = mid; lo = mid; }
       else hi = mid;
     } catch { hi = mid; }
   }
-
   const d = await doGql(indexerUrl, `{
-    current_table_items(
-      where: { table_handle: { _eq: "${handle}" } }
-      limit: 100
-      offset: ${lastValid}
-      order_by: { decoded_key: asc }
-    ) { decoded_key }
+    current_table_items(where:{table_handle:{_eq:"${handle}"}},limit:100,offset:${lastValid},order_by:{decoded_key:asc}){decoded_key}
   }`);
   return lastValid + (d?.current_table_items ?? []).length;
 }
 
-// ── Step 2: Stratified sampling — 50 stratas × 100 items = 5000 samples ──────
-// Đủ lớn để đại diện phân phối kích thước blob
-async function getAvgBlobSize(
+// ── Stratified sampling với is_written filter ─────────────────────────────────
+async function getStorageStats(
   indexerUrl: string,
   handle: string,
   totalSlots: number
-): Promise<number> {
-  if (totalSlots === 0) return 0;
+): Promise<{ avgWrittenSizePerBlob: number; writtenFraction: number }> {
+  if (totalSlots === 0) return { avgWrittenSizePerBlob: 0, writtenFraction: 1 };
 
   const STRATAS = 50;
-  const ITEMS_PER_STRATA = 100; // max per query
-  let totalSize = 0;
-  let totalCount = 0;
+  const ITEMS_PER_STRATA = 100;
+  let totalWrittenSize = 0, totalWrittenCount = 0, totalSampledCount = 0;
 
-  // Chạy song song 5 stratas cùng lúc để tăng tốc
   const BATCH = 5;
   for (let batch = 0; batch < STRATAS / BATCH; batch++) {
     const promises = [];
@@ -128,69 +127,68 @@ async function getAvgBlobSize(
       promises.push(
         doGql(indexerUrl, `{
           current_table_items(
-            where: { table_handle: { _eq: "${handle}" } }
-            limit: ${ITEMS_PER_STRATA}
-            offset: ${offset}
-            order_by: { decoded_key: asc }
-          ) { decoded_value }
+            where:{table_handle:{_eq:"${handle}"}}
+            limit:${ITEMS_PER_STRATA}
+            offset:${offset}
+            order_by:{decoded_key:asc}
+          ){decoded_value}
         }`).catch(() => null)
       );
     }
-
     const results = await Promise.all(promises);
     for (const data of results) {
       if (!data) continue;
       for (const item of (data.current_table_items ?? [])) {
-        const size = extractSizeFromSlot(item.decoded_value);
-        totalSize += size;
-        totalCount++;
+        const { writtenSize, totalCount, writtenCount } = extractFromSlot(item.decoded_value);
+        totalWrittenSize  += writtenSize;
+        totalWrittenCount += writtenCount;
+        totalSampledCount += totalCount;
       }
     }
   }
 
-  return totalCount > 0 ? totalSize / totalCount : 0;
+  const writtenFraction  = totalSampledCount > 0 ? totalWrittenCount / totalSampledCount : 0.84;
+  const avgWrittenSizePerBlob = totalWrittenCount > 0 ? totalWrittenSize / totalWrittenCount : 0;
+
+  return { avgWrittenSizePerBlob, writtenFraction };
 }
 
-// ── Step 3: Blob events = account_transactions_count × 2 ────────────────────
-// Mỗi blob write = 2 txns (register_blob + acknowledge/confirm)
-// account_transactions_aggregate cho core address = tổng txns
+// ── Blob events ───────────────────────────────────────────────────────────────
 async function fetchBlobEventCount(indexerUrl: string, coreAddress: string): Promise<number> {
   try {
     const d = await doGql(indexerUrl, `{
-      account_transactions_aggregate(
-        where: { account_address: { _eq: "${coreAddress}" } }
-      ) { aggregate { count } }
+      account_transactions_aggregate(where:{account_address:{_eq:"${coreAddress}"}}){aggregate{count}}
     }`);
     const txCount = nb(d?.account_transactions_aggregate?.aggregate?.count);
-    if (txCount > 0) {
-      // Mỗi blob = ~2 transactions (register + confirm)
-      // Nhưng cũng có non-blob transactions (admin, config, v.v.)
-      // Dựa trên ratio thực tế: 394481 tx → 785007 events → factor ≈ 1.99
-      return Math.round(txCount * 1.99);
-    }
+    if (txCount > 0) return Math.round(txCount * 1.99);
   } catch {}
   return 0;
 }
 
+// ── Main ──────────────────────────────────────────────────────────────────────
 async function fetchBlobStats(network: NetworkId): Promise<KVStats> {
   const cfg = NETWORKS[network];
   const handle = (cfg as any).blobTableHandle as string;
   if (!handle) return { totalBlobs: 0, totalStorageUsedBytes: 0, totalBlobEvents: 0, updatedAt: new Date().toISOString(), method: "no-handle" };
 
-  // Run blob count, size sampling, and event count in parallel where possible
   const totalSlots = await findTotalSlots(cfg.indexerUrl, handle);
 
-  const [avgSize, totalBlobEvents] = await Promise.all([
-    getAvgBlobSize(cfg.indexerUrl, handle, totalSlots),
+  const [storageStats, totalBlobEvents] = await Promise.all([
+    getStorageStats(cfg.indexerUrl, handle, totalSlots),
     fetchBlobEventCount(cfg.indexerUrl, cfg.coreAddress),
   ]);
 
+  // totalStorageUsedBytes = avg_written_size × total_written_blobs
+  // total_written_blobs ≈ totalSlots × writtenFraction
+  const totalWrittenBlobs = Math.round(totalSlots * storageStats.writtenFraction);
+  const totalStorageUsedBytes = Math.round(storageStats.avgWrittenSizePerBlob * totalWrittenBlobs);
+
   return {
     totalBlobs:            totalSlots,
-    totalStorageUsedBytes: Math.round(avgSize * totalSlots),
+    totalStorageUsedBytes: totalStorageUsedBytes,
     totalBlobEvents:       totalBlobEvents,
     updatedAt:             new Date().toISOString(),
-    method:                "gql-bsearch+stratified50+events",
+    method:                "gql-bsearch+stratified50-written",
   };
 }
 
@@ -338,7 +336,7 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "3.4.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "3.5.0", ts: new Date().toISOString() }, { headers: CORS });
     if (url.pathname === "/nodes"     && request.method === "GET")  return handleNodes(url, env);
     if (url.pathname === "/snapshots" && request.method === "GET")  return handleSnapshots(url, env);
     if (url.pathname === "/stats"     && request.method === "GET")  return handleStats(url, env);

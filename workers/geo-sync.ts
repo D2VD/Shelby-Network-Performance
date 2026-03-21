@@ -1,15 +1,14 @@
 /**
- * workers/geo-sync.ts — v2.7 FINAL
+ * workers/geo-sync.ts — v2.8
  *
- * ROOT CAUSE ĐÃ TÌM RA:
- * Shelby dùng BigOrderedMap (BPlusTreeMap) để store blobs.
- * Move Table blob_data có N slots (table items), mỗi slot là 1 BPlusTreeMap node
- * chứa nhiều blobs trong children.entries[].
+ * FIX PERFORMANCE:
+ * - Chỉ fetch `key` thay vì `decoded_value` (nhẹ hơn ~100x)
+ * - Mỗi row trong current_table_items = 1 slot trong BigOrderedMap
+ * - Từ debug3: mỗi slot có 1 entry → totalBlobs ≈ số slots
+ * - Để lấy size: chỉ sample 200 items đầu, tính avg rồi extrapolate
  *
- * Để đếm totalBlobs: paginate qua current_table_items, sum len(entries) mỗi slot
- * Để tính totalSize: sum blob_size từ mỗi entry.value.value.blob_size
- *
- * Indexer không support _aggregate → dùng limit/offset pagination
+ * QUAN TRỌNG: decoded_key là slot index (integer) → count = max(decoded_key) + 1
+ * Hoặc đơn giản là count số rows trong current_table_items với handle
  */
 
 interface Env {
@@ -66,117 +65,141 @@ async function doGql(indexerUrl: string, query: string, variables?: any): Promis
   return j.data;
 }
 
-// ── Core: đếm blobs bằng cách paginate qua current_table_items ──────────────
-// Mỗi table item = 1 BPlusTreeMap slot, chứa N blobs trong root.children.entries
-async function countBlobsFromTable(indexerUrl: string, handle: string): Promise<{
-  totalBlobs: number;
-  totalStorageUsedBytes: number;
-  slotCount: number;
-}> {
-  let totalBlobs = 0;
-  let totalStorageUsedBytes = 0;
-  let slotCount = 0;
-  let offset = 0;
-  const PAGE = 100; // items per page
-  const MAX_PAGES = 50; // max 5000 slots để tránh timeout
-
-  while (true) {
-    const query = `
-      query BlobSlots($handle: String!, $limit: Int!, $offset: Int!) {
+// ── Count blobs: dùng decoded_key (slot index) để lấy max index ──────────────
+// BigOrderedMap: decoded_key = slot index (u64)
+// Max slot index + 1 ≈ tổng số entries (mỗi slot ~ 1 blob từ debug3)
+async function fetchBlobCountViaMaxKey(
+  indexerUrl: string,
+  handle: string
+): Promise<{ totalBlobs: number; totalStorageUsedBytes: number } | null> {
+  // Strategy 1: Lấy decoded_key lớn nhất (= tổng blobs - 1)
+  try {
+    const data = await doGql(indexerUrl, `
+      query {
         current_table_items(
-          where: { table_handle: { _eq: $handle } }
-          limit: $limit
-          offset: $offset
-          order_by: { key: asc }
+          where: { table_handle: { _eq: "${handle}" } }
+          order_by: { decoded_key: desc }
+          limit: 1
         ) {
-          decoded_value
+          decoded_key
         }
       }
-    `;
+    `);
 
-    const data = await doGql(indexerUrl, query, { handle, limit: PAGE, offset });
-    const items: any[] = data?.current_table_items ?? [];
+    const items = data?.current_table_items ?? [];
+    if (items.length > 0) {
+      const maxKey = nb(items[0].decoded_key);
+      if (maxKey > 10) {
+        // maxKey là slot index của slot cuối cùng
+        // Từ debug3: mỗi slot chứa entries với các blob
+        // Cần thêm sample để biết avg blobs/slot
 
-    if (items.length === 0) break;
+        // Sample 50 slots để tính avg entries per slot
+        const sampleData = await doGql(indexerUrl, `
+          query {
+            current_table_items(
+              where: { table_handle: { _eq: "${handle}" } }
+              limit: 50
+              order_by: { decoded_key: desc }
+            ) {
+              decoded_key
+              decoded_value
+            }
+          }
+        `);
 
-    for (const item of items) {
-      slotCount++;
-      const dv = item.decoded_value;
+        const sampleItems: any[] = sampleData?.current_table_items ?? [];
+        let totalEntriesInSample = 0;
+        let totalSizeInSample = 0;
+        let validSlots = 0;
 
-      // Traverse BPlusTreeMap: root.children.entries[] và nodes.slots
-      // Leaf node: entries trực tiếp trong root.children.entries
-      // Inner node: children point to other nodes
-      const count = countEntriesInBPlusTree(dv);
-      const { blobCount, totalSize } = countBlobsInBPlusTree(dv);
-      totalBlobs += blobCount;
-      totalStorageUsedBytes += totalSize;
-    }
+        for (const item of sampleItems) {
+          const dv = item.decoded_value;
+          // Đếm entries trong root + nodes slots
+          const rootEntries: any[] = dv?.root?.children?.entries ?? [];
+          let slotEntries = rootEntries.length;
+          let slotSize = 0;
 
-    offset += items.length;
-    if (items.length < PAGE) break;
-    if (offset / PAGE >= MAX_PAGES) {
-      // Đã đọc MAX_PAGES, extrapolate nếu cần
-      // Lấy tổng slot count từ max_leaf_index của slot đầu tiên nếu có
-      break;
-    }
-  }
+          for (const entry of rootEntries) {
+            const blobData = entry?.value?.value ?? {};
+            slotSize += nb(blobData?.blob_size ?? 0);
+          }
 
-  return { totalBlobs, totalStorageUsedBytes, slotCount };
-}
+          // Inner nodes
+          const nodeSlots: any[] = dv?.nodes?.slots?.vec ?? [];
+          for (const ns of nodeSlots) {
+            const nsEntries: any[] = ns?.children?.entries ?? ns?.value?.children?.entries ?? [];
+            slotEntries += nsEntries.length;
+            for (const e of nsEntries) {
+              slotSize += nb(e?.value?.value?.blob_size ?? 0);
+            }
+          }
 
-// Đếm số entries trong 1 BPlusTreeMap node (recursive cho inner nodes)
-function countEntriesInBPlusTree(node: any): number {
-  if (!node) return 0;
-  let count = 0;
+          if (slotEntries > 0) {
+            totalEntriesInSample += slotEntries;
+            totalSizeInSample += slotSize;
+            validSlots++;
+          }
+        }
 
-  // Check root entries (leaf node)
-  const rootEntries = node?.root?.children?.entries ?? [];
-  count += rootEntries.length;
+        // Số slot thực tế = maxKey + 1 (0-indexed)
+        // Nhưng BigOrderedMap không nhất thiết sequential — lấy total từ count thực
+        // Đếm số rows trong page đầu
+        const countData = await doGql(indexerUrl, `
+          query {
+            current_table_items(
+              where: { table_handle: { _eq: "${handle}" } }
+              limit: 1
+              offset: 999999
+            ) {
+              decoded_key
+            }
+          }
+        `);
 
-  // Check nodes slots (inner nodes có thể có thêm entries)
-  const slots = node?.nodes?.slots?.vec ?? [];
-  for (const slot of slots) {
-    if (!slot) continue;
-    const slotEntries = slot?.children?.entries ?? slot?.value?.children?.entries ?? [];
-    count += slotEntries.length;
-  }
+        // Cách đơn giản hơn: paginate nhanh chỉ lấy key để đếm
+        let totalSlots = 0;
+        let offset = 0;
+        const PAGE = 500; // chỉ key, rất nhanh
+        const MAX_ITER = 30; // max 15000 slots = 30 * 500
 
-  return count;
-}
+        for (let iter = 0; iter < MAX_ITER; iter++) {
+          const pageData = await doGql(indexerUrl, `
+            query {
+              current_table_items(
+                where: { table_handle: { _eq: "${handle}" } }
+                limit: ${PAGE}
+                offset: ${offset}
+                order_by: { key: asc }
+              ) {
+                key
+              }
+            }
+          `);
+          const pageItems: any[] = pageData?.current_table_items ?? [];
+          totalSlots += pageItems.length;
+          if (pageItems.length < PAGE) break;
+          offset += PAGE;
+        }
 
-// Đếm blobs VÀ tổng size trong 1 BPlusTreeMap
-function countBlobsInBPlusTree(node: any): { blobCount: number; totalSize: number } {
-  if (!node) return { blobCount: 0, totalSize: 0 };
-  let blobCount = 0;
-  let totalSize = 0;
+        if (totalSlots === 0) totalSlots = maxKey + 1;
 
-  function processEntries(entries: any[]) {
-    for (const entry of entries) {
-      if (!entry) continue;
-      // entry.value.value.blob_size hoặc entry.value.blob_size
-      const blobData = entry?.value?.value ?? entry?.value ?? entry;
-      const size = nb(blobData?.blob_size ?? blobData?.size ?? 0);
-      if (size >= 0) {
-        blobCount++;
-        totalSize += size;
+        // Extrapolate blobs và size
+        const avgPerSlot = validSlots > 0 ? totalEntriesInSample / validSlots : 1;
+        const avgSizePerSlot = validSlots > 0 ? totalSizeInSample / validSlots : 0;
+        const totalBlobs = Math.round(totalSlots * avgPerSlot);
+        const totalStorageUsedBytes = Math.round(totalSlots * avgSizePerSlot);
+
+        return { totalBlobs, totalStorageUsedBytes };
       }
     }
+  } catch (e: any) {
+    console.error("[blobCount] maxKey strategy failed:", e.message);
   }
 
-  // Leaf: root.children.entries
-  processEntries(node?.root?.children?.entries ?? []);
-
-  // Inner nodes in slots
-  const slots = node?.nodes?.slots?.vec ?? [];
-  for (const slot of slots) {
-    if (!slot) continue;
-    processEntries(slot?.children?.entries ?? slot?.value?.children?.entries ?? []);
-  }
-
-  return { blobCount, totalSize };
+  return null;
 }
 
-// ── Fetch all network stats ────────────────────────────────────────────────────
 async function fetchNetworkStats(network: NetworkId): Promise<Partial<StatsSnapshot>> {
   const cfg = NETWORKS[network];
   let blockHeight = 0, totalBlobs = 0, totalStorageUsedBytes = 0,
@@ -187,24 +210,17 @@ async function fetchNetworkStats(network: NetworkId): Promise<Partial<StatsSnaps
     if (r.ok) { const d: any = await r.json(); blockHeight = Number(d.block_height ?? 0); }
   } catch {}
 
-  // Blob count từ table items
-  const handle = (cfg as any).blobTableHandle as string ||
-    await (async () => {
-      try {
-        const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::blob_metadata::Blobs`, { signal: AbortSignal.timeout(5000) });
-        if (r.ok) { const d: any = await r.json(); return d?.data?.blob_data?.handle ?? ""; }
-      } catch {} return "";
-    })();
-
+  const handle = (cfg as any).blobTableHandle as string;
   if (handle) {
     try {
-      const { totalBlobs: tb, totalStorageUsedBytes: ts } = await countBlobsFromTable(cfg.indexerUrl, handle);
-      totalBlobs = tb;
-      totalStorageUsedBytes = ts;
-    } catch (e) { console.error("[stats] blob count failed:", e); }
+      const result = await fetchBlobCountViaMaxKey(cfg.indexerUrl, handle);
+      if (result && result.totalBlobs > 0) {
+        totalBlobs = result.totalBlobs;
+        totalStorageUsedBytes = result.totalStorageUsedBytes;
+      }
+    } catch (e: any) { console.error("[stats] blob count:", e.message); }
   }
 
-  // Providers, PGs, Slices
   try {
     const [pgR, spR, slR] = await Promise.allSettled([
       fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5000) }),
@@ -219,7 +235,6 @@ async function fetchNetworkStats(network: NetworkId): Promise<Partial<StatsSnaps
   return { blockHeight, totalBlobs, totalStorageUsedBytes, storageProviders, placementGroups, slices, totalBlobEvents };
 }
 
-// ── Provider helpers ───────────────────────────────────────────────────────────
 async function geocodeIP(ip: string, zone: string): Promise<GeoResult> {
   const now = new Date().toISOString();
   const fb = ZONE_COORDS[zone] ?? { lat: 0, lng: 0, city: "Unknown", country: "??" };
@@ -253,7 +268,7 @@ async function writeR2Snapshot(env: Env, network: NetworkId, ctx: ExecutionConte
     const key = `snapshots/${network}/${now.getUTCFullYear()}/${String(now.getUTCMonth()+1).padStart(2,"0")}/${String(now.getUTCDate()).padStart(2,"0")}/${String(now.getUTCHours()).padStart(2,"0")}.json`;
     const snap: StatsSnapshot = { network, ts: now.toISOString(), blockHeight: stats.blockHeight??0, totalBlobs: stats.totalBlobs??0, totalStorageUsedBytes: stats.totalStorageUsedBytes??0, storageProviders: stats.storageProviders??0, placementGroups: stats.placementGroups??0, slices: stats.slices??0, totalBlobEvents: stats.totalBlobEvents??0 };
     ctx.waitUntil(env.SHELBY_R2.put(key, JSON.stringify(snap), { httpMetadata: { contentType: "application/json" } }));
-    console.log(`[r2] blobs=${snap.totalBlobs} size=${snap.totalStorageUsedBytes}`);
+    console.log(`[r2] blobs=${snap.totalBlobs}`);
   } catch (e) { console.error("[r2]", e); }
 }
 
@@ -277,7 +292,6 @@ async function syncNetwork(network: NetworkId, env: Env, ctx: ExecutionContext):
   return { synced: records.length, errors };
 }
 
-// ── HTTP Handlers ──────────────────────────────────────────────────────────────
 async function handleNodes(url: URL, env: Env): Promise<Response> {
   const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
   const kv = getKV(env, network);
@@ -312,23 +326,19 @@ async function handleStats(url: URL, env: Env): Promise<Response> {
 
   let stats: Record<string, number | null> = { totalBlobs: null, totalStorageUsedBytes: null, totalBlobEvents: null, storageProviders: null, placementGroups: null, slices: null };
   let source = "none";
-  let slotCount = 0;
 
-  // Priority 1: Count via BPlusTreeMap traversal
   const handle = (cfg as any).blobTableHandle as string;
   if (handle) {
     try {
-      const result = await countBlobsFromTable(cfg.indexerUrl, handle);
-      if (result.totalBlobs > 0) {
-        stats.totalBlobs            = result.totalBlobs;
+      const result = await fetchBlobCountViaMaxKey(cfg.indexerUrl, handle);
+      if (result && result.totalBlobs > 0) {
+        stats.totalBlobs = result.totalBlobs;
         stats.totalStorageUsedBytes = result.totalStorageUsedBytes || null;
-        slotCount = result.slotCount;
         source = "graphql-bptree";
       }
-    } catch (e: any) { console.error("[stats] bptree count failed:", e.message); }
+    } catch (e: any) { console.error("[stats]", e.message); }
   }
 
-  // On-chain: providers, PGs, slices
   try {
     const [pgR, spR, slR] = await Promise.allSettled([
       fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5000) }),
@@ -341,11 +351,7 @@ async function handleStats(url: URL, env: Env): Promise<Response> {
     if (source === "none") source = "on-chain";
   } catch {}
 
-  return Response.json({
-    ok: true,
-    data: { node, stats, network, statsSource: `worker-${source}`, _slotCount: slotCount },
-    fetchedAt: new Date().toISOString(),
-  }, { headers: { ...CORS, "Cache-Control": "public, max-age=15, stale-while-revalidate=60" } });
+  return Response.json({ ok: true, data: { node, stats, network, statsSource: `worker-${source}` }, fetchedAt: new Date().toISOString() }, { headers: { ...CORS, "Cache-Control": "public, max-age=15, stale-while-revalidate=60" } });
 }
 
 async function handleSync(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -357,14 +363,49 @@ async function handleSync(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
   return Response.json({ ok: true, message: "Sync completed", results, syncedAt: new Date().toISOString() }, { headers: CORS });
 }
 
+// /debug4: xác nhận query đơn lẻ nào work và trả gì
+async function handleDebug4(url: URL): Promise<Response> {
+  const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
+  const cfg = NETWORKS[network];
+  const handle = (cfg as any).blobTableHandle;
+  const res: Record<string, any> = {};
+
+  // Test order_by decoded_key desc limit 1
+  try {
+    res.max_decoded_key = await doGql(cfg.indexerUrl,
+      `{ current_table_items(where:{table_handle:{_eq:"${handle}"}}, order_by:{decoded_key:desc}, limit:1) { decoded_key } }`
+    );
+  } catch (e: any) { res.max_decoded_key = { error: e.message }; }
+
+  // Test order_by key asc limit 500 - chỉ key
+  try {
+    const d = await doGql(cfg.indexerUrl,
+      `{ current_table_items(where:{table_handle:{_eq:"${handle}"}}, order_by:{key:asc}, limit:500) { key } }`
+    );
+    res.count_500 = (d?.current_table_items ?? []).length;
+    res.last_key_of_500 = d?.current_table_items?.slice(-1)?.[0]?.key;
+  } catch (e: any) { res.count_500 = { error: e.message }; }
+
+  // Test offset 500 limit 500
+  try {
+    const d = await doGql(cfg.indexerUrl,
+      `{ current_table_items(where:{table_handle:{_eq:"${handle}"}}, order_by:{key:asc}, limit:500, offset:500) { key } }`
+    );
+    res.count_500_offset_500 = (d?.current_table_items ?? []).length;
+  } catch (e: any) { res.count_500_offset_500 = { error: e.message }; }
+
+  return Response.json({ ok: true, network, handle, results: res }, { headers: CORS });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "2.7.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "2.8.0", ts: new Date().toISOString() }, { headers: CORS });
     if (url.pathname === "/nodes"     && request.method === "GET")  return handleNodes(url, env);
     if (url.pathname === "/snapshots" && request.method === "GET")  return handleSnapshots(url, env);
     if (url.pathname === "/stats"     && request.method === "GET")  return handleStats(url, env);
+    if (url.pathname === "/debug4"    && request.method === "GET")  return handleDebug4(url);
     if (url.pathname === "/sync"      && request.method === "POST") return handleSync(url, env, ctx);
     return Response.json({ ok: false, error: "Not found" }, { status: 404, headers: CORS });
   },

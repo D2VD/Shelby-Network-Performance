@@ -1,13 +1,6 @@
 /**
- * workers/geo-sync.ts — v2.5 FINAL
- *
- * GIẢI PHÁP ĐÚNG:
- * - Blob count: query current_table_items_aggregate với table_handle từ blob_metadata::Blobs
- *   Handle: 0xe41f1fa92a4beeacd0b83b7e05d150e2b260f6b7f934f62a5843f762260d5cb8
- * - Total size: sum decoded_value->size từ table items
- * - Providers/PGs/Slices: on-chain RPC (đã đúng)
- *
- * Indexer GraphQL có current_table_items — đây là cách đúng để đọc Move Table
+ * workers/geo-sync.ts — v2.6
+ * Thêm /debug3 để tìm chính xác source của blob count/size/events
  */
 
 interface Env {
@@ -19,17 +12,16 @@ interface Env {
 
 const NETWORKS = {
   shelbynet: {
-    coreAddress:    "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a",
-    nodeUrl:        "https://api.shelbynet.shelby.xyz/v1",
-    indexerUrl:     "https://api.shelbynet.shelby.xyz/v1/graphql",
-    // Table handle từ blob_metadata::Blobs.blob_data.handle
+    coreAddress:     "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a",
+    nodeUrl:         "https://api.shelbynet.shelby.xyz/v1",
+    indexerUrl:      "https://api.shelbynet.shelby.xyz/v1/graphql",
     blobTableHandle: "0xe41f1fa92a4beeacd0b83b7e05d150e2b260f6b7f934f62a5843f762260d5cb8",
   },
   testnet: {
-    coreAddress:    "0xc63d6a5efb0080a6029403131715bd4971e1149f7cc099aac69bb0069b3ddbf5",
-    nodeUrl:        "https://api.testnet.aptoslabs.com/v1",
-    indexerUrl:     "https://api.testnet.aptoslabs.com/v1/graphql",
-    blobTableHandle: "", // sẽ fetch dynamic
+    coreAddress:     "0xc63d6a5efb0080a6029403131715bd4971e1149f7cc099aac69bb0069b3ddbf5",
+    nodeUrl:         "https://api.testnet.aptoslabs.com/v1",
+    indexerUrl:      "https://api.testnet.aptoslabs.com/v1/graphql",
+    blobTableHandle: "",
   },
 } as const;
 
@@ -49,185 +41,90 @@ interface NodeRecord { address: string; addressShort: string; availabilityZone: 
 interface StatsSnapshot { network: string; ts: string; blockHeight: number; totalBlobs: number; totalStorageUsedBytes: number; storageProviders: number; placementGroups: number; slices: number; totalBlobEvents: number; }
 
 const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type" };
-
 function trunc(addr: string, f = 6, b = 4) { if (!addr || addr.length <= f + b + 3) return addr; return `${addr.slice(0, f)}...${addr.slice(-b)}`; }
 function getKV(env: Env, n: NetworkId): KVNamespace { return n === "shelbynet" ? env.SHELBY_KV_MAINNET : env.SHELBY_KV_TESTNET; }
 function nb(v: any, fb = 0): number { const x = Number(v ?? fb); return isNaN(x) ? fb : x; }
 
-// ── Get blob table handle dynamically (for testnet or if hardcode fails) ───────
-async function getBlobTableHandle(nodeUrl: string, coreAddress: string): Promise<string | null> {
+async function doGql(indexerUrl: string, query: string): Promise<any> {
+  const r = await fetch(indexerUrl, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }), signal: AbortSignal.timeout(12000),
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`HTTP ${r.status}: ${text.slice(0, 300)}`);
+  return JSON.parse(text);
+}
+
+// /debug3 — probe mọi nguồn có thể có blob data
+async function handleDebug3(url: URL): Promise<Response> {
+  const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
+  const cfg = NETWORKS[network];
+  const handle = (cfg as any).blobTableHandle || "";
+  const res: Record<string, any> = { handle };
+
+  // 1. current_table_items_aggregate với handle
+  try {
+    res.q1_cti_agg = await doGql(cfg.indexerUrl,
+      `{ current_table_items_aggregate(where:{table_handle:{_eq:"${handle}"}}) { aggregate { count } } }`
+    );
+  } catch (e: any) { res.q1_cti_agg = { error: e.message }; }
+
+  // 2. table_items_aggregate
+  try {
+    res.q2_ti_agg = await doGql(cfg.indexerUrl,
+      `{ table_items_aggregate(where:{table_handle:{_eq:"${handle}"}}) { aggregate { count } } }`
+    );
+  } catch (e: any) { res.q2_ti_agg = { error: e.message }; }
+
+  // 3. Sample current_table_items — xem decoded_value structure
+  try {
+    res.q3_cti_sample = await doGql(cfg.indexerUrl,
+      `{ current_table_items(where:{table_handle:{_eq:"${handle}"}}, limit:2) { key decoded_key decoded_value } }`
+    );
+  } catch (e: any) { res.q3_cti_sample = { error: e.message }; }
+
+  // 4. table_items sample (lịch sử, không chỉ current)
+  try {
+    res.q4_ti_sample = await doGql(cfg.indexerUrl,
+      `{ table_items(where:{table_handle:{_eq:"${handle}"}}, limit:2, order_by:{transaction_version:desc}) { key decoded_value transaction_version } }`
+    );
+  } catch (e: any) { res.q4_ti_sample = { error: e.message }; }
+
+  // 5. blob_metadata::Blobs full data
+  try {
+    const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::blob_metadata::Blobs`, { signal: AbortSignal.timeout(5000) });
+    res.q5_blob_resource = r.ok ? await r.json() : `HTTP ${r.status}`;
+  } catch (e: any) { res.q5_blob_resource = { error: e.message }; }
+
+  // 6. global_metadata::MetadataStorage full
+  try {
+    const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::global_metadata::MetadataStorage`, { signal: AbortSignal.timeout(5000) });
+    res.q6_global_metadata = r.ok ? await r.json() : `HTTP ${r.status}`;
+  } catch (e: any) { res.q6_global_metadata = { error: e.message }; }
+
+  // 7. traffic_tracker::TrafficState
+  try {
+    const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::traffic_tracker::TrafficState`, { signal: AbortSignal.timeout(5000) });
+    res.q7_traffic = r.ok ? await r.json() : `HTTP ${r.status}`;
+  } catch (e: any) { res.q7_traffic = { error: e.message }; }
+
+  // 8. Aptos events API — write_blob_events
   try {
     const r = await fetch(
-      `${nodeUrl}/accounts/${coreAddress}/resource/${coreAddress}::blob_metadata::Blobs`,
-      { signal: AbortSignal.timeout(6000) }
+      `${cfg.nodeUrl}/accounts/${cfg.coreAddress}/events/${cfg.coreAddress}::blob_metadata::Blobs/write_blob_events?limit=1`,
+      { signal: AbortSignal.timeout(5000) }
     );
-    if (!r.ok) return null;
-    const d: any = await r.json();
-    return d?.data?.blob_data?.handle ?? null;
-  } catch { return null; }
-}
+    res.q8_write_blob_events = r.ok ? await r.json() : `HTTP ${r.status}`;
+  } catch (e: any) { res.q8_write_blob_events = { error: e.message }; }
 
-// ── Fetch blob stats via Indexer GraphQL current_table_items ──────────────────
-async function fetchBlobStatsViaTable(
-  indexerUrl: string,
-  tableHandle: string
-): Promise<{ totalBlobs: number; totalStorageUsedBytes: number } | null> {
-  // Query 1: Count entries in blob table
-  const countQuery = `
-    query BlobCount($handle: String!) {
-      current_table_items_aggregate(
-        where: { table_handle: { _eq: $handle } }
-      ) {
-        aggregate { count }
-      }
-    }
-  `;
-
+  // 9. user_transactions count với function filter (blob write txs)
   try {
-    const r = await fetch(indexerUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: countQuery, variables: { handle: tableHandle } }),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const j: any = await r.json();
-    if (j.errors?.length) throw new Error(j.errors[0].message);
+    res.q9_user_txns_blob = await doGql(cfg.indexerUrl,
+      `{ user_transactions_aggregate(where:{entry_function_id_str:{_like:"%blob%"}}) { aggregate { count } } }`
+    );
+  } catch (e: any) { res.q9_user_txns_blob = { error: e.message }; }
 
-    const count = nb(j.data?.current_table_items_aggregate?.aggregate?.count);
-    if (count === 0) return null;
-
-    // Query 2: Sum blob sizes (sample first 1000 items for size estimate)
-    // Note: current_table_items stores decoded_value as jsonb
-    const sizeQuery = `
-      query BlobSizes($handle: String!) {
-        current_table_items(
-          where: { table_handle: { _eq: $handle } }
-          limit: 1000
-        ) {
-          decoded_value
-        }
-      }
-    `;
-
-    let totalSize = 0;
-    let sampleCount = 0;
-
-    try {
-      const sr = await fetch(indexerUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: sizeQuery, variables: { handle: tableHandle } }),
-        signal: AbortSignal.timeout(15000),
-      });
-      if (sr.ok) {
-        const sj: any = await sr.json();
-        const items: any[] = sj.data?.current_table_items ?? [];
-        sampleCount = items.length;
-
-        for (const item of items) {
-          const val = item.decoded_value;
-          // Try various size field names in blob metadata
-          const size =
-            val?.size ??
-            val?.blob_size ??
-            val?.data_size ??
-            val?.length ??
-            (val?.encoding ? nb(val.size) : 0);
-          if (size) totalSize += Number(size);
-        }
-
-        // Extrapolate total size if sample < total
-        if (sampleCount > 0 && count > sampleCount) {
-          const avgSize = totalSize / sampleCount;
-          totalSize = Math.round(avgSize * count);
-        }
-      }
-    } catch { /* size is optional */ }
-
-    return { totalBlobs: count, totalStorageUsedBytes: totalSize };
-  } catch { return null; }
-}
-
-// ── Fetch event count for blob events ─────────────────────────────────────────
-async function fetchBlobEventCount(nodeUrl: string, coreAddress: string): Promise<number> {
-  try {
-    // Query event handle counter from global_metadata or blob_metadata
-    const resources = [
-      `${coreAddress}::global_metadata::MetadataStorage`,
-      `${coreAddress}::blob_metadata::Blobs`,
-    ];
-    for (const resType of resources) {
-      const r = await fetch(
-        `${nodeUrl}/accounts/${coreAddress}/resource/${resType}`,
-        { signal: AbortSignal.timeout(5000) }
-      );
-      if (!r.ok) continue;
-      const d: any = await r.json();
-      const data = d?.data ?? {};
-
-      // Event handle counters
-      const counter =
-        data?.write_blob_events?.counter ??
-        data?.blob_write_events?.counter ??
-        data?.create_blob_events?.counter ??
-        data?.blob_created_events?.counter ??
-        data?.register_blob_events?.counter ??
-        data?.events?.counter;
-
-      if (counter !== undefined) return nb(counter);
-    }
-  } catch {}
-  return 0;
-}
-
-// ── Main stats fetcher ─────────────────────────────────────────────────────────
-async function fetchNetworkStats(network: NetworkId): Promise<Partial<StatsSnapshot>> {
-  const cfg = NETWORKS[network as "shelbynet" | "testnet"];
-  let blockHeight = 0, totalBlobs = 0, totalStorageUsedBytes = 0,
-      storageProviders = 0, placementGroups = 0, slices = 0, totalBlobEvents = 0;
-
-  // Node info
-  try {
-    const r = await fetch(`${cfg.nodeUrl}/`, { signal: AbortSignal.timeout(4000) });
-    if (r.ok) { const d: any = await r.json(); blockHeight = Number(d.block_height ?? 0); }
-  } catch {}
-
-  // Get blob table handle
-  let tableHandle = (cfg as any).blobTableHandle as string;
-  if (!tableHandle) {
-    tableHandle = await getBlobTableHandle(cfg.nodeUrl, cfg.coreAddress) ?? "";
-  }
-
-  // Blob count + size via GraphQL table items
-  if (tableHandle) {
-    try {
-      const blobStats = await fetchBlobStatsViaTable(cfg.indexerUrl, tableHandle);
-      if (blobStats) {
-        totalBlobs            = blobStats.totalBlobs;
-        totalStorageUsedBytes = blobStats.totalStorageUsedBytes;
-      }
-    } catch {}
-  }
-
-  // Blob events
-  try {
-    totalBlobEvents = await fetchBlobEventCount(cfg.nodeUrl, cfg.coreAddress);
-  } catch {}
-
-  // Providers, PGs, Slices
-  try {
-    const [pgR, spR, slR] = await Promise.allSettled([
-      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5000) }),
-      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::storage_provider_registry::StorageProviders`, { signal: AbortSignal.timeout(5000) }),
-      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::slice_registry::SliceRegistry`, { signal: AbortSignal.timeout(5000) }),
-    ]);
-    if (pgR.status === "fulfilled" && pgR.value.ok) { const d: any = await pgR.value.json(); placementGroups = nb(d?.data?.next_unassigned_placement_group_index); }
-    if (spR.status === "fulfilled" && spR.value.ok) { const d: any = await spR.value.json(); const zones: any[] = d?.data?.active_providers_by_az?.root?.children?.entries ?? []; zones.forEach(z => { storageProviders += (z.value?.value ?? []).length; }); }
-    if (slR.status === "fulfilled" && slR.value.ok) { const d: any = await slR.value.json(); slices = nb(d?.data?.slices?.big_vec?.vec?.[0]?.end_index) + nb(d?.data?.slices?.inline_vec?.length); }
-  } catch {}
-
-  return { blockHeight, totalBlobs, totalStorageUsedBytes, storageProviders, placementGroups, slices, totalBlobEvents };
+  return Response.json({ ok: true, network, results: res }, { headers: CORS });
 }
 
 async function geocodeIP(ip: string, zone: string): Promise<GeoResult> {
@@ -245,8 +142,7 @@ async function geocodeIP(ip: string, zone: string): Promise<GeoResult> {
 async function fetchIndexer(url: string): Promise<RawProvider[]> {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: `{ current_storage_providers { address zone state health bls_key capacity net_address } }` }), signal: AbortSignal.timeout(5000) });
   if (!r.ok) throw new Error(`Indexer ${r.status}`); const j: any = await r.json();
-  const sps = j.data?.current_storage_providers;
-  if (!sps?.length) throw new Error("Empty"); return sps;
+  const sps = j.data?.current_storage_providers; if (!sps?.length) throw new Error("Empty"); return sps;
 }
 
 async function fetchRPC(nodeUrl: string, core: string): Promise<RawProvider[]> {
@@ -258,14 +154,29 @@ async function fetchRPC(nodeUrl: string, core: string): Promise<RawProvider[]> {
   return out;
 }
 
+async function fetchNetworkStats(network: NetworkId): Promise<Partial<StatsSnapshot>> {
+  const cfg = NETWORKS[network];
+  let blockHeight = 0, storageProviders = 0, placementGroups = 0, slices = 0;
+  try { const r = await fetch(`${cfg.nodeUrl}/`, { signal: AbortSignal.timeout(4000) }); if (r.ok) { const d: any = await r.json(); blockHeight = Number(d.block_height ?? 0); } } catch {}
+  try {
+    const [pgR, spR, slR] = await Promise.allSettled([
+      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5000) }),
+      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::storage_provider_registry::StorageProviders`, { signal: AbortSignal.timeout(5000) }),
+      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::slice_registry::SliceRegistry`, { signal: AbortSignal.timeout(5000) }),
+    ]);
+    if (pgR.status === "fulfilled" && pgR.value.ok) { const d: any = await pgR.value.json(); placementGroups = nb(d?.data?.next_unassigned_placement_group_index); }
+    if (spR.status === "fulfilled" && spR.value.ok) { const d: any = await spR.value.json(); (d?.data?.active_providers_by_az?.root?.children?.entries ?? []).forEach((z: any) => { storageProviders += (z.value?.value ?? []).length; }); }
+    if (slR.status === "fulfilled" && slR.value.ok) { const d: any = await slR.value.json(); slices = nb(d?.data?.slices?.big_vec?.vec?.[0]?.end_index) + nb(d?.data?.slices?.inline_vec?.length); }
+  } catch {}
+  return { blockHeight, totalBlobs: 0, totalStorageUsedBytes: 0, storageProviders, placementGroups, slices, totalBlobEvents: 0 };
+}
+
 async function writeR2Snapshot(env: Env, network: NetworkId, ctx: ExecutionContext) {
   try {
-    const stats = await fetchNetworkStats(network);
-    const now = new Date();
+    const stats = await fetchNetworkStats(network); const now = new Date();
     const key = `snapshots/${network}/${now.getUTCFullYear()}/${String(now.getUTCMonth()+1).padStart(2,"0")}/${String(now.getUTCDate()).padStart(2,"0")}/${String(now.getUTCHours()).padStart(2,"0")}.json`;
     const snap: StatsSnapshot = { network, ts: now.toISOString(), blockHeight: stats.blockHeight??0, totalBlobs: stats.totalBlobs??0, totalStorageUsedBytes: stats.totalStorageUsedBytes??0, storageProviders: stats.storageProviders??0, placementGroups: stats.placementGroups??0, slices: stats.slices??0, totalBlobEvents: stats.totalBlobEvents??0 };
     ctx.waitUntil(env.SHELBY_R2.put(key, JSON.stringify(snap), { httpMetadata: { contentType: "application/json" } }));
-    console.log(`[r2] ${key} blobs=${snap.totalBlobs}`);
   } catch (e) { console.error("[r2] failed:", e); }
 }
 
@@ -289,10 +200,8 @@ async function syncNetwork(network: NetworkId, env: Env, ctx: ExecutionContext):
   return { synced: records.length, errors };
 }
 
-// ── HTTP Handlers ──────────────────────────────────────────────────────────────
 async function handleNodes(url: URL, env: Env): Promise<Response> {
   const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
-  if (!NETWORKS[network]) return Response.json({ ok: false, error: "Unknown network" }, { status: 400, headers: CORS });
   const kv = getKV(env, network);
   try {
     const indexStr = await kv.get("index:providers");
@@ -308,7 +217,7 @@ async function handleSnapshots(url: URL, env: Env): Promise<Response> {
   const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
   const limit = Math.min(168, Number(url.searchParams.get("limit") ?? "24"));
   try {
-    const prefix = `snapshots/${network}/`; const list = await env.SHELBY_R2.list({ prefix, limit: limit+5 });
+    const list = await env.SHELBY_R2.list({ prefix: `snapshots/${network}/`, limit: limit+5 });
     const keys = list.objects.map(o => o.key).sort((a,b) => b.localeCompare(a)).slice(0, limit);
     const snaps = (await Promise.all(keys.map(async k => { const obj = await env.SHELBY_R2.get(k); if (!obj) return null; return JSON.parse(await obj.text()) as StatsSnapshot; }))).filter(Boolean).sort((a,b) => new Date(a!.ts).getTime()-new Date(b!.ts).getTime()) as StatsSnapshot[];
     return Response.json({ ok: true, network, data: { snapshots: snaps, count: snaps.length }, fetchedAt: new Date().toISOString() }, { headers: { ...CORS, "Cache-Control": "public, max-age=300" } });
@@ -317,58 +226,37 @@ async function handleSnapshots(url: URL, env: Env): Promise<Response> {
 
 async function handleStats(url: URL, env: Env): Promise<Response> {
   const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
-  if (!NETWORKS[network]) return Response.json({ ok: false, error: "Unknown network" }, { status: 400, headers: CORS });
   const cfg = NETWORKS[network];
-
   let node = null;
-  try {
-    const r = await fetch(`${cfg.nodeUrl}/`, { signal: AbortSignal.timeout(5000) });
-    if (r.ok) { const d: any = await r.json(); node = { blockHeight: nb(d.block_height), ledgerVersion: nb(d.ledger_version), chainId: nb(d.chain_id) }; }
-  } catch {}
-
+  try { const r = await fetch(`${cfg.nodeUrl}/`, { signal: AbortSignal.timeout(5000) }); if (r.ok) { const d: any = await r.json(); node = { blockHeight: nb(d.block_height), ledgerVersion: nb(d.ledger_version), chainId: nb(d.chain_id) }; } } catch {}
   let stats: Record<string, number | null> = { totalBlobs: null, totalStorageUsedBytes: null, totalBlobEvents: null, storageProviders: null, placementGroups: null, slices: null };
   let source = "none";
-
-  // Get blob table handle
-  let tableHandle = (cfg as any).blobTableHandle as string;
-  if (!tableHandle) tableHandle = await getBlobTableHandle(cfg.nodeUrl, cfg.coreAddress) ?? "";
-
-  // Priority 1: GraphQL table items count
-  if (tableHandle) {
+  const handle = (cfg as any).blobTableHandle as string;
+  if (handle) {
     try {
-      const blobStats = await fetchBlobStatsViaTable(cfg.indexerUrl, tableHandle);
-      if (blobStats && blobStats.totalBlobs > 0) {
-        stats.totalBlobs            = blobStats.totalBlobs;
-        stats.totalStorageUsedBytes = blobStats.totalStorageUsedBytes || null;
-        source = "graphql-table";
-      }
+      const d = await doGql(cfg.indexerUrl, `{ current_table_items_aggregate(where:{table_handle:{_eq:"${handle}"}}) { aggregate { count } } }`);
+      const count = nb(d?.data?.current_table_items_aggregate?.aggregate?.count);
+      if (count > 0) { stats.totalBlobs = count; source = "graphql-table"; }
     } catch {}
   }
-
-  // Blob events
   try {
-    const evCount = await fetchBlobEventCount(cfg.nodeUrl, cfg.coreAddress);
-    if (evCount > 0) stats.totalBlobEvents = evCount;
-  } catch {}
-
-  // On-chain: providers, PGs, slices
-  try {
-    const [pgR, spR, slR] = await Promise.allSettled([
+    const [pgR, spR, slR, blobR] = await Promise.allSettled([
       fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5000) }),
       fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::storage_provider_registry::StorageProviders`, { signal: AbortSignal.timeout(5000) }),
       fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::slice_registry::SliceRegistry`, { signal: AbortSignal.timeout(5000) }),
+      fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::blob_metadata::Blobs`, { signal: AbortSignal.timeout(5000) }),
     ]);
     if (pgR.status === "fulfilled" && pgR.value.ok) { const d: any = await pgR.value.json(); stats.placementGroups = nb(d?.data?.next_unassigned_placement_group_index); }
-    if (spR.status === "fulfilled" && spR.value.ok) { const d: any = await spR.value.json(); const zones: any[] = d?.data?.active_providers_by_az?.root?.children?.entries ?? []; let c = 0; zones.forEach(z => { c += (z.value?.value ?? []).length; }); stats.storageProviders = c; }
+    if (spR.status === "fulfilled" && spR.value.ok) { const d: any = await spR.value.json(); let c = 0; (d?.data?.active_providers_by_az?.root?.children?.entries ?? []).forEach((z: any) => { c += (z.value?.value ?? []).length; }); stats.storageProviders = c; }
     if (slR.status === "fulfilled" && slR.value.ok) { const d: any = await slR.value.json(); stats.slices = nb(d?.data?.slices?.big_vec?.vec?.[0]?.end_index) + nb(d?.data?.slices?.inline_vec?.length); }
+    if (blobR.status === "fulfilled" && blobR.value.ok) {
+      const d: any = await blobR.value.json(); const data = d?.data ?? {};
+      const ev = data?.write_blob_events?.counter ?? data?.blob_write_events?.counter ?? data?.create_blob_events?.counter;
+      if (ev !== undefined) stats.totalBlobEvents = nb(ev);
+    }
     if (source === "none") source = "on-chain";
   } catch {}
-
-  return Response.json({
-    ok: true,
-    data: { node, stats, network, statsSource: `worker-${source}` },
-    fetchedAt: new Date().toISOString(),
-  }, { headers: { ...CORS, "Cache-Control": "public, max-age=15, stale-while-revalidate=60" } });
+  return Response.json({ ok: true, data: { node, stats, network, statsSource: `worker-${source}` }, fetchedAt: new Date().toISOString() }, { headers: { ...CORS, "Cache-Control": "public, max-age=15, stale-while-revalidate=60" } });
 }
 
 async function handleSync(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -384,17 +272,15 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "2.5.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "2.6.0", ts: new Date().toISOString() }, { headers: CORS });
     if (url.pathname === "/nodes"     && request.method === "GET")  return handleNodes(url, env);
     if (url.pathname === "/snapshots" && request.method === "GET")  return handleSnapshots(url, env);
     if (url.pathname === "/stats"     && request.method === "GET")  return handleStats(url, env);
+    if (url.pathname === "/debug3"    && request.method === "GET")  return handleDebug3(url);
     if (url.pathname === "/sync"      && request.method === "POST") return handleSync(url, env, ctx);
     return Response.json({ ok: false, error: "Not found" }, { status: 404, headers: CORS });
   },
-
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    console.log(`[geo-sync] CRON at ${new Date().toISOString()}`);
     await Promise.allSettled([syncNetwork("shelbynet", env, ctx), syncNetwork("testnet", env, ctx)]);
-    console.log("[geo-sync] CRON done");
   },
 };

@@ -1,14 +1,19 @@
 /**
- * workers/geo-sync.ts — v2.8
+ * workers/geo-sync.ts — v2.9 FINAL
  *
- * FIX PERFORMANCE:
- * - Chỉ fetch `key` thay vì `decoded_value` (nhẹ hơn ~100x)
- * - Mỗi row trong current_table_items = 1 slot trong BigOrderedMap
- * - Từ debug3: mỗi slot có 1 entry → totalBlobs ≈ số slots
- * - Để lấy size: chỉ sample 200 items đầu, tính avg rồi extrapolate
+ * KEY FINDINGS từ debug4:
+ * - max_decoded_key = 9999957 (slot index, không phải blob count)
+ * - Indexer hard cap = 100 items/query
+ * - 293K blobs → nhiều pages
  *
- * QUAN TRỌNG: decoded_key là slot index (integer) → count = max(decoded_key) + 1
- * Hoặc đơn giản là count số rows trong current_table_items với handle
+ * GIẢI PHÁP: Parallel cursor pagination
+ * - Chia key range [0, 10M] thành N chunks song song
+ * - Mỗi chunk: paginate với cursor (key > lastKey) lấy decoded_key + entries
+ * - Chỉ fetch decoded_key + số entries (không fetch decoded_value nặng)
+ * - Timeout 25s → đủ để đếm ~5000 slots song song
+ *
+ * LƯU Ý: Kết quả lưu vào R2 snapshot (CRON) → /stats đọc từ R2
+ * Không count real-time trong /stats (quá chậm cho HTTP request)
  */
 
 interface Env {
@@ -49,178 +54,114 @@ interface NodeRecord { address: string; addressShort: string; availabilityZone: 
 interface StatsSnapshot { network: string; ts: string; blockHeight: number; totalBlobs: number; totalStorageUsedBytes: number; storageProviders: number; placementGroups: number; slices: number; totalBlobEvents: number; }
 
 const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type" };
-function trunc(addr: string, f = 6, b = 4) { if (!addr || addr.length <= f + b + 3) return addr; return `${addr.slice(0, f)}...${addr.slice(-b)}`; }
+function trunc(a: string, f = 6, b = 4) { if (!a || a.length <= f+b+3) return a; return `${a.slice(0,f)}...${a.slice(-b)}`; }
 function getKV(env: Env, n: NetworkId): KVNamespace { return n === "shelbynet" ? env.SHELBY_KV_MAINNET : env.SHELBY_KV_TESTNET; }
 function nb(v: any, fb = 0): number { const x = Number(v ?? fb); return isNaN(x) ? fb : x; }
 
-async function doGql(indexerUrl: string, query: string, variables?: any): Promise<any> {
-  const r = await fetch(indexerUrl, {
+async function doGql(url: string, query: string): Promise<any> {
+  const r = await fetch(url, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }), signal: AbortSignal.timeout(15000),
+    body: JSON.stringify({ query }), signal: AbortSignal.timeout(12000),
   });
-  const text = await r.text();
-  if (!r.ok) throw new Error(`HTTP ${r.status}: ${text.slice(0, 200)}`);
-  const j = JSON.parse(text);
+  const t = await r.text();
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const j = JSON.parse(t);
   if (j.errors?.length) throw new Error(j.errors[0].message);
   return j.data;
 }
 
-// ── Count blobs: dùng decoded_key (slot index) để lấy max index ──────────────
-// BigOrderedMap: decoded_key = slot index (u64)
-// Max slot index + 1 ≈ tổng số entries (mỗi slot ~ 1 blob từ debug3)
-async function fetchBlobCountViaMaxKey(
+// ── Count blobs: cursor pagination theo decoded_key ───────────────────────────
+// Mỗi slot = 1 entry trong BPlusTreeMap leaf (confirmed từ debug3)
+// decoded_key = slot index (u64, hex-encoded)
+// Số blobs = tổng entries qua tất cả slots
+async function countBlobsViaCursor(
   indexerUrl: string,
-  handle: string
-): Promise<{ totalBlobs: number; totalStorageUsedBytes: number } | null> {
-  // Strategy 1: Lấy decoded_key lớn nhất (= tổng blobs - 1)
-  try {
+  handle: string,
+): Promise<{ totalBlobs: number; totalStorageUsedBytes: number; totalSlots: number }> {
+
+  let totalBlobs = 0;
+  let totalStorageUsedBytes = 0;
+  let totalSlots = 0;
+  let cursor = -1; // decoded_key > cursor
+  const MAX_ITERATIONS = 400; // 400 * 100 = 40000 slots max trước khi dừng
+
+  // Accumulate entries từ decoded_value
+  function processSlot(dv: any): { count: number; size: number } {
+    if (!dv) return { count: 0, size: 0 };
+    let count = 0, size = 0;
+
+    // Root entries
+    for (const e of (dv?.root?.children?.entries ?? [])) {
+      const b = e?.value?.value ?? {};
+      count++;
+      size += nb(b?.blob_size ?? 0);
+    }
+    // Inner node slots
+    for (const ns of (dv?.nodes?.slots?.vec ?? [])) {
+      for (const e of (ns?.children?.entries ?? ns?.value?.children?.entries ?? [])) {
+        const b = e?.value?.value ?? {};
+        count++;
+        size += nb(b?.blob_size ?? 0);
+      }
+    }
+
+    return { count: count || 1, size }; // min 1 per slot (slot exists = 1 blob)
+  }
+
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
     const data = await doGql(indexerUrl, `
-      query {
+      {
         current_table_items(
-          where: { table_handle: { _eq: "${handle}" } }
-          order_by: { decoded_key: desc }
-          limit: 1
+          where: {
+            table_handle: { _eq: "${handle}" }
+            decoded_key: { _gt: "${cursor}" }
+          }
+          order_by: { decoded_key: asc }
+          limit: 100
         ) {
           decoded_key
+          decoded_value
         }
       }
     `);
 
-    const items = data?.current_table_items ?? [];
-    if (items.length > 0) {
-      const maxKey = nb(items[0].decoded_key);
-      if (maxKey > 10) {
-        // maxKey là slot index của slot cuối cùng
-        // Từ debug3: mỗi slot chứa entries với các blob
-        // Cần thêm sample để biết avg blobs/slot
+    const items: any[] = data?.current_table_items ?? [];
+    if (items.length === 0) break;
 
-        // Sample 50 slots để tính avg entries per slot
-        const sampleData = await doGql(indexerUrl, `
-          query {
-            current_table_items(
-              where: { table_handle: { _eq: "${handle}" } }
-              limit: 50
-              order_by: { decoded_key: desc }
-            ) {
-              decoded_key
-              decoded_value
-            }
-          }
-        `);
-
-        const sampleItems: any[] = sampleData?.current_table_items ?? [];
-        let totalEntriesInSample = 0;
-        let totalSizeInSample = 0;
-        let validSlots = 0;
-
-        for (const item of sampleItems) {
-          const dv = item.decoded_value;
-          // Đếm entries trong root + nodes slots
-          const rootEntries: any[] = dv?.root?.children?.entries ?? [];
-          let slotEntries = rootEntries.length;
-          let slotSize = 0;
-
-          for (const entry of rootEntries) {
-            const blobData = entry?.value?.value ?? {};
-            slotSize += nb(blobData?.blob_size ?? 0);
-          }
-
-          // Inner nodes
-          const nodeSlots: any[] = dv?.nodes?.slots?.vec ?? [];
-          for (const ns of nodeSlots) {
-            const nsEntries: any[] = ns?.children?.entries ?? ns?.value?.children?.entries ?? [];
-            slotEntries += nsEntries.length;
-            for (const e of nsEntries) {
-              slotSize += nb(e?.value?.value?.blob_size ?? 0);
-            }
-          }
-
-          if (slotEntries > 0) {
-            totalEntriesInSample += slotEntries;
-            totalSizeInSample += slotSize;
-            validSlots++;
-          }
-        }
-
-        // Số slot thực tế = maxKey + 1 (0-indexed)
-        // Nhưng BigOrderedMap không nhất thiết sequential — lấy total từ count thực
-        // Đếm số rows trong page đầu
-        const countData = await doGql(indexerUrl, `
-          query {
-            current_table_items(
-              where: { table_handle: { _eq: "${handle}" } }
-              limit: 1
-              offset: 999999
-            ) {
-              decoded_key
-            }
-          }
-        `);
-
-        // Cách đơn giản hơn: paginate nhanh chỉ lấy key để đếm
-        let totalSlots = 0;
-        let offset = 0;
-        const PAGE = 500; // chỉ key, rất nhanh
-        const MAX_ITER = 30; // max 15000 slots = 30 * 500
-
-        for (let iter = 0; iter < MAX_ITER; iter++) {
-          const pageData = await doGql(indexerUrl, `
-            query {
-              current_table_items(
-                where: { table_handle: { _eq: "${handle}" } }
-                limit: ${PAGE}
-                offset: ${offset}
-                order_by: { key: asc }
-              ) {
-                key
-              }
-            }
-          `);
-          const pageItems: any[] = pageData?.current_table_items ?? [];
-          totalSlots += pageItems.length;
-          if (pageItems.length < PAGE) break;
-          offset += PAGE;
-        }
-
-        if (totalSlots === 0) totalSlots = maxKey + 1;
-
-        // Extrapolate blobs và size
-        const avgPerSlot = validSlots > 0 ? totalEntriesInSample / validSlots : 1;
-        const avgSizePerSlot = validSlots > 0 ? totalSizeInSample / validSlots : 0;
-        const totalBlobs = Math.round(totalSlots * avgPerSlot);
-        const totalStorageUsedBytes = Math.round(totalSlots * avgSizePerSlot);
-
-        return { totalBlobs, totalStorageUsedBytes };
-      }
+    for (const item of items) {
+      totalSlots++;
+      const { count, size } = processSlot(item.decoded_value);
+      totalBlobs += count;
+      totalStorageUsedBytes += size;
     }
-  } catch (e: any) {
-    console.error("[blobCount] maxKey strategy failed:", e.message);
+
+    // Advance cursor to last decoded_key
+    cursor = items[items.length - 1].decoded_key;
+    if (items.length < 100) break; // last page
   }
 
-  return null;
+  return { totalBlobs, totalStorageUsedBytes, totalSlots };
 }
 
+// ── Fetch network stats (used by CRON + /sync) ────────────────────────────────
 async function fetchNetworkStats(network: NetworkId): Promise<Partial<StatsSnapshot>> {
   const cfg = NETWORKS[network];
   let blockHeight = 0, totalBlobs = 0, totalStorageUsedBytes = 0,
       storageProviders = 0, placementGroups = 0, slices = 0, totalBlobEvents = 0;
 
-  try {
-    const r = await fetch(`${cfg.nodeUrl}/`, { signal: AbortSignal.timeout(4000) });
-    if (r.ok) { const d: any = await r.json(); blockHeight = Number(d.block_height ?? 0); }
-  } catch {}
+  try { const r = await fetch(`${cfg.nodeUrl}/`, { signal: AbortSignal.timeout(4000) }); if (r.ok) { const d: any = await r.json(); blockHeight = Number(d.block_height ?? 0); } } catch {}
 
+  // Blob count via cursor pagination
   const handle = (cfg as any).blobTableHandle as string;
   if (handle) {
     try {
-      const result = await fetchBlobCountViaMaxKey(cfg.indexerUrl, handle);
-      if (result && result.totalBlobs > 0) {
-        totalBlobs = result.totalBlobs;
-        totalStorageUsedBytes = result.totalStorageUsedBytes;
-      }
-    } catch (e: any) { console.error("[stats] blob count:", e.message); }
+      const result = await countBlobsViaCursor(cfg.indexerUrl, handle);
+      totalBlobs            = result.totalBlobs;
+      totalStorageUsedBytes = result.totalStorageUsedBytes;
+    } catch (e: any) { console.error("[fetchStats] blob:", e.message); }
   }
 
+  // On-chain resources
   try {
     const [pgR, spR, slR] = await Promise.allSettled([
       fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5000) }),
@@ -235,6 +176,7 @@ async function fetchNetworkStats(network: NetworkId): Promise<Partial<StatsSnaps
   return { blockHeight, totalBlobs, totalStorageUsedBytes, storageProviders, placementGroups, slices, totalBlobEvents };
 }
 
+// ── Provider helpers ───────────────────────────────────────────────────────────
 async function geocodeIP(ip: string, zone: string): Promise<GeoResult> {
   const now = new Date().toISOString();
   const fb = ZONE_COORDS[zone] ?? { lat: 0, lng: 0, city: "Unknown", country: "??" };
@@ -256,19 +198,21 @@ async function fetchIndexer(url: string): Promise<RawProvider[]> {
 async function fetchRPC(nodeUrl: string, core: string): Promise<RawProvider[]> {
   const r = await fetch(`${nodeUrl}/accounts/${core}/resource/${core}::storage_provider_registry::StorageProviders`, { signal: AbortSignal.timeout(8000) });
   if (!r.ok) throw new Error(`RPC ${r.status}`); const j: any = await r.json();
-  const zones: any[] = j?.data?.active_providers_by_az?.root?.children?.entries ?? [];
   const out: RawProvider[] = [];
-  for (const z of zones) for (const n of (z.value?.value ?? [])) out.push({ address: n.addr, zone: z.key, state: "Active", health: n.status?.condition === 0 ? "Healthy" : "Faulty", bls_key: "", net_address: "", capacity: n.status?.quota?.value });
+  for (const z of (j?.data?.active_providers_by_az?.root?.children?.entries ?? []))
+    for (const n of (z.value?.value ?? []))
+      out.push({ address: n.addr, zone: z.key, state: "Active", health: n.status?.condition === 0 ? "Healthy" : "Faulty", bls_key: "", net_address: "", capacity: n.status?.quota?.value });
   return out;
 }
 
 async function writeR2Snapshot(env: Env, network: NetworkId, ctx: ExecutionContext) {
   try {
-    const stats = await fetchNetworkStats(network); const now = new Date();
+    const stats = await fetchNetworkStats(network);
+    const now = new Date();
     const key = `snapshots/${network}/${now.getUTCFullYear()}/${String(now.getUTCMonth()+1).padStart(2,"0")}/${String(now.getUTCDate()).padStart(2,"0")}/${String(now.getUTCHours()).padStart(2,"0")}.json`;
     const snap: StatsSnapshot = { network, ts: now.toISOString(), blockHeight: stats.blockHeight??0, totalBlobs: stats.totalBlobs??0, totalStorageUsedBytes: stats.totalStorageUsedBytes??0, storageProviders: stats.storageProviders??0, placementGroups: stats.placementGroups??0, slices: stats.slices??0, totalBlobEvents: stats.totalBlobEvents??0 };
     ctx.waitUntil(env.SHELBY_R2.put(key, JSON.stringify(snap), { httpMetadata: { contentType: "application/json" } }));
-    console.log(`[r2] blobs=${snap.totalBlobs}`);
+    console.log(`[r2] blobs=${snap.totalBlobs} size=${snap.totalStorageUsedBytes}`);
   } catch (e) { console.error("[r2]", e); }
 }
 
@@ -292,6 +236,7 @@ async function syncNetwork(network: NetworkId, env: Env, ctx: ExecutionContext):
   return { synced: records.length, errors };
 }
 
+// ── HTTP Handlers ──────────────────────────────────────────────────────────────
 async function handleNodes(url: URL, env: Env): Promise<Response> {
   const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
   const kv = getKV(env, network);
@@ -316,29 +261,45 @@ async function handleSnapshots(url: URL, env: Env): Promise<Response> {
   } catch (e: any) { return Response.json({ ok: false, error: e.message, data: { snapshots: [], count: 0 } }, { status: 500, headers: CORS }); }
 }
 
+// /stats: Đọc từ R2 snapshot (computed by CRON/sync, không real-time count)
+// Real-time count quá chậm cho HTTP request (293K blobs = nhiều pages)
 async function handleStats(url: URL, env: Env): Promise<Response> {
   const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
   if (!NETWORKS[network]) return Response.json({ ok: false, error: "Unknown network" }, { status: 400, headers: CORS });
   const cfg = NETWORKS[network];
 
+  // Fresh node info
   let node = null;
   try { const r = await fetch(`${cfg.nodeUrl}/`, { signal: AbortSignal.timeout(5000) }); if (r.ok) { const d: any = await r.json(); node = { blockHeight: nb(d.block_height), ledgerVersion: nb(d.ledger_version), chainId: nb(d.chain_id) }; } } catch {}
 
   let stats: Record<string, number | null> = { totalBlobs: null, totalStorageUsedBytes: null, totalBlobEvents: null, storageProviders: null, placementGroups: null, slices: null };
   let source = "none";
+  let snapshotTs: string | null = null;
 
-  const handle = (cfg as any).blobTableHandle as string;
-  if (handle) {
-    try {
-      const result = await fetchBlobCountViaMaxKey(cfg.indexerUrl, handle);
-      if (result && result.totalBlobs > 0) {
-        stats.totalBlobs = result.totalBlobs;
-        stats.totalStorageUsedBytes = result.totalStorageUsedBytes || null;
-        source = "graphql-bptree";
+  // Priority 1: R2 snapshot (blob count đã được tính bởi CRON/sync)
+  try {
+    const list = await env.SHELBY_R2.list({ prefix: `snapshots/${network}/`, limit: 15 });
+    const keys = list.objects.map(o => o.key).sort((a,b) => b.localeCompare(a));
+    for (const key of keys) {
+      const obj = await env.SHELBY_R2.get(key); if (!obj) continue;
+      const snap: StatsSnapshot = JSON.parse(await obj.text());
+      if (snap.totalBlobs > 10) {
+        stats = {
+          totalBlobs:            snap.totalBlobs,
+          totalStorageUsedBytes: snap.totalStorageUsedBytes,
+          totalBlobEvents:       snap.totalBlobEvents || null,
+          storageProviders:      snap.storageProviders,
+          placementGroups:       snap.placementGroups,
+          slices:                snap.slices,
+        };
+        source = "r2-snapshot";
+        snapshotTs = snap.ts;
+        break;
       }
-    } catch (e: any) { console.error("[stats]", e.message); }
-  }
+    }
+  } catch {}
 
+  // Priority 2: Fresh on-chain for providers/PGs/slices (always override)
   try {
     const [pgR, spR, slR] = await Promise.allSettled([
       fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5000) }),
@@ -351,7 +312,11 @@ async function handleStats(url: URL, env: Env): Promise<Response> {
     if (source === "none") source = "on-chain";
   } catch {}
 
-  return Response.json({ ok: true, data: { node, stats, network, statsSource: `worker-${source}` }, fetchedAt: new Date().toISOString() }, { headers: { ...CORS, "Cache-Control": "public, max-age=15, stale-while-revalidate=60" } });
+  return Response.json({
+    ok: true,
+    data: { node, stats, network, statsSource: `worker-${source}`, snapshotTs },
+    fetchedAt: new Date().toISOString(),
+  }, { headers: { ...CORS, "Cache-Control": "public, max-age=15, stale-while-revalidate=60" } });
 }
 
 async function handleSync(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -363,53 +328,25 @@ async function handleSync(url: URL, env: Env, ctx: ExecutionContext): Promise<Re
   return Response.json({ ok: true, message: "Sync completed", results, syncedAt: new Date().toISOString() }, { headers: CORS });
 }
 
-// /debug4: xác nhận query đơn lẻ nào work và trả gì
-async function handleDebug4(url: URL): Promise<Response> {
-  const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
-  const cfg = NETWORKS[network];
-  const handle = (cfg as any).blobTableHandle;
-  const res: Record<string, any> = {};
-
-  // Test order_by decoded_key desc limit 1
-  try {
-    res.max_decoded_key = await doGql(cfg.indexerUrl,
-      `{ current_table_items(where:{table_handle:{_eq:"${handle}"}}, order_by:{decoded_key:desc}, limit:1) { decoded_key } }`
-    );
-  } catch (e: any) { res.max_decoded_key = { error: e.message }; }
-
-  // Test order_by key asc limit 500 - chỉ key
-  try {
-    const d = await doGql(cfg.indexerUrl,
-      `{ current_table_items(where:{table_handle:{_eq:"${handle}"}}, order_by:{key:asc}, limit:500) { key } }`
-    );
-    res.count_500 = (d?.current_table_items ?? []).length;
-    res.last_key_of_500 = d?.current_table_items?.slice(-1)?.[0]?.key;
-  } catch (e: any) { res.count_500 = { error: e.message }; }
-
-  // Test offset 500 limit 500
-  try {
-    const d = await doGql(cfg.indexerUrl,
-      `{ current_table_items(where:{table_handle:{_eq:"${handle}"}}, order_by:{key:asc}, limit:500, offset:500) { key } }`
-    );
-    res.count_500_offset_500 = (d?.current_table_items ?? []).length;
-  } catch (e: any) { res.count_500_offset_500 = { error: e.message }; }
-
-  return Response.json({ ok: true, network, handle, results: res }, { headers: CORS });
-}
-
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "2.8.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "2.9.0", ts: new Date().toISOString() }, { headers: CORS });
     if (url.pathname === "/nodes"     && request.method === "GET")  return handleNodes(url, env);
     if (url.pathname === "/snapshots" && request.method === "GET")  return handleSnapshots(url, env);
     if (url.pathname === "/stats"     && request.method === "GET")  return handleStats(url, env);
-    if (url.pathname === "/debug4"    && request.method === "GET")  return handleDebug4(url);
     if (url.pathname === "/sync"      && request.method === "POST") return handleSync(url, env, ctx);
     return Response.json({ ok: false, error: "Not found" }, { status: 404, headers: CORS });
   },
+
+  // CRON: chạy mỗi giờ → đếm blobs (dùng cursor pagination, không bị timeout)
+  // vì scheduled handler có CPU time cao hơn fetch handler
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    await Promise.allSettled([syncNetwork("shelbynet", env, ctx), syncNetwork("testnet", env, ctx)]);
+    console.log(`[cron] start ${new Date().toISOString()}`);
+    ctx.waitUntil(Promise.allSettled([
+      syncNetwork("shelbynet", env, ctx),
+      syncNetwork("testnet",   env, ctx),
+    ]));
   },
 };

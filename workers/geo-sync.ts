@@ -1,9 +1,13 @@
 /**
- * workers/geo-sync.ts — v2.4
+ * workers/geo-sync.ts — v2.5 FINAL
  *
- * FIX: Dùng Aptos on-chain view functions để lấy blob count chính xác
- * Shelby contract expose view functions cho stats
- * Indexer GraphQL chỉ có standard Aptos tables, không có blob tables
+ * GIẢI PHÁP ĐÚNG:
+ * - Blob count: query current_table_items_aggregate với table_handle từ blob_metadata::Blobs
+ *   Handle: 0xe41f1fa92a4beeacd0b83b7e05d150e2b260f6b7f934f62a5843f762260d5cb8
+ * - Total size: sum decoded_value->size từ table items
+ * - Providers/PGs/Slices: on-chain RPC (đã đúng)
+ *
+ * Indexer GraphQL có current_table_items — đây là cách đúng để đọc Move Table
  */
 
 interface Env {
@@ -15,14 +19,17 @@ interface Env {
 
 const NETWORKS = {
   shelbynet: {
-    coreAddress: "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a",
-    nodeUrl:     "https://api.shelbynet.shelby.xyz/v1",
-    indexerUrl:  "https://api.shelbynet.shelby.xyz/v1/graphql",
+    coreAddress:    "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a",
+    nodeUrl:        "https://api.shelbynet.shelby.xyz/v1",
+    indexerUrl:     "https://api.shelbynet.shelby.xyz/v1/graphql",
+    // Table handle từ blob_metadata::Blobs.blob_data.handle
+    blobTableHandle: "0xe41f1fa92a4beeacd0b83b7e05d150e2b260f6b7f934f62a5843f762260d5cb8",
   },
   testnet: {
-    coreAddress: "0xc63d6a5efb0080a6029403131715bd4971e1149f7cc099aac69bb0069b3ddbf5",
-    nodeUrl:     "https://api.testnet.aptoslabs.com/v1",
-    indexerUrl:  "https://api.testnet.aptoslabs.com/v1/graphql",
+    coreAddress:    "0xc63d6a5efb0080a6029403131715bd4971e1149f7cc099aac69bb0069b3ddbf5",
+    nodeUrl:        "https://api.testnet.aptoslabs.com/v1",
+    indexerUrl:     "https://api.testnet.aptoslabs.com/v1/graphql",
+    blobTableHandle: "", // sẽ fetch dynamic
   },
 } as const;
 
@@ -47,139 +54,168 @@ function trunc(addr: string, f = 6, b = 4) { if (!addr || addr.length <= f + b +
 function getKV(env: Env, n: NetworkId): KVNamespace { return n === "shelbynet" ? env.SHELBY_KV_MAINNET : env.SHELBY_KV_TESTNET; }
 function nb(v: any, fb = 0): number { const x = Number(v ?? fb); return isNaN(x) ? fb : x; }
 
-async function callView(nodeUrl: string, func: string, args: any[] = []): Promise<any> {
-  const r = await fetch(`${nodeUrl}/view`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ function: func, type_arguments: [], arguments: args }),
-    signal: AbortSignal.timeout(6000),
-  });
-  if (!r.ok) throw new Error(`view ${func} => HTTP ${r.status}`);
-  return r.json();
-}
-
-// ── Fetch blob stats from on-chain view functions ─────────────────────────────
-async function fetchBlobStats(nodeUrl: string, core: string): Promise<{
-  totalBlobs: number; totalStorageUsedBytes: number; totalBlobEvents: number;
-}> {
-  let totalBlobs = 0, totalStorageUsedBytes = 0, totalBlobEvents = 0;
-
-  // Try known view function patterns for Shelby contract
-  const viewFuncs = [
-    `${core}::blob_registry::blob_count`,
-    `${core}::blob_registry::total_blobs`,
-    `${core}::blob_registry::get_blob_count`,
-    `${core}::statistics::total_blobs`,
-    `${core}::statistics::get_stats`,
-    `${core}::blob_registry::total_size`,
-  ];
-
-  for (const fn of viewFuncs) {
-    try {
-      const result = await callView(nodeUrl, fn);
-      if (Array.isArray(result) && result.length > 0) {
-        const v = Number(result[0]);
-        if (!isNaN(v) && v > 10) {
-          totalBlobs = v;
-          break;
-        }
-      }
-    } catch { /* try next */ }
-  }
-
-  // Try blob_registry resource directly — look for total count field
+// ── Get blob table handle dynamically (for testnet or if hardcode fails) ───────
+async function getBlobTableHandle(nodeUrl: string, coreAddress: string): Promise<string | null> {
   try {
     const r = await fetch(
-      `${nodeUrl}/accounts/${core}/resource/${core}::blob_registry::BlobRegistry`,
+      `${nodeUrl}/accounts/${coreAddress}/resource/${coreAddress}::blob_metadata::Blobs`,
       { signal: AbortSignal.timeout(6000) }
     );
-    if (r.ok) {
-      const d: any = await r.json();
-      // Check common field names for blob count
-      const data = d?.data ?? {};
-      const count =
-        data?.total_blobs ??
-        data?.blob_count ??
-        data?.num_blobs ??
-        data?.blobs?.length ??
-        data?.count;
-
-      if (count !== undefined && Number(count) > 10) {
-        totalBlobs = Number(count);
-      }
-
-      // Size fields
-      const size =
-        data?.total_size ??
-        data?.total_storage_used ??
-        data?.used_bytes;
-      if (size !== undefined) totalStorageUsedBytes = Number(size);
-
-      // Events
-      const events =
-        data?.total_events ??
-        data?.blob_events ??
-        data?.num_events;
-      if (events !== undefined) totalBlobEvents = Number(events);
-    }
-  } catch {}
-
-  // Try event counter via account resources list
-  if (totalBlobs === 0) {
-    try {
-      const r = await fetch(
-        `${nodeUrl}/accounts/${core}/resources?limit=200`,
-        { signal: AbortSignal.timeout(8000) }
-      );
-      if (r.ok) {
-        const resources: any[] = await r.json();
-        for (const res of resources) {
-          const type: string = res.type ?? "";
-          const data = res.data ?? {};
-
-          // Look for blob registry with counts
-          if (type.includes("blob_registry") || type.includes("BlobRegistry")) {
-            const count = data?.total_blobs ?? data?.blob_count ?? data?.num_blobs ?? data?.count;
-            if (count !== undefined) totalBlobs = Math.max(totalBlobs, Number(count));
-            const size = data?.total_size ?? data?.total_storage_used;
-            if (size !== undefined) totalStorageUsedBytes = Number(size);
-          }
-
-          // Look for event handles with counters
-          if (type.includes("blob") || type.includes("Blob")) {
-            const counter =
-              data?.create_blob_events?.counter ??
-              data?.blob_created_events?.counter ??
-              data?.write_blob_events?.counter ??
-              data?.blob_write_events?.counter;
-            if (counter !== undefined) totalBlobEvents = Math.max(totalBlobEvents, Number(counter));
-          }
-        }
-      }
-    } catch {}
-  }
-
-  return { totalBlobs, totalStorageUsedBytes, totalBlobEvents };
+    if (!r.ok) return null;
+    const d: any = await r.json();
+    return d?.data?.blob_data?.handle ?? null;
+  } catch { return null; }
 }
 
-// ── Fetch all stats ────────────────────────────────────────────────────────────
+// ── Fetch blob stats via Indexer GraphQL current_table_items ──────────────────
+async function fetchBlobStatsViaTable(
+  indexerUrl: string,
+  tableHandle: string
+): Promise<{ totalBlobs: number; totalStorageUsedBytes: number } | null> {
+  // Query 1: Count entries in blob table
+  const countQuery = `
+    query BlobCount($handle: String!) {
+      current_table_items_aggregate(
+        where: { table_handle: { _eq: $handle } }
+      ) {
+        aggregate { count }
+      }
+    }
+  `;
+
+  try {
+    const r = await fetch(indexerUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: countQuery, variables: { handle: tableHandle } }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j: any = await r.json();
+    if (j.errors?.length) throw new Error(j.errors[0].message);
+
+    const count = nb(j.data?.current_table_items_aggregate?.aggregate?.count);
+    if (count === 0) return null;
+
+    // Query 2: Sum blob sizes (sample first 1000 items for size estimate)
+    // Note: current_table_items stores decoded_value as jsonb
+    const sizeQuery = `
+      query BlobSizes($handle: String!) {
+        current_table_items(
+          where: { table_handle: { _eq: $handle } }
+          limit: 1000
+        ) {
+          decoded_value
+        }
+      }
+    `;
+
+    let totalSize = 0;
+    let sampleCount = 0;
+
+    try {
+      const sr = await fetch(indexerUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: sizeQuery, variables: { handle: tableHandle } }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (sr.ok) {
+        const sj: any = await sr.json();
+        const items: any[] = sj.data?.current_table_items ?? [];
+        sampleCount = items.length;
+
+        for (const item of items) {
+          const val = item.decoded_value;
+          // Try various size field names in blob metadata
+          const size =
+            val?.size ??
+            val?.blob_size ??
+            val?.data_size ??
+            val?.length ??
+            (val?.encoding ? nb(val.size) : 0);
+          if (size) totalSize += Number(size);
+        }
+
+        // Extrapolate total size if sample < total
+        if (sampleCount > 0 && count > sampleCount) {
+          const avgSize = totalSize / sampleCount;
+          totalSize = Math.round(avgSize * count);
+        }
+      }
+    } catch { /* size is optional */ }
+
+    return { totalBlobs: count, totalStorageUsedBytes: totalSize };
+  } catch { return null; }
+}
+
+// ── Fetch event count for blob events ─────────────────────────────────────────
+async function fetchBlobEventCount(nodeUrl: string, coreAddress: string): Promise<number> {
+  try {
+    // Query event handle counter from global_metadata or blob_metadata
+    const resources = [
+      `${coreAddress}::global_metadata::MetadataStorage`,
+      `${coreAddress}::blob_metadata::Blobs`,
+    ];
+    for (const resType of resources) {
+      const r = await fetch(
+        `${nodeUrl}/accounts/${coreAddress}/resource/${resType}`,
+        { signal: AbortSignal.timeout(5000) }
+      );
+      if (!r.ok) continue;
+      const d: any = await r.json();
+      const data = d?.data ?? {};
+
+      // Event handle counters
+      const counter =
+        data?.write_blob_events?.counter ??
+        data?.blob_write_events?.counter ??
+        data?.create_blob_events?.counter ??
+        data?.blob_created_events?.counter ??
+        data?.register_blob_events?.counter ??
+        data?.events?.counter;
+
+      if (counter !== undefined) return nb(counter);
+    }
+  } catch {}
+  return 0;
+}
+
+// ── Main stats fetcher ─────────────────────────────────────────────────────────
 async function fetchNetworkStats(network: NetworkId): Promise<Partial<StatsSnapshot>> {
-  const cfg = NETWORKS[network];
+  const cfg = NETWORKS[network as "shelbynet" | "testnet"];
   let blockHeight = 0, totalBlobs = 0, totalStorageUsedBytes = 0,
       storageProviders = 0, placementGroups = 0, slices = 0, totalBlobEvents = 0;
 
+  // Node info
   try {
     const r = await fetch(`${cfg.nodeUrl}/`, { signal: AbortSignal.timeout(4000) });
     if (r.ok) { const d: any = await r.json(); blockHeight = Number(d.block_height ?? 0); }
   } catch {}
 
+  // Get blob table handle
+  let tableHandle = (cfg as any).blobTableHandle as string;
+  if (!tableHandle) {
+    tableHandle = await getBlobTableHandle(cfg.nodeUrl, cfg.coreAddress) ?? "";
+  }
+
+  // Blob count + size via GraphQL table items
+  if (tableHandle) {
+    try {
+      const blobStats = await fetchBlobStatsViaTable(cfg.indexerUrl, tableHandle);
+      if (blobStats) {
+        totalBlobs            = blobStats.totalBlobs;
+        totalStorageUsedBytes = blobStats.totalStorageUsedBytes;
+      }
+    } catch {}
+  }
+
+  // Blob events
   try {
-    const bs = await fetchBlobStats(cfg.nodeUrl, cfg.coreAddress);
-    totalBlobs = bs.totalBlobs;
-    totalStorageUsedBytes = bs.totalStorageUsedBytes;
-    totalBlobEvents = bs.totalBlobEvents;
+    totalBlobEvents = await fetchBlobEventCount(cfg.nodeUrl, cfg.coreAddress);
   } catch {}
 
+  // Providers, PGs, Slices
   try {
     const [pgR, spR, slR] = await Promise.allSettled([
       fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5000) }),
@@ -208,17 +244,14 @@ async function geocodeIP(ip: string, zone: string): Promise<GeoResult> {
 
 async function fetchIndexer(url: string): Promise<RawProvider[]> {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: `{ current_storage_providers { address zone state health bls_key capacity net_address } }` }), signal: AbortSignal.timeout(5000) });
-  if (!r.ok) throw new Error(`Indexer ${r.status}`);
-  const j: any = await r.json();
+  if (!r.ok) throw new Error(`Indexer ${r.status}`); const j: any = await r.json();
   const sps = j.data?.current_storage_providers;
-  if (!sps?.length) throw new Error("Empty indexer");
-  return sps;
+  if (!sps?.length) throw new Error("Empty"); return sps;
 }
 
 async function fetchRPC(nodeUrl: string, core: string): Promise<RawProvider[]> {
   const r = await fetch(`${nodeUrl}/accounts/${core}/resource/${core}::storage_provider_registry::StorageProviders`, { signal: AbortSignal.timeout(8000) });
-  if (!r.ok) throw new Error(`RPC ${r.status}`);
-  const j: any = await r.json();
+  if (!r.ok) throw new Error(`RPC ${r.status}`); const j: any = await r.json();
   const zones: any[] = j?.data?.active_providers_by_az?.root?.children?.entries ?? [];
   const out: RawProvider[] = [];
   for (const z of zones) for (const n of (z.value?.value ?? [])) out.push({ address: n.addr, zone: z.key, state: "Active", health: n.status?.condition === 0 ? "Healthy" : "Faulty", bls_key: "", net_address: "", capacity: n.status?.quota?.value });
@@ -240,7 +273,7 @@ async function syncNetwork(network: NetworkId, env: Env, ctx: ExecutionContext):
   const cfg = NETWORKS[network]; const kv = getKV(env, network); const errors: string[] = [];
   let raw: RawProvider[] = [];
   try { raw = await fetchIndexer(cfg.indexerUrl); }
-  catch (e1: any) { try { raw = await fetchRPC(cfg.nodeUrl, cfg.coreAddress); } catch (e2: any) { errors.push(e2.message); return { synced: 0, errors }; } }
+  catch { try { raw = await fetchRPC(cfg.nodeUrl, cfg.coreAddress); } catch (e: any) { errors.push(e.message); return { synced: 0, errors }; } }
   if (!raw.length) return { synced: 0, errors: ["No providers"] };
   const records: NodeRecord[] = []; const addrs: string[] = [];
   for (let i = 0; i < raw.length; i++) {
@@ -296,38 +329,29 @@ async function handleStats(url: URL, env: Env): Promise<Response> {
   let stats: Record<string, number | null> = { totalBlobs: null, totalStorageUsedBytes: null, totalBlobEvents: null, storageProviders: null, placementGroups: null, slices: null };
   let source = "none";
 
-  // Priority 1: On-chain view functions + resources
-  try {
-    const bs = await fetchBlobStats(cfg.nodeUrl, cfg.coreAddress);
-    if (bs.totalBlobs > 0) {
-      stats.totalBlobs            = bs.totalBlobs;
-      stats.totalStorageUsedBytes = bs.totalStorageUsedBytes || null;
-      stats.totalBlobEvents       = bs.totalBlobEvents || null;
-      source = "on-chain-view";
-    }
-  } catch {}
+  // Get blob table handle
+  let tableHandle = (cfg as any).blobTableHandle as string;
+  if (!tableHandle) tableHandle = await getBlobTableHandle(cfg.nodeUrl, cfg.coreAddress) ?? "";
 
-  // Priority 2: R2 snapshot
-  if (!stats.totalBlobs) {
+  // Priority 1: GraphQL table items count
+  if (tableHandle) {
     try {
-      const prefix = `snapshots/${network}/`;
-      const list = await env.SHELBY_R2.list({ prefix, limit: 10 });
-      const keys = list.objects.map(o => o.key).sort((a,b) => b.localeCompare(a));
-      for (const key of keys) {
-        const obj = await env.SHELBY_R2.get(key); if (!obj) continue;
-        const snap: StatsSnapshot = JSON.parse(await obj.text());
-        if (snap.totalBlobs > 10) {
-          stats.totalBlobs = snap.totalBlobs;
-          stats.totalStorageUsedBytes = snap.totalStorageUsedBytes;
-          stats.totalBlobEvents = snap.totalBlobEvents;
-          source = "r2-snapshot";
-          break;
-        }
+      const blobStats = await fetchBlobStatsViaTable(cfg.indexerUrl, tableHandle);
+      if (blobStats && blobStats.totalBlobs > 0) {
+        stats.totalBlobs            = blobStats.totalBlobs;
+        stats.totalStorageUsedBytes = blobStats.totalStorageUsedBytes || null;
+        source = "graphql-table";
       }
     } catch {}
   }
 
-  // On-chain: providers, PGs, slices (luôn fresh)
+  // Blob events
+  try {
+    const evCount = await fetchBlobEventCount(cfg.nodeUrl, cfg.coreAddress);
+    if (evCount > 0) stats.totalBlobEvents = evCount;
+  } catch {}
+
+  // On-chain: providers, PGs, slices
   try {
     const [pgR, spR, slR] = await Promise.allSettled([
       fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::placement_group_registry::PlacementGroups`, { signal: AbortSignal.timeout(5000) }),
@@ -340,58 +364,11 @@ async function handleStats(url: URL, env: Env): Promise<Response> {
     if (source === "none") source = "on-chain";
   } catch {}
 
-  return Response.json({ ok: true, data: { node, stats, network, statsSource: `worker-${source}` }, fetchedAt: new Date().toISOString() }, { headers: { ...CORS, "Cache-Control": "public, max-age=15, stale-while-revalidate=60" } });
-}
-
-// /debug2: Probe all resources of core contract to find blob count fields
-async function handleDebug2(url: URL): Promise<Response> {
-  const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
-  const cfg = NETWORKS[network];
-  const results: Record<string, any> = {};
-
-  // List all resources
-  try {
-    const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resources?limit=200`, { signal: AbortSignal.timeout(10000) });
-    if (r.ok) {
-      const resources: any[] = await r.json();
-      results.resource_types = resources.map(r => r.type);
-      results.resource_count = resources.length;
-
-      // Show data for blob/stats related resources
-      for (const res of resources) {
-        const type: string = res.type ?? "";
-        if (type.includes("blob") || type.includes("Blob") || type.includes("statistic") || type.includes("Statistic") || type.includes("registry") || type.includes("Registry")) {
-          results[type] = res.data;
-        }
-      }
-    }
-  } catch (e: any) { results.resources_error = e.message; }
-
-  // Try view functions
-  const viewFns = [
-    `${cfg.coreAddress}::blob_registry::blob_count`,
-    `${cfg.coreAddress}::blob_registry::total_blobs`,
-    `${cfg.coreAddress}::statistics::get_stats`,
-    `${cfg.coreAddress}::blob_registry::total_size`,
-    `${cfg.coreAddress}::blob_registry::get_total_blobs`,
-  ];
-
-  results.view_results = {};
-  for (const fn of viewFns) {
-    try {
-      const r = await fetch(`${cfg.nodeUrl}/view`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ function: fn, type_arguments: [], arguments: [] }),
-        signal: AbortSignal.timeout(5000),
-      });
-      results.view_results[fn] = r.ok ? await r.json() : `HTTP ${r.status}`;
-    } catch (e: any) {
-      results.view_results[fn] = e.message;
-    }
-  }
-
-  return Response.json({ ok: true, network, coreAddress: cfg.coreAddress, results }, { headers: CORS });
+  return Response.json({
+    ok: true,
+    data: { node, stats, network, statsSource: `worker-${source}` },
+    fetchedAt: new Date().toISOString(),
+  }, { headers: { ...CORS, "Cache-Control": "public, max-age=15, stale-while-revalidate=60" } });
 }
 
 async function handleSync(url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -407,11 +384,10 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "2.4.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "2.5.0", ts: new Date().toISOString() }, { headers: CORS });
     if (url.pathname === "/nodes"     && request.method === "GET")  return handleNodes(url, env);
     if (url.pathname === "/snapshots" && request.method === "GET")  return handleSnapshots(url, env);
     if (url.pathname === "/stats"     && request.method === "GET")  return handleStats(url, env);
-    if (url.pathname === "/debug2"    && request.method === "GET")  return handleDebug2(url);
     if (url.pathname === "/sync"      && request.method === "POST") return handleSync(url, env, ctx);
     return Response.json({ ok: false, error: "Not found" }, { status: 404, headers: CORS });
   },

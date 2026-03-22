@@ -13,13 +13,13 @@ interface Stats {
 
 interface NodeInfo { blockHeight: number; ledgerVersion: number; chainId: number; }
 
-// Hiện full number với dấu phẩy ngăn cách hàng nghìn
+// Hiện đầy đủ số với dấu phẩy ngăn cách hàng nghìn
 function fmt(v: number | null): string {
   if (v == null) return "—";
   return v.toLocaleString("en-US");
 }
 
-// Hiện storage với 2 chữ số thập phân chính xác
+// Hiện bytes với 2 chữ số thập phân
 function fmtBytes(b: number | null): string {
   if (b == null) return "—";
   if (b >= 1e12) return `${(b / 1e12).toFixed(2)} TB`;
@@ -87,29 +87,18 @@ export function MetricsPanel() {
   if (collapsed) {
     return (
       <div className="metrics-panel" style={{ width: 44 }}>
-        <button
-          onClick={() => setCollapsed(false)}
-          className="panel-toggle"
-          title="Show metrics"
-          style={{ width: "100%", height: 36 }}
-        >
-          ◀
-        </button>
+        <button onClick={() => setCollapsed(false)} className="panel-toggle" title="Show metrics" style={{ width: "100%", height: 36 }}>◀</button>
       </div>
     );
   }
 
   return (
     <div className="metrics-panel">
-      {/* Header */}
       <div className="metrics-panel-header">
         <span className="metrics-panel-title">Network</span>
-        <button className="panel-toggle" onClick={() => setCollapsed(true)} title="Collapse">
-          ▶
-        </button>
+        <button className="panel-toggle" onClick={() => setCollapsed(true)} title="Collapse">▶</button>
       </div>
 
-      {/* Live indicator */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
         <div className="live-dot">
           <span className="live-dot-circle" />
@@ -118,7 +107,6 @@ export function MetricsPanel() {
         {lastAt && <span style={{ fontSize: 11, color: "var(--gray-400)", fontFamily: "var(--font-mono)" }}>{lastAt}</span>}
       </div>
 
-      {/* Block height */}
       {node && (
         <div className="block-ticker">
           <span className="block-ticker-label">Block</span>
@@ -127,11 +115,12 @@ export function MetricsPanel() {
       )}
       {!node && loading && <div className="skeleton" style={{ height: 40, marginBottom: 8 }} />}
 
-      {/* 6 metrics */}
       {METRICS.map(m => {
         const rawVal = stats[m.key as keyof Stats];
         const display = loading && rawVal == null ? "…" : m.fmt(rawVal as any);
         const isPulsing = pulses[m.key];
+        // Smaller font for large numbers
+        const isLarge = typeof rawVal === "number" && rawVal >= 100_000;
         return (
           <div key={m.key} className="metric-item">
             <div className="metric-item-label">{m.label}</div>
@@ -140,8 +129,8 @@ export function MetricsPanel() {
               style={{
                 transition: "color 0.3s",
                 color: isPulsing ? "var(--net-color)" : undefined,
-                // Smaller font for large numbers to fit panel
-                fontSize: rawVal != null && rawVal > 999999 ? "1.1rem" : undefined,
+                fontSize: isLarge ? "1.05rem" : undefined,
+                letterSpacing: isLarge ? "-0.02em" : undefined,
               }}
             >
               {display}
@@ -150,7 +139,6 @@ export function MetricsPanel() {
         );
       })}
 
-      {/* Chain info footer */}
       {node && (
         <div style={{ padding: "10px 2px 0", borderTop: "1px solid var(--gray-100)", marginTop: 4 }}>
           {[

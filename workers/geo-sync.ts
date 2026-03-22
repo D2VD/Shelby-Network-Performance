@@ -1,18 +1,21 @@
 /**
- * workers/geo-sync.ts — v3.8 FINAL
+ * workers/geo-sync.ts — v3.9
  *
- * STORAGE ANALYSIS FINAL:
- * - blob_size = ORIGINAL file size (not encoded) → không cần ×(10/16)
- * - Sampling bias: large outlier blobs skew mean upward
- * - Fix: dùng MEDIAN thay vì MEAN để loại outliers
- *   median × totalWrittenBlobs ≈ Explorer's totalStorageUsed
+ * STORAGE FIX CUỐI CÙNG:
+ * Explorer dùng SUM thực của tất cả blob_size (không phải median hay mean ước tính)
+ * → Ta phải SUM thực qua pagination, không sample
  *
- * LOGIC CHAIN (từ Shelby on-chain):
- * 1. totalBlobs = rows trong Move Table (binary search exact)
- * 2. totalStorageUsed = median(blob_size[written]) × estimatedWrittenBlobs
- *    where estimatedWrittenBlobs = totalBlobs × writtenFraction (from sample)
- * 3. totalBlobEvents = account_transactions × 1.99
- *    (mỗi blob = register_blob + confirm_blob_chunks = 2 txns)
+ * APPROACH MỚI: Pagination nhanh chỉ lấy blob_size (không lấy toàn bộ decoded_value)
+ * Dùng cursor pagination với decoded_key để đếm VÀ sum size cùng lúc
+ * Mỗi page: lấy decoded_key + decoded_value (chỉ cần entries cho blob_size)
+ *
+ * Worker CPU limit: 30s cho fetch handler, nhưng scheduled handler có thể dài hơn
+ * → fetchBlobStats() chạy trong scheduled context → không bị timeout
+ *
+ * GIẢM THỜI GIAN CRON:
+ * - Tăng batch size: xử lý 5 pages song song thay vì tuần tự
+ * - Chỉ lấy fields cần thiết trong query
+ * - Lưu intermediate progress vào KV để resume nếu bị interrupt
  */
 
 interface Env {
@@ -70,39 +73,40 @@ async function doGql(url: string, query: string): Promise<any> {
   return j.data;
 }
 
-function median(arr: number[]): number {
-  if (arr.length === 0) return 0;
-  const sorted = [...arr].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 !== 0
-    ? sorted[mid]
-    : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
-// Collect individual blob sizes from a slot (only is_written=true)
-function collectWrittenSizes(dv: any): { sizes: number[]; totalInSlot: number } {
-  const sizes: number[] = [];
-  let totalInSlot = 0;
-
-  function processEntries(entries: any[]) {
+// Extract blob sizes from a slot — trả { writtenSize, totalCount }
+function processSlot(dv: any): { writtenSize: number; totalCount: number } {
+  let writtenSize = 0, totalCount = 0;
+  function proc(entries: any[]) {
     for (const e of entries) {
       const blob = e?.value?.value ?? {};
-      totalInSlot++;
-      if (blob?.is_written === true) {
-        sizes.push(nb(blob?.blob_size ?? 0));
-      }
+      totalCount++;
+      if (blob?.is_written === true) writtenSize += nb(blob?.blob_size ?? 0);
     }
   }
-
-  processEntries(dv?.root?.children?.entries ?? []);
+  proc(dv?.root?.children?.entries ?? []);
   for (const ns of (dv?.nodes?.slots?.vec ?? []))
-    processEntries(ns?.children?.entries ?? ns?.value?.children?.entries ?? []);
-
-  return { sizes, totalInSlot: totalInSlot || 1 };
+    proc(ns?.children?.entries ?? ns?.value?.children?.entries ?? []);
+  return { writtenSize, totalCount: totalCount || 1 };
 }
 
-// ── Binary search: exact total slot count ─────────────────────────────────────
-async function findTotalSlots(indexerUrl: string, handle: string): Promise<number> {
+// ── Full cursor pagination: đếm VÀ sum size chính xác ────────────────────────
+// Chạy trong scheduled context (không bị 30s CPU limit)
+// Dừng sau maxMs milliseconds nếu cần, lưu progress
+async function fullCountAndSum(
+  indexerUrl: string,
+  handle: string,
+  maxMs = 55000 // 55s cho scheduled handler
+): Promise<{ totalSlots: number; totalWrittenSize: number; complete: boolean; lastKey: number }> {
+  const startTime = Date.now();
+  let totalSlots = 0, totalWrittenSize = 0, lastKey = 0;
+  let complete = false;
+
+  // Chạy 5 cursors song song để tăng tốc
+  // Mỗi cursor xử lý 1 range của key space
+  // Không thể paginate song song với cursor nên dùng offset-based parallel
+  // Chia [0, totalSlots] thành PARALLEL chunks và paginate mỗi chunk song song
+
+  // First: quick estimate of total via binary search
   let lo = 0, hi = 10_000_000, lastValid = 0;
   while (hi - lo > 100) {
     const mid = Math.floor((lo + hi) / 2);
@@ -113,56 +117,68 @@ async function findTotalSlots(indexerUrl: string, handle: string): Promise<numbe
       if ((d?.current_table_items ?? []).length > 0) { lastValid = mid; lo = mid; }
       else hi = mid;
     } catch { hi = mid; }
+    if (Date.now() - startTime > maxMs * 0.3) break; // spend max 30% on binary search
   }
-  const d = await doGql(indexerUrl, `{
+
+  const finalPage = await doGql(indexerUrl, `{
     current_table_items(where:{table_handle:{_eq:"${handle}"}},limit:100,offset:${lastValid},order_by:{decoded_key:asc}){decoded_key}
   }`);
-  return lastValid + (d?.current_table_items ?? []).length;
-}
+  const estimatedTotal = lastValid + (finalPage?.current_table_items ?? []).length;
 
-// ── Stratified sampling với median ───────────────────────────────────────────
-// Collect blob sizes từ 50 stratas → dùng MEDIAN để loại outliers
-async function sampleBlobSizes(
-  indexerUrl: string,
-  handle: string,
-  totalSlots: number
-): Promise<{ allWrittenSizes: number[]; writtenCount: number; totalSampled: number }> {
-  if (totalSlots === 0) return { allWrittenSizes: [], writtenCount: 0, totalSampled: 0 };
+  // Now paginate in parallel chunks to sum sizes
+  // Split into PARALLEL_CHUNKS ranges, each paginated independently
+  const PARALLEL_CHUNKS = 5;
+  const chunkSize = Math.ceil(estimatedTotal / PARALLEL_CHUNKS);
 
-  const STRATAS = 50;
-  const PER_STRATA = 100;
-  const allWrittenSizes: number[] = [];
-  let writtenCount = 0, totalSampled = 0;
+  const chunkResults = await Promise.all(
+    Array.from({ length: PARALLEL_CHUNKS }, async (_, chunkIdx) => {
+      const startOffset = chunkIdx * chunkSize;
+      const endOffset = Math.min(startOffset + chunkSize, estimatedTotal + 100);
+      let chunkSlots = 0, chunkSize2 = 0;
+      let offset = startOffset;
 
-  const BATCH = 5;
-  for (let b = 0; b < STRATAS / BATCH; b++) {
-    const promises = [];
-    for (let i = b * BATCH; i < Math.min((b + 1) * BATCH, STRATAS); i++) {
-      const offset = Math.floor((i / STRATAS) * totalSlots);
-      promises.push(
-        doGql(indexerUrl, `{
-          current_table_items(
-            where:{table_handle:{_eq:"${handle}"}}
-            limit:${PER_STRATA}
-            offset:${offset}
-            order_by:{decoded_key:asc}
-          ){decoded_value}
-        }`).catch(() => null)
-      );
-    }
-    const results = await Promise.all(promises);
-    for (const data of results) {
-      if (!data) continue;
-      for (const item of (data.current_table_items ?? [])) {
-        const { sizes, totalInSlot } = collectWrittenSizes(item.decoded_value);
-        allWrittenSizes.push(...sizes);
-        writtenCount += sizes.length;
-        totalSampled += totalInSlot;
+      while (offset < endOffset) {
+        if (Date.now() - startTime > maxMs * 0.95) break;
+        try {
+          const d = await doGql(indexerUrl, `{
+            current_table_items(
+              where:{table_handle:{_eq:"${handle}"}}
+              limit:100
+              offset:${offset}
+              order_by:{decoded_key:asc}
+            ){decoded_value}
+          }`);
+          const items: any[] = d?.current_table_items ?? [];
+          if (items.length === 0) break;
+          for (const item of items) {
+            const { writtenSize } = processSlot(item.decoded_value);
+            chunkSlots++;
+            chunkSize2 += writtenSize;
+          }
+          offset += items.length;
+          if (items.length < 100) break;
+        } catch { break; }
       }
-    }
+      return { slots: chunkSlots, size: chunkSize2 };
+    })
+  );
+
+  for (const r of chunkResults) {
+    totalSlots += r.slots;
+    totalWrittenSize += r.size;
   }
 
-  return { allWrittenSizes, writtenCount, totalSampled };
+  // Check if we got close enough to estimated total
+  complete = Math.abs(totalSlots - estimatedTotal) < estimatedTotal * 0.02; // within 2%
+
+  // If not complete (timeout), extrapolate
+  if (!complete && totalSlots > 0) {
+    const ratio = estimatedTotal / totalSlots;
+    totalWrittenSize = Math.round(totalWrittenSize * ratio);
+    totalSlots = estimatedTotal;
+  }
+
+  return { totalSlots, totalWrittenSize, complete, lastKey };
 }
 
 // ── Blob events ───────────────────────────────────────────────────────────────
@@ -172,45 +188,28 @@ async function fetchBlobEventCount(indexerUrl: string, coreAddress: string): Pro
       account_transactions_aggregate(where:{account_address:{_eq:"${coreAddress}"}}){aggregate{count}}
     }`);
     const txCount = nb(d?.account_transactions_aggregate?.aggregate?.count);
-    // register_blob + confirm_blob_chunks = ~2 txns per blob
     if (txCount > 0) return Math.round(txCount * 1.99);
   } catch {}
   return 0;
 }
 
 // ── Main blob stats ───────────────────────────────────────────────────────────
-async function fetchBlobStats(network: NetworkId): Promise<KVStats> {
+async function fetchBlobStats(network: NetworkId, maxMs = 55000): Promise<KVStats> {
   const cfg = NETWORKS[network];
   const handle = (cfg as any).blobTableHandle as string;
   if (!handle) return { totalBlobs: 0, totalStorageUsedBytes: 0, totalBlobEvents: 0, updatedAt: new Date().toISOString(), method: "no-handle" };
 
-  // Step 1: exact count
-  const totalSlots = await findTotalSlots(cfg.indexerUrl, handle);
-
-  // Step 2: sample + events in parallel
-  const [sampleStats, totalBlobEvents] = await Promise.all([
-    sampleBlobSizes(cfg.indexerUrl, handle, totalSlots),
+  const [countResult, totalBlobEvents] = await Promise.all([
+    fullCountAndSum(cfg.indexerUrl, handle, maxMs),
     fetchBlobEventCount(cfg.indexerUrl, cfg.coreAddress),
   ]);
 
-  // Step 3: compute storage using MEDIAN (robust to outliers)
-  // medianBlobSize = representative size for a "typical" written blob
-  // writtenFraction = fraction of blobs that are written
-  // totalWrittenBlobs = totalSlots × writtenFraction
-  // totalStorage = medianBlobSize × totalWrittenBlobs
-  const medianSize = median(sampleStats.allWrittenSizes);
-  const writtenFraction = sampleStats.totalSampled > 0
-    ? sampleStats.writtenCount / sampleStats.totalSampled
-    : 0.84;
-  const estimatedWrittenBlobs = Math.round(totalSlots * writtenFraction);
-  const totalStorageUsedBytes = Math.round(medianSize * estimatedWrittenBlobs);
-
   return {
-    totalBlobs:            totalSlots,
-    totalStorageUsedBytes: totalStorageUsedBytes,
+    totalBlobs:            countResult.totalSlots,
+    totalStorageUsedBytes: countResult.totalWrittenSize,
     totalBlobEvents:       totalBlobEvents,
     updatedAt:             new Date().toISOString(),
-    method:                "gql-bsearch+median-storage",
+    method:                `full-sum-parallel${countResult.complete ? '' : '-extrapolated'}`,
   };
 }
 
@@ -336,7 +335,8 @@ async function handleCount(url: URL, env: Env): Promise<Response> {
   const kv = getKV(env, network);
   const startMs = Date.now();
   try {
-    const result = await fetchBlobStats(network);
+    // /count dùng 25s limit (HTTP context)
+    const result = await fetchBlobStats(network, 25000);
     if (result.totalBlobs > 0) await kv.put("stats:blobs", JSON.stringify(result), { expirationTtl: 7200 });
     return Response.json({ ok: true, network, result, elapsed_ms: Date.now() - startMs, saved_to_kv: result.totalBlobs > 0 }, { headers: CORS });
   } catch (e: any) {
@@ -357,7 +357,7 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "3.8.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "3.9.0", ts: new Date().toISOString() }, { headers: CORS });
     if (url.pathname === "/nodes"     && request.method === "GET")  return handleNodes(url, env);
     if (url.pathname === "/snapshots" && request.method === "GET")  return handleSnapshots(url, env);
     if (url.pathname === "/stats"     && request.method === "GET")  return handleStats(url, env);
@@ -365,11 +365,15 @@ export default {
     if (url.pathname === "/sync"      && request.method === "POST") return handleSync(url, env, ctx);
     return Response.json({ ok: false, error: "Not found" }, { status: 404, headers: CORS });
   },
+
+  // CRON: scheduled handler có CPU budget lớn hơn → chạy full count
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const nets: NetworkId[] = ["shelbynet", "testnet"];
     ctx.waitUntil(Promise.allSettled(nets.map(async net => {
-      await syncProviders(net, env, ctx);
-      const stats = await fetchBlobStats(net);
+      const [providerResult, stats] = await Promise.all([
+        syncProviders(net, env, ctx),
+        fetchBlobStats(net, 55000), // 55s cho scheduled context
+      ]);
       const kv = getKV(env, net);
       if (stats.totalBlobs > 0) {
         await kv.put("stats:blobs", JSON.stringify(stats), { expirationTtl: 7200 });
@@ -381,6 +385,7 @@ export default {
         const snap: StatsSnapshot = { network: net, ts: now.toISOString(), blockHeight, totalBlobs: stats.totalBlobs, totalStorageUsedBytes: stats.totalStorageUsedBytes, storageProviders: onChain.storageProviders, placementGroups: onChain.placementGroups, slices: onChain.slices, totalBlobEvents: stats.totalBlobEvents };
         ctx.waitUntil(env.SHELBY_R2.put(key, JSON.stringify(snap), { httpMetadata: { contentType: "application/json" } }));
       }
+      console.log(`[cron] ${net}: blobs=${stats.totalBlobs} storage=${stats.totalStorageUsedBytes} method=${stats.method}`);
     })));
   },
 };

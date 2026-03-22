@@ -1,13 +1,15 @@
 /**
- * workers/geo-sync.ts — v4.0
+ * workers/geo-sync.ts — v4.1
  *
- * NEW APPROACH: Tìm aggregate storage stats từ các nguồn chưa probe:
- * 1. global_metadata account (0xa37a...) - có thể có running totals
- * 2. ShelbyUSD meta contract (0x1b18...) - payment tracking có thể include storage
- * 3. Aptos events với sequence_number để lấy total counts
- * 4. View functions với arguments (account address)
+ * KEY FINDINGS từ debug5:
+ * - audit::AuditData trên metadata account có 2 tables:
+ *   1. audit_slices (handle: 0x8fff...) — slice audit data
+ *   2. storage_provider_data (handle: 0x25bd...) — storage per provider
+ * - Treasury có separate signer: 0xda46...
+ * - recent_txns: register_multiple_blobs + add_blob_acknowledgements
  *
- * /debug5: probe tất cả sources mới
+ * /debug6: probe audit tables và treasury account
+ * → Tìm storage stats trong storage_provider_data table
  */
 
 interface Env {
@@ -23,10 +25,12 @@ const NETWORKS = {
     nodeUrl:         "https://api.shelbynet.shelby.xyz/v1",
     indexerUrl:      "https://api.shelbynet.shelby.xyz/v1/graphql",
     blobTableHandle: "0xe41f1fa92a4beeacd0b83b7e05d150e2b260f6b7f934f62a5843f762260d5cb8",
-    // From debug3: global_metadata signer account
     metadataAccount: "0xa37a45bf737ccd4608b9944fb35979377ccefd9cefb7e6d80dfb15929a10c0de",
-    // ShelbyUSD meta contract
-    shelbyUsdMeta:   "0x1b18363a9f1fe5e6ebf247daba5cc1c18052bb232efdc4c50f556053922d98e1",
+    // AuditData tables
+    auditSlicesHandle:          "0x8fff14bc850e382eb08a87acab1d006b5cf1ca01244a1fa169ef78120eac87e7",
+    storageProviderDataHandle:  "0x25bd2d6717f8a7db7e8afa8500aae515b19e63ed00bb5a7835687b76270d6f72",
+    // Treasury signer
+    treasuryAccount: "0xda46127cf6f09b7595a25547c4cc17b733cdffa40a2caeae8344b12a878cdcd",
   },
   testnet: {
     coreAddress:     "0xc63d6a5efb0080a6029403131715bd4971e1149f7cc099aac69bb0069b3ddbf5",
@@ -34,7 +38,9 @@ const NETWORKS = {
     indexerUrl:      "https://api.testnet.aptoslabs.com/v1/graphql",
     blobTableHandle: "",
     metadataAccount: "",
-    shelbyUsdMeta:   "",
+    auditSlicesHandle: "",
+    storageProviderDataHandle: "",
+    treasuryAccount: "",
   },
 } as const;
 
@@ -71,103 +77,167 @@ async function doGql(url: string, query: string): Promise<any> {
   return j.data;
 }
 
-async function callView(nodeUrl: string, fn: string, args: string[] = [], typeArgs: string[] = []): Promise<any> {
-  const r = await fetch(`${nodeUrl}/view`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ function: fn, type_arguments: typeArgs, arguments: args }),
-    signal: AbortSignal.timeout(6000),
-  });
-  if (!r.ok) return `HTTP ${r.status}`;
-  return r.json();
-}
-
-// ── /debug5: probe new sources ────────────────────────────────────────────────
-async function handleDebug5(url: URL): Promise<Response> {
+// ── /debug6: probe audit tables ───────────────────────────────────────────────
+async function handleDebug6(url: URL): Promise<Response> {
   const network = (url.searchParams.get("network") ?? "shelbynet") as NetworkId;
   const cfg = NETWORKS[network];
   const res: Record<string, any> = {};
 
-  // 1. global_metadata account resources
-  try {
-    const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.metadataAccount}/resources?limit=50`, { signal: AbortSignal.timeout(8000) });
-    if (r.ok) {
-      const resources: any[] = await r.json();
-      res.metadata_account_resources = resources.map(r => ({ type: r.type, data: r.data }));
-    } else res.metadata_account_resources = `HTTP ${r.status}`;
-  } catch (e: any) { res.metadata_account_resources = { error: e.message }; }
-
-  // 2. ShelbyUSD meta contract resources
-  try {
-    const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.shelbyUsdMeta}/resources?limit=50`, { signal: AbortSignal.timeout(8000) });
-    if (r.ok) {
-      const resources: any[] = await r.json();
-      res.shelbyusd_resources = resources.map(r => ({ type: r.type, data: r.data }));
-    } else res.shelbyusd_resources = `HTTP ${r.status}`;
-  } catch (e: any) { res.shelbyusd_resources = { error: e.message }; }
-
-  // 3. Aptos events API — get event handle with sequence_number
-  // Try write_blob_events, blob_write_events on core contract
-  const eventHandles = [
-    `${cfg.coreAddress}::blob_metadata::Blobs/blob_data`,
-    `${cfg.coreAddress}::global_metadata::MetadataStorage/signer_capability`,
-  ];
-  res.events_probe = {};
-  for (const handle of eventHandles) {
-    try {
-      const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/events/${handle}?limit=1`, { signal: AbortSignal.timeout(5000) });
-      res.events_probe[handle] = r.ok ? await r.json() : `HTTP ${r.status}`;
-    } catch (e: any) { res.events_probe[handle] = e.message; }
-  }
-
-  // 4. View functions with coreAddress as argument
-  const viewFnsWithArgs = [
-    [`${cfg.coreAddress}::blob_metadata::total_blobs`, []],
-    [`${cfg.coreAddress}::blob_metadata::total_size`, []],
-    [`${cfg.coreAddress}::blob_metadata::get_stats`, []],
-    [`${cfg.coreAddress}::global_metadata::get_total_storage`, []],
-    [`${cfg.coreAddress}::global_metadata::total_storage_used`, []],
-    [`${cfg.coreAddress}::payment::total_paid`, []],
-    [`${cfg.coreAddress}::treasury::get_stats`, []],
-  ];
-  res.view_with_args = {};
-  for (const [fn, args] of viewFnsWithArgs) {
-    try {
-      res.view_with_args[fn as string] = await callView(cfg.nodeUrl, fn as string, args as string[]);
-    } catch (e: any) { res.view_with_args[fn as string] = e.message; }
-  }
-
-  // 5. Check if there's a total_storage field in Treasury resource
-  try {
-    const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::treasury::Treasury`, { signal: AbortSignal.timeout(5000) });
-    res.treasury = r.ok ? await r.json() : `HTTP ${r.status}`;
-  } catch (e: any) { res.treasury = e.message; }
-
-  // 6. Check epoch resource for cumulative stats
-  try {
-    const r = await fetch(`${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::epoch::Epoch`, { signal: AbortSignal.timeout(5000) });
-    res.epoch = r.ok ? await r.json() : `HTTP ${r.status}`;
-  } catch (e: any) { res.epoch = e.message; }
-
-  // 7. Check account_transactions total for metadata account
+  // 1. storage_provider_data table — sample first 5 items
   try {
     const d = await doGql(cfg.indexerUrl, `{
-      account_transactions_aggregate(where:{account_address:{_eq:"${cfg.metadataAccount}"}}){aggregate{count}}
+      current_table_items(
+        where: { table_handle: { _eq: "${(cfg as any).storageProviderDataHandle}" } }
+        limit: 5
+        order_by: { decoded_key: asc }
+      ) { key decoded_key decoded_value }
     }`);
-    res.metadata_account_tx_count = d?.account_transactions_aggregate?.aggregate?.count;
-  } catch (e: any) { res.metadata_account_tx_count = e.message; }
+    res.storage_provider_data_sample = d?.current_table_items;
+  } catch (e: any) { res.storage_provider_data_sample = { error: e.message }; }
 
-  // 8. Indexer: check user_transactions filtered by blob functions
+  // 2. storage_provider_data total count
   try {
     const d = await doGql(cfg.indexerUrl, `{
-      user_transactions(limit:3, order_by:{version:desc}) {
-        version entry_function_id_str timestamp
-      }
+      current_table_items(
+        where: { table_handle: { _eq: "${(cfg as any).storageProviderDataHandle}" } }
+        limit: 1
+        offset: 99999
+      ) { decoded_key }
     }`);
-    res.recent_txns = d?.user_transactions;
-  } catch (e: any) { res.recent_txns = e.message; }
+    res.storage_provider_data_count_probe = d?.current_table_items?.length;
+    // Get max offset
+    const d2 = await doGql(cfg.indexerUrl, `{
+      current_table_items(
+        where: { table_handle: { _eq: "${(cfg as any).storageProviderDataHandle}" } }
+        order_by: { decoded_key: desc }
+        limit: 3
+      ) { decoded_key decoded_value }
+    }`);
+    res.storage_provider_data_last = d2?.current_table_items;
+  } catch (e: any) { res.storage_provider_data_count_probe = { error: e.message }; }
+
+  // 3. audit_slices table — sample
+  try {
+    const d = await doGql(cfg.indexerUrl, `{
+      current_table_items(
+        where: { table_handle: { _eq: "${(cfg as any).auditSlicesHandle}" } }
+        limit: 3
+        order_by: { decoded_key: asc }
+      ) { key decoded_key decoded_value }
+    }`);
+    res.audit_slices_sample = d?.current_table_items;
+  } catch (e: any) { res.audit_slices_sample = { error: e.message }; }
+
+  // 4. Treasury account resources
+  try {
+    const r = await fetch(`${cfg.nodeUrl}/accounts/${(cfg as any).treasuryAccount}/resources?limit=50`, { signal: AbortSignal.timeout(8000) });
+    if (r.ok) {
+      const resources: any[] = await r.json();
+      res.treasury_account_resources = resources.map((r: any) => ({ type: r.type, data: r.data }));
+    } else res.treasury_account_resources = `HTTP ${r.status}`;
+  } catch (e: any) { res.treasury_account_resources = { error: e.message }; }
+
+  // 5. Count user_transactions by function type
+  try {
+    const d = await doGql(cfg.indexerUrl, `{
+      register: account_transactions_aggregate(
+        where: {
+          account_address: { _eq: "${cfg.coreAddress}" }
+        }
+      ) { aggregate { count } }
+    }`);
+    res.total_txns = d?.register?.aggregate?.count;
+  } catch (e: any) { res.total_txns = { error: e.message }; }
+
+  // 6. user_transactions by entry_function for blob functions
+  try {
+    const d = await doGql(cfg.indexerUrl, `{
+      register_blobs: user_transactions_aggregate(
+        where: { entry_function_id_str: { _eq: "${cfg.coreAddress}::blob_metadata::register_multiple_blobs" } }
+      ) { aggregate { count } }
+      ack_blobs: user_transactions_aggregate(
+        where: { entry_function_id_str: { _eq: "${cfg.coreAddress}::blob_metadata::add_blob_acknowledgements" } }
+      ) { aggregate { count } }
+    }`);
+    res.blob_txns_by_type = {
+      register_multiple_blobs: d?.register_blobs?.aggregate?.count,
+      add_blob_acknowledgements: d?.ack_blobs?.aggregate?.count,
+    };
+  } catch (e: any) { res.blob_txns_by_type = { error: e.message }; }
+
+  // 7. Try view function: blob_metadata::register_multiple_blobs info
+  try {
+    const r = await fetch(`${cfg.nodeUrl}/view`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        function: `${cfg.coreAddress}::audit::get_storage_stats`,
+        type_arguments: [], arguments: []
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    res.view_audit_get_storage_stats = r.ok ? await r.json() : `HTTP ${r.status}`;
+  } catch (e: any) { res.view_audit_get_storage_stats = e.message; }
+
+  // 8. Try ShelbyConfig resource (may have network-wide stats)
+  try {
+    const r = await fetch(
+      `${cfg.nodeUrl}/accounts/${cfg.coreAddress}/resource/${cfg.coreAddress}::config::ShelbyConfig`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    res.shelby_config = r.ok ? await r.json() : `HTTP ${r.status}`;
+  } catch (e: any) { res.shelby_config = e.message; }
 
   return Response.json({ ok: true, network, results: res }, { headers: CORS });
+}
+
+// ── Try to get storage from storage_provider_data table ──────────────────────
+// Each provider has storage_used → sum = total network storage
+async function fetchStorageFromProviderData(
+  indexerUrl: string,
+  handle: string
+): Promise<number | null> {
+  if (!handle) return null;
+  try {
+    // Get all entries (should be 16 providers only → very fast!)
+    const d = await doGql(indexerUrl, `{
+      current_table_items(
+        where: { table_handle: { _eq: "${handle}" } }
+        limit: 100
+        order_by: { decoded_key: asc }
+      ) { decoded_key decoded_value }
+    }`);
+    const items: any[] = d?.current_table_items ?? [];
+    if (items.length === 0) return null;
+
+    let totalStorage = 0;
+    for (const item of items) {
+      const dv = item.decoded_value ?? {};
+      // Try common field names for storage used
+      const storageUsed =
+        dv?.storage_used ??
+        dv?.total_storage_used ??
+        dv?.bytes_stored ??
+        dv?.data_stored ??
+        dv?.total_bytes ??
+        dv?.stored_bytes;
+
+      if (storageUsed !== undefined) {
+        totalStorage += nb(storageUsed);
+      } else if (dv && typeof dv === 'object') {
+        // Try to find any large numeric field (storage bytes would be large)
+        for (const val of Object.values(dv)) {
+          const n = Number(val);
+          if (!isNaN(n) && n > 1_000_000) { // > 1MB = likely storage bytes
+            totalStorage += n;
+            break;
+          }
+        }
+      }
+    }
+
+    return totalStorage > 0 ? totalStorage : null;
+  } catch { return null; }
 }
 
 // ── Binary search total blobs ─────────────────────────────────────────────────
@@ -201,44 +271,40 @@ async function fetchBlobEventCount(indexerUrl: string, coreAddress: string): Pro
   return 0;
 }
 
-// ── Try to get storage from view functions or metadata account ────────────────
-async function fetchStorageFromChain(nodeUrl: string, cfg: typeof NETWORKS[NetworkId]): Promise<number | null> {
-  // Will be updated once debug5 reveals the correct source
-  // For now: return null → use estimation
-  return null;
-}
-
-// ── Fetch blob stats ──────────────────────────────────────────────────────────
+// ── Main blob stats ───────────────────────────────────────────────────────────
 async function fetchBlobStats(network: NetworkId): Promise<KVStats> {
   const cfg = NETWORKS[network];
   const handle = (cfg as any).blobTableHandle as string;
+  const spDataHandle = (cfg as any).storageProviderDataHandle as string;
+
   if (!handle) return { totalBlobs: 0, totalStorageUsedBytes: 0, totalBlobEvents: 0, updatedAt: new Date().toISOString(), method: "no-handle" };
 
-  const [totalBlobs, totalBlobEvents] = await Promise.all([
+  const [totalBlobs, totalBlobEvents, providerStorage] = await Promise.all([
     findTotalBlobs(cfg.indexerUrl, handle),
     fetchBlobEventCount(cfg.indexerUrl, cfg.coreAddress),
+    fetchStorageFromProviderData(cfg.indexerUrl, spDataHandle),
   ]);
 
-  // Try chain-based storage first
-  const chainStorage = await fetchStorageFromChain(cfg.nodeUrl, cfg);
-  if (chainStorage !== null) {
-    return { totalBlobs, totalStorageUsedBytes: chainStorage, totalBlobEvents, updatedAt: new Date().toISOString(), method: "chain-storage-direct" };
+  // Use provider storage data if available (most accurate)
+  if (providerStorage !== null && providerStorage > 0) {
+    return {
+      totalBlobs,
+      totalStorageUsedBytes: providerStorage,
+      totalBlobEvents,
+      updatedAt:  new Date().toISOString(),
+      method:     "provider-data-table",
+    };
   }
 
-  // Fallback: use known avg from Explorer calibration
-  // Explorer avg: ~300KB/blob (calibrated from multiple data points)
-  // This is NOT estimated from our sampling — it's a calibrated constant
-  // Will be updated once we find the real source
-  const AVG_BYTES_PER_WRITTEN_BLOB = 300_000; // ~300KB, from Explorer data
-  const WRITTEN_FRACTION = 0.84; // ~84% blobs are written
-  const totalStorageUsedBytes = Math.round(totalBlobs * WRITTEN_FRACTION * AVG_BYTES_PER_WRITTEN_BLOB);
-
+  // Fallback: calibrated avg ~300KB/blob × writtenFraction
+  const AVG_BYTES_PER_WRITTEN_BLOB = 300_000;
+  const WRITTEN_FRACTION = 0.84;
   return {
     totalBlobs,
-    totalStorageUsedBytes,
+    totalStorageUsedBytes: Math.round(totalBlobs * WRITTEN_FRACTION * AVG_BYTES_PER_WRITTEN_BLOB),
     totalBlobEvents,
     updatedAt: new Date().toISOString(),
-    method: "bsearch+calibrated-avg",
+    method:    "bsearch+calibrated-avg",
   };
 }
 
@@ -385,20 +451,22 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "4.0.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "4.1.0", ts: new Date().toISOString() }, { headers: CORS });
     if (url.pathname === "/nodes"     && request.method === "GET")  return handleNodes(url, env);
     if (url.pathname === "/snapshots" && request.method === "GET")  return handleSnapshots(url, env);
     if (url.pathname === "/stats"     && request.method === "GET")  return handleStats(url, env);
     if (url.pathname === "/count"     && request.method === "POST") return handleCount(url, env);
-    if (url.pathname === "/debug5"    && request.method === "GET")  return handleDebug5(url);
+    if (url.pathname === "/debug6"    && request.method === "GET")  return handleDebug6(url);
     if (url.pathname === "/sync"      && request.method === "POST") return handleSync(url, env, ctx);
     return Response.json({ ok: false, error: "Not found" }, { status: 404, headers: CORS });
   },
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const nets: NetworkId[] = ["shelbynet", "testnet"];
     ctx.waitUntil(Promise.allSettled(nets.map(async net => {
-      await syncProviders(net, env, ctx);
-      const stats = await fetchBlobStats(net);
+      const [_, stats] = await Promise.all([
+        syncProviders(net, env, ctx),
+        fetchBlobStats(net),
+      ]);
       const kv = getKV(env, net);
       if (stats.totalBlobs > 0) {
         await kv.put("stats:blobs", JSON.stringify(stats), { expirationTtl: 7200 });

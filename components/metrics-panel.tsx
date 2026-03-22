@@ -13,13 +13,11 @@ interface Stats {
 
 interface NodeInfo { blockHeight: number; ledgerVersion: number; chainId: number; }
 
-// Hiện đầy đủ số với dấu phẩy ngăn cách hàng nghìn
 function fmt(v: number | null): string {
   if (v == null) return "—";
   return v.toLocaleString("en-US");
 }
 
-// Hiện bytes với 2 chữ số thập phân
 function fmtBytes(b: number | null): string {
   if (b == null) return "—";
   if (b >= 1e12) return `${(b / 1e12).toFixed(2)} TB`;
@@ -119,7 +117,6 @@ export function MetricsPanel() {
         const rawVal = stats[m.key as keyof Stats];
         const display = loading && rawVal == null ? "…" : m.fmt(rawVal as any);
         const isPulsing = pulses[m.key];
-        // Smaller font for large numbers
         const isLarge = typeof rawVal === "number" && rawVal >= 100_000;
         return (
           <div key={m.key} className="metric-item">

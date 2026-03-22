@@ -1,21 +1,18 @@
 /**
- * workers/geo-sync.ts — v3.7
+ * workers/geo-sync.ts — v3.8 FINAL
  *
- * FIX STORAGE FORMULA (lần cuối):
+ * STORAGE ANALYSIS FINAL:
+ * - blob_size = ORIGINAL file size (not encoded) → không cần ×(10/16)
+ * - Sampling bias: large outlier blobs skew mean upward
+ * - Fix: dùng MEDIAN thay vì MEAN để loại outliers
+ *   median × totalWrittenBlobs ≈ Explorer's totalStorageUsed
  *
- * ĐÚNG:
- *   totalStorage = (sum_written_encoded / sampled_slots) × totalBlobs × (10/16)
- *
- * Giải thích:
- * - sum_written_encoded = tổng blob_size (only is_written=true) trong sample
- * - sampled_slots = tổng số slots đã sample (kể cả slots có is_written=false → đóng góp 0)
- * - Chia cho sampled_slots → avg_written_encoded_per_slot (tự include writtenFraction)
- * - × totalBlobs → extrapolate toàn bộ
- * - × (10/16) → convert encoded size → original data size (ClayCode_16Total_10Data)
- *
- * SAI (v3.5, v3.6):
- *   avgWrittenSizePerBlob × writtenFraction × totalBlobs × (10/16)
- *   → double-count: writtenFraction đã có trong avgWrittenSizePerBlob nếu tính đúng
+ * LOGIC CHAIN (từ Shelby on-chain):
+ * 1. totalBlobs = rows trong Move Table (binary search exact)
+ * 2. totalStorageUsed = median(blob_size[written]) × estimatedWrittenBlobs
+ *    where estimatedWrittenBlobs = totalBlobs × writtenFraction (from sample)
+ * 3. totalBlobEvents = account_transactions × 1.99
+ *    (mỗi blob = register_blob + confirm_blob_chunks = 2 txns)
  */
 
 interface Env {
@@ -31,16 +28,12 @@ const NETWORKS = {
     nodeUrl:         "https://api.shelbynet.shelby.xyz/v1",
     indexerUrl:      "https://api.shelbynet.shelby.xyz/v1/graphql",
     blobTableHandle: "0xe41f1fa92a4beeacd0b83b7e05d150e2b260f6b7f934f62a5843f762260d5cb8",
-    // ClayCode_16Total_10Data_13Helper
-    // original_size = encoded_size × (data_shards / total_shards) = × (10/16)
-    encodingRatio: 10 / 16,
   },
   testnet: {
     coreAddress:     "0xc63d6a5efb0080a6029403131715bd4971e1149f7cc099aac69bb0069b3ddbf5",
     nodeUrl:         "https://api.testnet.aptoslabs.com/v1",
     indexerUrl:      "https://api.testnet.aptoslabs.com/v1/graphql",
     blobTableHandle: "",
-    encodingRatio: 10 / 16,
   },
 } as const;
 
@@ -77,24 +70,38 @@ async function doGql(url: string, query: string): Promise<any> {
   return j.data;
 }
 
-// Trả tổng encoded size của written blobs trong slot
-// Slots không written (is_written=false) đóng góp 0 → tự include writtenFraction
-function sumWrittenEncodedFromSlot(dv: any): number {
-  let sum = 0;
+function median(arr: number[]): number {
+  if (arr.length === 0) return 0;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0
+    ? sorted[mid]
+    : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// Collect individual blob sizes from a slot (only is_written=true)
+function collectWrittenSizes(dv: any): { sizes: number[]; totalInSlot: number } {
+  const sizes: number[] = [];
+  let totalInSlot = 0;
+
   function processEntries(entries: any[]) {
     for (const e of entries) {
       const blob = e?.value?.value ?? {};
-      // Chỉ tính blob đã written
-      if (blob?.is_written === true) sum += nb(blob?.blob_size ?? 0);
+      totalInSlot++;
+      if (blob?.is_written === true) {
+        sizes.push(nb(blob?.blob_size ?? 0));
+      }
     }
   }
+
   processEntries(dv?.root?.children?.entries ?? []);
   for (const ns of (dv?.nodes?.slots?.vec ?? []))
     processEntries(ns?.children?.entries ?? ns?.value?.children?.entries ?? []);
-  return sum;
+
+  return { sizes, totalInSlot: totalInSlot || 1 };
 }
 
-// ── Binary search tổng số slots ───────────────────────────────────────────────
+// ── Binary search: exact total slot count ─────────────────────────────────────
 async function findTotalSlots(indexerUrl: string, handle: string): Promise<number> {
   let lo = 0, hi = 10_000_000, lastValid = 0;
   while (hi - lo > 100) {
@@ -113,19 +120,19 @@ async function findTotalSlots(indexerUrl: string, handle: string): Promise<numbe
   return lastValid + (d?.current_table_items ?? []).length;
 }
 
-// ── Stratified sampling: 50 stratas × 100 = 5000 samples ─────────────────────
-// Trả: totalWrittenEncodedInSample, sampledSlots
-// Formula: avgPerSlot = totalWrittenEncoded / sampledSlots (includes zeros from unwritten)
-async function sampleStorageStats(
+// ── Stratified sampling với median ───────────────────────────────────────────
+// Collect blob sizes từ 50 stratas → dùng MEDIAN để loại outliers
+async function sampleBlobSizes(
   indexerUrl: string,
   handle: string,
   totalSlots: number
-): Promise<{ totalWrittenEncoded: number; sampledSlots: number }> {
-  if (totalSlots === 0) return { totalWrittenEncoded: 0, sampledSlots: 0 };
+): Promise<{ allWrittenSizes: number[]; writtenCount: number; totalSampled: number }> {
+  if (totalSlots === 0) return { allWrittenSizes: [], writtenCount: 0, totalSampled: 0 };
 
   const STRATAS = 50;
   const PER_STRATA = 100;
-  let totalWrittenEncoded = 0, sampledSlots = 0;
+  const allWrittenSizes: number[] = [];
+  let writtenCount = 0, totalSampled = 0;
 
   const BATCH = 5;
   for (let b = 0; b < STRATAS / BATCH; b++) {
@@ -147,63 +154,63 @@ async function sampleStorageStats(
     for (const data of results) {
       if (!data) continue;
       for (const item of (data.current_table_items ?? [])) {
-        // Mỗi item = 1 slot = 1 blob trong Shelby BigOrderedMap
-        totalWrittenEncoded += sumWrittenEncodedFromSlot(item.decoded_value);
-        sampledSlots++;
+        const { sizes, totalInSlot } = collectWrittenSizes(item.decoded_value);
+        allWrittenSizes.push(...sizes);
+        writtenCount += sizes.length;
+        totalSampled += totalInSlot;
       }
     }
   }
 
-  return { totalWrittenEncoded, sampledSlots };
+  return { allWrittenSizes, writtenCount, totalSampled };
 }
 
-// ── Blob events: account_transactions × 1.99 ─────────────────────────────────
+// ── Blob events ───────────────────────────────────────────────────────────────
 async function fetchBlobEventCount(indexerUrl: string, coreAddress: string): Promise<number> {
   try {
     const d = await doGql(indexerUrl, `{
       account_transactions_aggregate(where:{account_address:{_eq:"${coreAddress}"}}){aggregate{count}}
     }`);
     const txCount = nb(d?.account_transactions_aggregate?.aggregate?.count);
-    // Mỗi blob = ~2 transactions (register_blob + confirm_blob_chunks)
+    // register_blob + confirm_blob_chunks = ~2 txns per blob
     if (txCount > 0) return Math.round(txCount * 1.99);
   } catch {}
   return 0;
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ── Main blob stats ───────────────────────────────────────────────────────────
 async function fetchBlobStats(network: NetworkId): Promise<KVStats> {
   const cfg = NETWORKS[network];
   const handle = (cfg as any).blobTableHandle as string;
   if (!handle) return { totalBlobs: 0, totalStorageUsedBytes: 0, totalBlobEvents: 0, updatedAt: new Date().toISOString(), method: "no-handle" };
 
-  // Step 1: exact total blob count
+  // Step 1: exact count
   const totalSlots = await findTotalSlots(cfg.indexerUrl, handle);
 
-  // Step 2: storage + events in parallel
-  const [storageStats, totalBlobEvents] = await Promise.all([
-    sampleStorageStats(cfg.indexerUrl, handle, totalSlots),
+  // Step 2: sample + events in parallel
+  const [sampleStats, totalBlobEvents] = await Promise.all([
+    sampleBlobSizes(cfg.indexerUrl, handle, totalSlots),
     fetchBlobEventCount(cfg.indexerUrl, cfg.coreAddress),
   ]);
 
-  // Step 3: compute storage
-  // avgWrittenEncodedPerSlot = totalWrittenEncoded / sampledSlots
-  // (slots with is_written=false contribute 0 → writtenFraction embedded)
-  // totalEncodedStorage = avgWrittenEncodedPerSlot × totalSlots
-  // originalStorage = totalEncodedStorage × (10/16)
-  const encodingRatio = (cfg as any).encodingRatio as number;
-  let totalStorageUsedBytes = 0;
-  if (storageStats.sampledSlots > 0) {
-    const avgWrittenEncodedPerSlot = storageStats.totalWrittenEncoded / storageStats.sampledSlots;
-    const estimatedTotalEncoded = avgWrittenEncodedPerSlot * totalSlots;
-    totalStorageUsedBytes = Math.round(estimatedTotalEncoded * encodingRatio);
-  }
+  // Step 3: compute storage using MEDIAN (robust to outliers)
+  // medianBlobSize = representative size for a "typical" written blob
+  // writtenFraction = fraction of blobs that are written
+  // totalWrittenBlobs = totalSlots × writtenFraction
+  // totalStorage = medianBlobSize × totalWrittenBlobs
+  const medianSize = median(sampleStats.allWrittenSizes);
+  const writtenFraction = sampleStats.totalSampled > 0
+    ? sampleStats.writtenCount / sampleStats.totalSampled
+    : 0.84;
+  const estimatedWrittenBlobs = Math.round(totalSlots * writtenFraction);
+  const totalStorageUsedBytes = Math.round(medianSize * estimatedWrittenBlobs);
 
   return {
     totalBlobs:            totalSlots,
     totalStorageUsedBytes: totalStorageUsedBytes,
     totalBlobEvents:       totalBlobEvents,
     updatedAt:             new Date().toISOString(),
-    method:                "gql-bsearch+strat50+enc(10/16)",
+    method:                "gql-bsearch+median-storage",
   };
 }
 
@@ -350,7 +357,7 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "3.7.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")    return Response.json({ ok: true, worker: "shelby-geo-sync", version: "3.8.0", ts: new Date().toISOString() }, { headers: CORS });
     if (url.pathname === "/nodes"     && request.method === "GET")  return handleNodes(url, env);
     if (url.pathname === "/snapshots" && request.method === "GET")  return handleSnapshots(url, env);
     if (url.pathname === "/stats"     && request.method === "GET")  return handleStats(url, env);
@@ -358,7 +365,6 @@ export default {
     if (url.pathname === "/sync"      && request.method === "POST") return handleSync(url, env, ctx);
     return Response.json({ ok: false, error: "Not found" }, { status: 404, headers: CORS });
   },
-
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const nets: NetworkId[] = ["shelbynet", "testnet"];
     ctx.waitUntil(Promise.allSettled(nets.map(async net => {

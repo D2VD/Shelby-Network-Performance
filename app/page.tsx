@@ -22,7 +22,18 @@ interface BenchResult { latency: LatResult; uploads: UpResult[]; downloads: DlRe
 interface Balance    { apt: number; shelbyusd: number; ready: boolean; address: string }
 
 interface DiagnoseCheck { name: string; status: "pass" | "fail" | "warn" | "skip"; value?: string; hint?: string }
-interface DiagnoseResult { ready: boolean; passCount: number; failCount: number; warnCount: number; checks: DiagnoseCheck[]; summary: string }
+interface DiagnoseResult {
+  ready:           boolean;
+  passCount:       number;
+  failCount:       number;
+  warnCount:       number;
+  checks:          DiagnoseCheck[];
+  summary:         string;
+  workerDeployed?: boolean;
+  workerVersion?:  string;
+  deploySteps?:    string[];
+  workerUrl?:      string;
+}
 
 interface HistoryEntry { ts: string; avgUploadKbs: number; avgDownloadKbs: number; latencyAvg: number; score: number }
 
@@ -86,8 +97,10 @@ function ScoreRing({ score }: { score: number }) {
 
 // ── Diagnose panel ────────────────────────────────────────────────────────────
 function DiagnosePanel({ result, loading, onRecheck }: { result: DiagnoseResult | null; loading: boolean; onRecheck: () => void }) {
-  const statusIcon: Record<string, string> = { pass: "✓", fail: "✗", warn: "⚠", skip: "—" };
+  const statusIcon: Record<string, string>  = { pass: "✓", fail: "✗", warn: "⚠", skip: "—" };
   const statusColor: Record<string, string> = { pass: "#16a34a", fail: "#ef4444", warn: "#d97706", skip: "#9ca3af" };
+
+  const workerNotDeployed = result && result.workerDeployed === false;
 
   return (
     <div className="card" style={{ marginBottom: 20 }}>
@@ -97,7 +110,9 @@ function DiagnosePanel({ result, loading, onRecheck }: { result: DiagnoseResult 
           <div className="card-subtitle">
             {loading ? "Checking…" : result
               ? result.ready
-                ? `All ${result.passCount} checks passed`
+                ? `All ${result.passCount} checks passed${result.workerVersion ? ` · Worker v${result.workerVersion}` : ""}`
+                : workerNotDeployed
+                ? "Benchmark Worker chưa được deploy"
                 : `${result.failCount} issue${result.failCount > 1 ? "s" : ""} to fix`
               : "Run checks before benchmark"}
           </div>
@@ -116,6 +131,27 @@ function DiagnosePanel({ result, loading, onRecheck }: { result: DiagnoseResult 
         )}
         {result && (
           <>
+            {/* Worker not deployed — show deploy instructions prominently */}
+            {workerNotDeployed && result.deploySteps && (
+              <div style={{ marginBottom: 16, padding: "14px 16px", borderRadius: 10, background: "#fef2f2", border: "1px solid #fecaca" }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "#b91c1c", marginBottom: 10 }}>
+                  Benchmark Worker chưa được deploy — cần deploy trước khi chạy benchmark
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {result.deploySteps.map((step, i) => (
+                    <div key={i} style={{ fontFamily: "var(--font-mono)", fontSize: 12, background: "#fff", padding: "6px 10px", borderRadius: 6, border: "1px solid #fecaca", color: "#374151", userSelect: "all" }}>
+                      {step}
+                    </div>
+                  ))}
+                </div>
+                {result.workerUrl && (
+                  <div style={{ marginTop: 10, fontSize: 12, color: "#6b7280" }}>
+                    Worker URL: <code style={{ fontFamily: "var(--font-mono)" }}>{result.workerUrl}</code>
+                  </div>
+                )}
+              </div>
+            )}
+
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {result.checks.map((c, i) => (
                 <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "8px 10px", borderRadius: 8, background: c.status === "fail" ? "#fef2f2" : c.status === "warn" ? "#fffbeb" : "#f0fdf4" }}>

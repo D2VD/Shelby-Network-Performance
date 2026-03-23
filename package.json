@@ -15,9 +15,12 @@
     "worker:deploy": "npx wrangler deploy workers/geo-sync.ts --config workers/wrangler.worker.toml",
     "worker:dev":    "npx wrangler dev workers/geo-sync.ts --config workers/wrangler.worker.toml",
 
+    "benchmark:deploy": "npx wrangler deploy workers/benchmark.ts --config workers/wrangler.benchmark.toml",
+    "benchmark:dev":    "npx wrangler dev workers/benchmark.ts --config workers/wrangler.benchmark.toml",
+
     "cf:dev":        "npx wrangler pages dev .vercel/output/static",
 
-    "deploy":        "npm run pages:deploy && npm run worker:deploy"
+    "deploy":        "npm run pages:deploy && npm run worker:deploy && npm run benchmark:deploy"
   },
   "dependencies": {
     "@aptos-labs/ts-sdk":   "^5.2.1",

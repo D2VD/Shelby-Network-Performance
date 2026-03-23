@@ -4,41 +4,38 @@
   "private": true,
   "description": "Shelby Protocol Analytics Dashboard",
   "scripts": {
-    "dev":           "next dev",
-    "build":         "next build",
-    "start":         "next start",
-    "type-check":    "tsc --noEmit",
-
-    "pages:build":   "npx @cloudflare/next-on-pages",
-    "pages:deploy":  "npm run pages:build && npx wrangler pages deploy .vercel/output/static",
-
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "type-check": "tsc --noEmit",
+    "pages:build": "npx @cloudflare/next-on-pages",
+    "pages:deploy": "npm run pages:build && npx wrangler pages deploy .vercel/output/static",
     "worker:deploy": "npx wrangler deploy workers/geo-sync.ts --config workers/wrangler.worker.toml",
-    "worker:dev":    "npx wrangler dev workers/geo-sync.ts --config workers/wrangler.worker.toml",
-
+    "worker:dev": "npx wrangler dev workers/geo-sync.ts --config workers/wrangler.worker.toml",
     "benchmark:deploy": "npx wrangler deploy workers/benchmark.ts --config workers/wrangler.benchmark.toml",
-    "benchmark:dev":    "npx wrangler dev workers/benchmark.ts --config workers/wrangler.benchmark.toml",
-
-    "cf:dev":        "npx wrangler pages dev .vercel/output/static",
-
-    "deploy":        "npm run pages:deploy && npm run worker:deploy && npm run benchmark:deploy"
+    "benchmark:dev": "npx wrangler dev workers/benchmark.ts --config workers/wrangler.benchmark.toml",
+    "cf:dev": "npx wrangler pages dev .vercel/output/static",
+    "deploy": "npm run pages:deploy && npm run worker:deploy && npm run benchmark:deploy"
   },
   "dependencies": {
-    "@aptos-labs/ts-sdk":   "^5.2.1",
+    "@aptos-labs/ts-sdk": "^5.2.1",
     "@shelby-protocol/sdk": "^0.2.4",
-    "got":                  "^14.4.6",
-    "next":                 "^15.2.3",
-    "react":                "^19",
-    "react-dom":            "^19",
-    "swr":                  "^2.4.1"
+    "got": "^14.4.6",
+    "next": "^15.2.3",
+    "react": "^19",
+    "react-dom": "^19",
+    "swr": "^2.4.1"
   },
   "devDependencies": {
     "@cloudflare/next-on-pages": "^1.13.16",
     "@cloudflare/workers-types": "^4.20250109.0",
-    "@types/node":               "^20",
-    "@types/react":              "^19",
-    "@types/react-dom":          "^19",
-    "typescript":                "^5",
-    "wrangler":                  "^4.74.0"
+    "@types/node": "^20.19.37",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "typescript": "^5",
+    "wrangler": "^4.74.0"
   },
-  "engines": { "node": ">=20.0.0" }
+  "engines": {
+    "node": ">=20.0.0"
+  }
 }

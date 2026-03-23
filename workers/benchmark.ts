@@ -55,9 +55,11 @@ function getAccount(env: Env): Ed25519Account {
 
 function getClient(env: Env): ShelbyNodeClient {
   if (_client) return _client;
-  // FIX v1.3: pass explicit rpc.baseUrl + aptos config để tránh "Invalid URL string"
-  // khi Network.SHELBYNET enum không resolve đúng → NetworkToShelbyRPCBaseUrl lookup fail
-  // → baseUrl = undefined → new URL(undefined) → Invalid URL string
+  // FIX v1.3: pass explicit rpc.baseUrl + aptos fullnode/indexer URLs để tránh
+  // "Invalid URL string" khi Network.SHELBYNET enum không resolve đúng
+  // → SDK dùng NetworkToShelbyRPCBaseUrl[network] để lấy baseUrl;
+  //   nếu network không match → undefined → new URL(undefined) → crash
+  // AptosSettings type: { network?, fullnode?, indexer?, ... } — flat, không nested
   _client = new ShelbyNodeClient({
     network: (Network as any).SHELBYNET ?? ("shelbynet" as any),
     rpc: {
@@ -68,7 +70,7 @@ function getClient(env: Env): ShelbyNodeClient {
       network:  (Network as any).SHELBYNET ?? ("shelbynet" as any),
       fullnode: "https://api.shelbynet.shelby.xyz/v1",
       indexer:  "https://api.shelbynet.aptoslabs.com/nocode/v1/public/cmforrguw0042s601fn71f9l2/v1/graphql",
-    },
+    } as any, // AptosSettings — cast to avoid strict enum check on network field
     ...(env.SHELBY_API_KEY ? { apiKey: env.SHELBY_API_KEY } : {}),
   });
   return _client;

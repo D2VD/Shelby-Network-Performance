@@ -50,7 +50,7 @@ export function MetricsPanel() {
     try {
       const res = await fetch(`/api/network/stats?network=${network}`);
       if (!res.ok) return;
-      const d = await res.json();
+      const d = await res.json() as any;
       if (d.data?.stats) {
         const newStats = d.data.stats as Stats;
         const changed: Record<string, boolean> = {};

@@ -93,7 +93,7 @@ export function Sidebar() {
       const url = `/api/network/stats?network=${network}`;
       const res = await fetch(url);
       if (!res.ok) return;
-      const d = await res.json();
+      const d = await res.json() as any;
       if (d.ok || d.data) {
         setStats(d.data?.stats ?? {});
         setNode(d.data?.node ?? null);

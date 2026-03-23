@@ -1,14 +1,16 @@
 /**
- * workers/benchmark.ts — Shelby Benchmark Worker v1.1
+ * workers/benchmark.ts — Shelby Benchmark Worker v1.2
  *
- * FIX v1.1:
- * - Dùng client.upload() thay vì generateCommitments() + registerBlob() thủ công
- *   → tránh lỗi "Cannot read properties of undefined (reading 'erasure_n')"
- *   → WASM được SDK handle internally, không cần ClayErasureCodingProvider riêng
- * - Thêm /faucet endpoint (faucet route proxy sang đây, có SHELBY_WALLET_ADDRESS)
+ * FIX v1.2:
+ * - blobData: Uint8Array → Buffer để đảm bảo .length luôn là số nguyên hợp lệ
+ *   → Buffer là subclass của Uint8Array, compatible với SDK type
+ *   → tránh lỗi 400: "contentLength: Expected number, received nan"
+ * - Bỏ field contentLength (không tồn tại trong SDK type TS2353)
+ *   → SDK tự đọc blobData.length internally
+ * - handleTxTime: tương tự fix Buffer
  *
  * Upload flow theo SDK docs:
- *   client.upload({ signer, blobData: Buffer, blobName, expirationMicros })
+ *   client.upload({ signer, blobData, blobName, expirationMicros })
  *   → SDK tự: WASM commitments → registerBlob on-chain → waitForTx → putBlob RPC
  */
 
@@ -62,8 +64,9 @@ function nb(v: any, fb = 0): number {
   return isNaN(x) ? fb : x;
 }
 
-function generatePayload(bytes: number): Uint8Array {
-  const buf = new Uint8Array(bytes);
+// FIX: Buffer thay Uint8Array — .length luôn là number, tránh NaN khi SDK set Content-Length header
+function generatePayload(bytes: number): Buffer {
+  const buf = Buffer.allocUnsafe(bytes);
   for (let i = 0; i < bytes; i++) buf[i] = (i * 37 + 13) % 256;
   return buf;
 }
@@ -126,20 +129,20 @@ async function handleLatency(): Promise<Response> {
 }
 
 /**
- * Upload dùng client.upload() — SDK xử lý toàn bộ flow nội bộ.
- * Không cần gọi ClayErasureCodingProvider hay generateCommitments trực tiếp.
+ * FIX v1.2: blobData là Buffer (Uint8Array subclass) — SDK tự đọc .length để set Content-Length.
+ * Không pass contentLength field (không tồn tại trong SDK type).
  */
 async function handleUpload(req: Request, env: Env): Promise<Response> {
   const body     = await req.json().catch(() => ({})) as any;
   const bytes    = TEST_SIZES[body.sizeIndex ?? 0] ?? TEST_SIZES[0];
-  const payload  = generatePayload(bytes);
+  const payload  = generatePayload(bytes); // ← Buffer, không phải Uint8Array
   const blobName = uniqueBlobName(bytes);
   const t0       = performance.now();
 
   try {
     const result = await (getClient(env).upload({
       signer:           getAccount(env),
-      blobData:         payload,        // Uint8Array — không cần Buffer
+      blobData:         payload,          // Buffer (Uint8Array subclass) — SDK đọc .length để set Content-Length
       blobName,
       expirationMicros: (Date.now() + 7 * 24 * 3600 * 1000) * 1000,
     }) as any);
@@ -156,13 +159,15 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
     const code = msg.includes("INSUFFICIENT") || msg.includes("balance") ? "INSUFFICIENT_BALANCE"
                : msg.includes("rate")   || msg.includes("429")           ? "RATE_LIMITED"
                : msg.includes("erasure")|| msg.includes("WASM")          ? "WASM_ERROR"
+               : msg.includes("contentLength") || msg.includes("nan")    ? "CONTENT_LENGTH_ERROR"
                : "UPLOAD_FAILED";
     return Response.json({
       error: msg.slice(0, 300), code,
       elapsed: performance.now() - t0,
-      hint: code === "RATE_LIMITED"         ? "Set SHELBY_API_KEY from geomi.dev in Worker secrets"
-          : code === "INSUFFICIENT_BALANCE" ? "Fund wallet via faucet.shelbynet.shelby.xyz"
-          : code === "WASM_ERROR"           ? "SDK WASM error — redeploy worker với nodejs_compat flag"
+      hint: code === "RATE_LIMITED"           ? "Set SHELBY_API_KEY from geomi.dev in Worker secrets"
+          : code === "INSUFFICIENT_BALANCE"   ? "Fund wallet via faucet.shelbynet.shelby.xyz"
+          : code === "WASM_ERROR"             ? "SDK WASM error — redeploy worker với nodejs_compat flag"
+          : code === "CONTENT_LENGTH_ERROR"   ? "contentLength NaN — đã fix trong v1.2, redeploy worker"
           : undefined,
     }, { status: 500, headers: CORS });
   }
@@ -194,13 +199,17 @@ async function handleDownload(req: Request, env: Env): Promise<Response> {
   }
 }
 
+/**
+ * FIX v1.2: Buffer.alloc thay vì new Uint8Array để đồng nhất với handleUpload.
+ */
 async function handleTxTime(env: Env): Promise<Response> {
   const blobName = `bench/tx/${Date.now()}-${Math.floor(Math.random() * 0xffff).toString(16)}`;
+  const payload  = Buffer.alloc(512, 42); // FIX: Buffer thay Uint8Array
   const t0       = performance.now();
   try {
     const txResult = await (getClient(env).upload({
       signer:           getAccount(env),
-      blobData:         new Uint8Array(512).fill(42), // không cần Buffer
+      blobData:         payload,
       blobName,
       expirationMicros: (Date.now() + 3_600_000) * 1000,
     }) as any);
@@ -328,7 +337,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")   return Response.json({ ok: true, worker: "shelby-benchmark", version: "1.1.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")   return Response.json({ ok: true, worker: "shelby-benchmark", version: "1.2.0", ts: new Date().toISOString() }, { headers: CORS });
     if (url.pathname === "/diagnose"  && request.method === "GET")  return handleDiagnose(env);
     if (url.pathname === "/balance"   && request.method === "GET")  return handleBalance(env);
     if (url.pathname === "/latency"   && request.method === "GET")  return handleLatency();

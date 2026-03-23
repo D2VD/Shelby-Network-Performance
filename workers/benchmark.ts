@@ -1,13 +1,16 @@
 /**
- * workers/benchmark.ts — Shelby Benchmark Worker v1.2
+ * workers/benchmark.ts — Shelby Benchmark Worker v1.3
+ *
+ * FIX v1.3:
+ * - getClient(): pass explicit rpc.baseUrl + aptos.fullnode/indexer URLs
+ *   → tránh "Invalid URL string" khi Network.SHELBYNET enum không resolve đúng
+ *   → SDK dùng NetworkToShelbyRPCBaseUrl[network] để lấy baseUrl;
+ *     nếu network không match enum → undefined → new URL(undefined) → crash
+ *   → Fix: cung cấp URLs trực tiếp, SDK ưu tiên explicit config over enum lookup
  *
  * FIX v1.2:
- * - blobData: Uint8Array → Buffer để đảm bảo .length luôn là số nguyên hợp lệ
- *   → Buffer là subclass của Uint8Array, compatible với SDK type
- *   → tránh lỗi 400: "contentLength: Expected number, received nan"
- * - Bỏ field contentLength (không tồn tại trong SDK type TS2353)
- *   → SDK tự đọc blobData.length internally
- * - handleTxTime: tương tự fix Buffer
+ * - blobData: Buffer thay Uint8Array — .length luôn là number hợp lệ
+ * - Bỏ contentLength field (không tồn tại trong SDK type TS2353)
  *
  * Upload flow theo SDK docs:
  *   client.upload({ signer, blobData, blobName, expirationMicros })
@@ -52,8 +55,20 @@ function getAccount(env: Env): Ed25519Account {
 
 function getClient(env: Env): ShelbyNodeClient {
   if (_client) return _client;
+  // FIX v1.3: pass explicit rpc.baseUrl + aptos config để tránh "Invalid URL string"
+  // khi Network.SHELBYNET enum không resolve đúng → NetworkToShelbyRPCBaseUrl lookup fail
+  // → baseUrl = undefined → new URL(undefined) → Invalid URL string
   _client = new ShelbyNodeClient({
     network: (Network as any).SHELBYNET ?? ("shelbynet" as any),
+    rpc: {
+      baseUrl: "https://api.shelbynet.shelby.xyz/shelby",
+      ...(env.SHELBY_API_KEY ? { apiKey: env.SHELBY_API_KEY } : {}),
+    },
+    aptos: {
+      network:  (Network as any).SHELBYNET ?? ("shelbynet" as any),
+      fullnode: "https://api.shelbynet.shelby.xyz/v1",
+      indexer:  "https://api.shelbynet.aptoslabs.com/nocode/v1/public/cmforrguw0042s601fn71f9l2/v1/graphql",
+    },
     ...(env.SHELBY_API_KEY ? { apiKey: env.SHELBY_API_KEY } : {}),
   });
   return _client;
@@ -337,7 +352,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")   return Response.json({ ok: true, worker: "shelby-benchmark", version: "1.2.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")   return Response.json({ ok: true, worker: "shelby-benchmark", version: "1.3.0", ts: new Date().toISOString() }, { headers: CORS });
     if (url.pathname === "/diagnose"  && request.method === "GET")  return handleDiagnose(env);
     if (url.pathname === "/balance"   && request.method === "GET")  return handleBalance(env);
     if (url.pathname === "/latency"   && request.method === "GET")  return handleLatency();

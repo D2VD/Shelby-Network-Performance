@@ -168,8 +168,8 @@ export default function GlobeEngine({
   // ── Load globe dots ──────────────────────────────────────────────────────────
   useEffect(() => {
     fetch("/geo/globe-dots.json")
-      .then(r => r.json())
-      .then((d: GlobeDots) => setDots(d.points))
+      .then(r => r.json() as Promise<GlobeDots>)
+      .then(d => setDots(d.points))
       .catch(() => {
         const fb: [number, number][] = [];
         for (let lon = -170; lon < 180; lon += 8)

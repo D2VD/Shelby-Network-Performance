@@ -1,0 +1,30 @@
+# ═══════════════════════════════════════════════════════════════
+# workers/wrangler.benchmark.toml
+# Config cho Shelby Benchmark Worker — tách biệt với geo-sync Worker
+#
+# Worker này:
+#   - Dùng SDK (@shelby-protocol/sdk) + clay-codes WASM
+#   - Cần nodejs_compat để load WASM và sign Aptos transactions
+#   - KHÔNG phải Pages project
+#
+# Deploy:
+#   npm run benchmark:deploy
+#
+# Secrets (set sau khi deploy):
+#   npx wrangler secret put SHELBY_PRIVATE_KEY    --config workers/wrangler.benchmark.toml
+#   npx wrangler secret put SHELBY_WALLET_ADDRESS --config workers/wrangler.benchmark.toml
+#   npx wrangler secret put SHELBY_API_KEY        --config workers/wrangler.benchmark.toml
+# ═══════════════════════════════════════════════════════════════
+
+name               = "shelby-benchmark"
+main               = "benchmark.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# ── KV Namespace (để lưu bench results) ───────────────────────
+# Dùng cùng namespace với geo-sync worker
+[[kv_namespaces]]
+binding = "SHELBY_KV_MAINNET"
+id      = "5cb5ee699b924052812beda7ae936569"
+
+# ── KHÔNG có CRON — worker này chỉ handle HTTP requests ───────

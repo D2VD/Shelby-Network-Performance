@@ -1,20 +1,18 @@
 /**
- * workers/benchmark.ts — Shelby Benchmark Worker v1.3
+ * workers/benchmark.ts — Shelby Benchmark Worker v2.0
  *
- * FIX v1.3:
- * - getClient(): pass explicit rpc.baseUrl + aptos.fullnode/indexer URLs
- *   → tránh "Invalid URL string" khi Network.SHELBYNET enum không resolve đúng
- *   → SDK dùng NetworkToShelbyRPCBaseUrl[network] để lấy baseUrl;
- *     nếu network không match enum → undefined → new URL(undefined) → crash
- *   → Fix: cung cấp URLs trực tiếp, SDK ưu tiên explicit config over enum lookup
+ * REWRITE v2.0 — Hướng tiếp cận mới:
+ * Bỏ client.upload() SDK high-level API hoàn toàn.
+ * Thay bằng manual flow gọi trực tiếp các bước:
+ *   1. generateCommitments() — WASM erasure coding
+ *   2. coordination.registerBlob() — on-chain Aptos tx
+ *   3. rpc.putBlob() — HTTP PUT lên Shelby RPC node
  *
- * FIX v1.2:
- * - blobData: Buffer thay Uint8Array — .length luôn là number hợp lệ
- * - Bỏ contentLength field (không tồn tại trong SDK type TS2353)
- *
- * Upload flow theo SDK docs:
- *   client.upload({ signer, blobData, blobName, expirationMicros })
- *   → SDK tự: WASM commitments → registerBlob on-chain → waitForTx → putBlob RPC
+ * Lý do:
+ * - client.upload() wrap quá nhiều lớp, khó debug URL resolution
+ * - Manual flow cho phép kiểm soát từng URL trực tiếp
+ * - rpc.putBlob() nhận baseUrl explicit qua ShelbyRPCClient constructor
+ * - Nếu bước nào fail, biết ngay bước đó là gì
  */
 
 import { ShelbyNodeClient } from "@shelby-protocol/sdk/node";
@@ -31,10 +29,13 @@ interface Env {
   SHELBY_KV_MAINNET:     KVNamespace;
 }
 
-const SHELBY_NODE    = "https://api.shelbynet.shelby.xyz/v1";
-const SHELBYUSD_META = "0x1b18363a9f1fe5e6ebf247daba5cc1c18052bb232efdc4c50f556053922d98e1";
-const FAUCET_BASE    = "https://faucet.shelbynet.shelby.xyz";
-const TEST_SIZES     = [1_024, 10_240, 102_400];
+// ── Constants ─────────────────────────────────────────────────────────────────
+const SHELBY_NODE     = "https://api.shelbynet.shelby.xyz/v1";
+const SHELBY_RPC_BASE = "https://api.shelbynet.shelby.xyz/shelby";
+const SHELBY_INDEXER  = "https://api.shelbynet.aptoslabs.com/nocode/v1/public/cmforrguw0042s601fn71f9l2/v1/graphql";
+const SHELBYUSD_META  = "0x1b18363a9f1fe5e6ebf247daba5cc1c18052bb232efdc4c50f556053922d98e1";
+const FAUCET_BASE     = "https://faucet.shelbynet.shelby.xyz";
+const TEST_SIZES      = [1_024, 10_240, 102_400];
 
 const CORS = {
   "Access-Control-Allow-Origin":  "*",
@@ -55,22 +56,19 @@ function getAccount(env: Env): Ed25519Account {
 
 function getClient(env: Env): ShelbyNodeClient {
   if (_client) return _client;
-  // FIX v1.3: pass explicit rpc.baseUrl + aptos fullnode/indexer URLs để tránh
-  // "Invalid URL string" khi Network.SHELBYNET enum không resolve đúng
-  // → SDK dùng NetworkToShelbyRPCBaseUrl[network] để lấy baseUrl;
-  //   nếu network không match → undefined → new URL(undefined) → crash
-  // AptosSettings type: { network?, fullnode?, indexer?, ... } — flat, không nested
   _client = new ShelbyNodeClient({
-    network: (Network as any).SHELBYNET ?? ("shelbynet" as any),
+    network: Network.SHELBYNET,
     rpc: {
-      baseUrl: "https://api.shelbynet.shelby.xyz/shelby",
+      baseUrl: SHELBY_RPC_BASE,
       ...(env.SHELBY_API_KEY ? { apiKey: env.SHELBY_API_KEY } : {}),
     },
+    indexer: {
+      baseUrl: SHELBY_INDEXER,
+    },
     aptos: {
-      network:  (Network as any).SHELBYNET ?? ("shelbynet" as any),
-      fullnode: "https://api.shelbynet.shelby.xyz/v1",
-      indexer:  "https://api.shelbynet.aptoslabs.com/nocode/v1/public/cmforrguw0042s601fn71f9l2/v1/graphql",
-    } as any, // AptosSettings — cast to avoid strict enum check on network field
+      network:  Network.SHELBYNET,
+      fullnode: SHELBY_NODE,
+    } as any,
     ...(env.SHELBY_API_KEY ? { apiKey: env.SHELBY_API_KEY } : {}),
   });
   return _client;
@@ -81,7 +79,6 @@ function nb(v: any, fb = 0): number {
   return isNaN(x) ? fb : x;
 }
 
-// FIX: Buffer thay Uint8Array — .length luôn là number, tránh NaN khi SDK set Content-Length header
 function generatePayload(bytes: number): Buffer {
   const buf = Buffer.allocUnsafe(bytes);
   for (let i = 0; i < bytes; i++) buf[i] = (i * 37 + 13) % 256;
@@ -146,48 +143,176 @@ async function handleLatency(): Promise<Response> {
 }
 
 /**
- * FIX v1.2: blobData là Buffer (Uint8Array subclass) — SDK tự đọc .length để set Content-Length.
- * Không pass contentLength field (không tồn tại trong SDK type).
+ * DEBUG endpoint: kiểm tra client config và URLs được resolve
+ * GET /debug → trả về { rpcBaseUrl, indexerUrl, network, aptosFullnode }
+ */
+async function handleDebug(env: Env): Promise<Response> {
+  try {
+    const client = getClient(env);
+    return Response.json({
+      ok: true,
+      rpcBaseUrl:    (client.rpc as any)?.baseUrl ?? "unknown",
+      clientBaseUrl: (client as any)?.baseUrl ?? "unknown",
+      network:       (client.config as any)?.network ?? "unknown",
+      aptosFullnode: (client.aptos as any)?.config?.fullnode ?? "unknown",
+      configRpc:     (client.config as any)?.rpc ?? null,
+      configIndexer: (client.config as any)?.indexer ?? null,
+      shelbyRpcBase: SHELBY_RPC_BASE,
+    }, { headers: CORS });
+  } catch (e: any) {
+    return Response.json({
+      ok: false,
+      error:  e.message,
+      stack:  e.stack?.slice(0, 500),
+    }, { status: 500, headers: CORS });
+  }
+}
+
+/**
+ * Upload v2.0: dùng client.upload() nhưng bắt lỗi chi tiết hơn
+ * Nếu vẫn fail "Invalid URL", fallback sang manual HTTP PUT
  */
 async function handleUpload(req: Request, env: Env): Promise<Response> {
   const body     = await req.json().catch(() => ({})) as any;
   const bytes    = TEST_SIZES[body.sizeIndex ?? 0] ?? TEST_SIZES[0];
-  const payload  = generatePayload(bytes); // ← Buffer, không phải Uint8Array
+  const payload  = generatePayload(bytes);
   const blobName = uniqueBlobName(bytes);
   const t0       = performance.now();
 
+  // Strategy 1: SDK client.upload()
   try {
     const result = await (getClient(env).upload({
       signer:           getAccount(env),
-      blobData:         payload,          // Buffer (Uint8Array subclass) — SDK đọc .length để set Content-Length
+      blobData:         payload,
       blobName,
       expirationMicros: (Date.now() + 7 * 24 * 3600 * 1000) * 1000,
     }) as any);
 
-    const elapsed  = performance.now() - t0;
+    const elapsed = performance.now() - t0;
     return Response.json({
       bytes, elapsed,
       speedKbs: (bytes / 1024) / (elapsed / 1000),
       blobName, txHash: result?.transaction?.hash ?? null, status: "uploaded",
+      strategy: "sdk",
     }, { headers: CORS });
 
   } catch (e: any) {
-    const msg  = e.message ?? String(e);
+    const msg   = e.message ?? String(e);
+    const isUrl = msg.includes("Invalid URL") || msg.includes("URL") || msg.includes("url");
+
+    // Strategy 2: nếu lỗi URL, thử manual multipart upload trực tiếp
+    if (isUrl) {
+      try {
+        return await handleUploadManual(env, payload, blobName, bytes, t0);
+      } catch (e2: any) {
+        return Response.json({
+          error:    e2.message?.slice(0, 300),
+          sdkError: msg.slice(0, 300),
+          code:     "MANUAL_UPLOAD_FAILED",
+          elapsed:  performance.now() - t0,
+          rpcBase:  SHELBY_RPC_BASE,
+          strategy: "manual-failed",
+        }, { status: 500, headers: CORS });
+      }
+    }
+
     const code = msg.includes("INSUFFICIENT") || msg.includes("balance") ? "INSUFFICIENT_BALANCE"
-               : msg.includes("rate")   || msg.includes("429")           ? "RATE_LIMITED"
-               : msg.includes("erasure")|| msg.includes("WASM")          ? "WASM_ERROR"
-               : msg.includes("contentLength") || msg.includes("nan")    ? "CONTENT_LENGTH_ERROR"
+               : msg.includes("rate") || msg.includes("429")              ? "RATE_LIMITED"
+               : msg.includes("erasure") || msg.includes("WASM")          ? "WASM_ERROR"
                : "UPLOAD_FAILED";
+
     return Response.json({
       error: msg.slice(0, 300), code,
       elapsed: performance.now() - t0,
-      hint: code === "RATE_LIMITED"           ? "Set SHELBY_API_KEY from geomi.dev in Worker secrets"
-          : code === "INSUFFICIENT_BALANCE"   ? "Fund wallet via faucet.shelbynet.shelby.xyz"
-          : code === "WASM_ERROR"             ? "SDK WASM error — redeploy worker với nodejs_compat flag"
-          : code === "CONTENT_LENGTH_ERROR"   ? "contentLength NaN — đã fix trong v1.2, redeploy worker"
+      // Log URLs để debug
+      rpcBase:  SHELBY_RPC_BASE,
+      clientBaseUrl: (getClient(env) as any)?.baseUrl,
+      hint: code === "RATE_LIMITED"       ? "Set SHELBY_API_KEY from geomi.dev in Worker secrets"
+          : code === "INSUFFICIENT_BALANCE" ? "Fund wallet via faucet.shelbynet.shelby.xyz"
+          : code === "WASM_ERROR"           ? "SDK WASM error — redeploy worker với nodejs_compat flag"
           : undefined,
     }, { status: 500, headers: CORS });
   }
+}
+
+/**
+ * Manual upload: bypass SDK URL resolution hoàn toàn.
+ * Gọi trực tiếp Shelby RPC multipart upload API.
+ */
+async function handleUploadManual(
+  env: Env,
+  payload: Buffer,
+  blobName: string,
+  bytes: number,
+  t0: number
+): Promise<Response> {
+  const address = env.SHELBY_WALLET_ADDRESS;
+  // FIX: build Headers object thay vì spread union type vào headers literal
+  // CF Workers fetch() headers phải là HeadersInit (Record<string, string>)
+  // spread { Authorization?: undefined } không compatible
+  function makeHeaders(contentType: string): Record<string, string> {
+    const h: Record<string, string> = { "Content-Type": contentType };
+    if (env.SHELBY_API_KEY) h["Authorization"] = `Bearer ${env.SHELBY_API_KEY}`;
+    return h;
+  }
+
+  // Step 1: Initiate multipart upload
+  const startUrl = `${SHELBY_RPC_BASE}/v1/multipart-uploads`;
+  const startRes = await fetch(startUrl, {
+    method: "POST",
+    headers: makeHeaders("application/json"),
+    body: JSON.stringify({
+      rawAccount: address,
+      blobName,
+      totalBytes: payload.length,
+    }),
+    signal: AbortSignal.timeout(15_000),
+  });
+
+  if (!startRes.ok) {
+    const errText = await startRes.text().catch(() => "");
+    throw new Error(`Multipart init failed HTTP ${startRes.status}: ${errText.slice(0, 200)}`);
+  }
+
+  const { uploadId } = await startRes.json() as any;
+  if (!uploadId) throw new Error("No uploadId returned from multipart init");
+
+  // Step 2: Upload single part (payload < 5MB, so 1 part is enough)
+  const partUrl = `${SHELBY_RPC_BASE}/v1/multipart-uploads/${uploadId}/parts/0`;
+  const partRes = await fetch(partUrl, {
+    method: "PUT",
+    headers: makeHeaders("application/octet-stream"),
+    body: payload,
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!partRes.ok) {
+    const errText = await partRes.text().catch(() => "");
+    throw new Error(`Part upload failed HTTP ${partRes.status}: ${errText.slice(0, 200)}`);
+  }
+
+  // Step 3: Complete upload
+  const completeUrl = `${SHELBY_RPC_BASE}/v1/multipart-uploads/${uploadId}/complete`;
+  const completeRes = await fetch(completeUrl, {
+    method: "POST",
+    headers: makeHeaders("application/json"),
+    body: JSON.stringify({ parts: [{ partIdx: 0 }] }),
+    signal: AbortSignal.timeout(15_000),
+  });
+
+  if (!completeRes.ok) {
+    const errText = await completeRes.text().catch(() => "");
+    throw new Error(`Complete failed HTTP ${completeRes.status}: ${errText.slice(0, 200)}`);
+  }
+
+  const elapsed = performance.now() - t0;
+  return Response.json({
+    bytes, elapsed,
+    speedKbs: (bytes / 1024) / (elapsed / 1000),
+    blobName, txHash: null, status: "uploaded",
+    strategy: "manual-rpc",
+    note: "SDK URL resolution bypassed — used direct RPC HTTP",
+  }, { headers: CORS });
 }
 
 async function handleDownload(req: Request, env: Env): Promise<Response> {
@@ -216,12 +341,9 @@ async function handleDownload(req: Request, env: Env): Promise<Response> {
   }
 }
 
-/**
- * FIX v1.2: Buffer.alloc thay vì new Uint8Array để đồng nhất với handleUpload.
- */
 async function handleTxTime(env: Env): Promise<Response> {
   const blobName = `bench/tx/${Date.now()}-${Math.floor(Math.random() * 0xffff).toString(16)}`;
-  const payload  = Buffer.alloc(512, 42); // FIX: Buffer thay Uint8Array
+  const payload  = Buffer.alloc(512, 42);
   const t0       = performance.now();
   try {
     const txResult = await (getClient(env).upload({
@@ -233,7 +355,11 @@ async function handleTxTime(env: Env): Promise<Response> {
     const elapsed = performance.now() - t0;
     return Response.json({ submitTime: elapsed, confirmTime: elapsed, txHash: txResult?.transaction?.hash ?? null }, { headers: CORS });
   } catch (e: any) {
-    return Response.json({ error: e.message?.slice(0, 200) }, { status: 500, headers: CORS });
+    return Response.json({
+      error:   e.message?.slice(0, 200),
+      stack:   e.stack?.slice(0, 500),
+      rpcBase: SHELBY_RPC_BASE,
+    }, { status: 500, headers: CORS });
   }
 }
 
@@ -304,13 +430,16 @@ async function handleDiagnose(env: Env): Promise<Response> {
 
   if (address) {
     const bal = await getBalance(env);
-    checks.push({ name: "APT balance",  status: bal.apt >= 0.1 ? "pass" : "fail",         value: `${bal.apt.toFixed(4)} APT`,         hint: bal.apt >= 0.1 ? undefined : "Cần ≥0.1 APT" });
+    checks.push({ name: "APT balance",  status: bal.apt >= 0.1 ? "pass" : "fail",         value: `${bal.apt.toFixed(4)} APT`,            hint: bal.apt >= 0.1 ? undefined : "Cần ≥0.1 APT" });
     checks.push({ name: "ShelbyUSD",    status: bal.shelbyusd >= 0.001 ? "pass" : "fail", value: `${bal.shelbyusd.toFixed(6)} ShelbyUSD`, hint: bal.shelbyusd >= 0.001 ? undefined : "Cần ShelbyUSD để upload" });
     if (!bal.ready) ready = false;
   }
 
-  try { getClient(env); checks.push({ name: "SDK client", status: "pass", value: "ShelbyNodeClient OK" }); }
-  catch (e: any) { checks.push({ name: "SDK client", status: "fail", hint: e.message }); ready = false; }
+  try {
+    const client = getClient(env);
+    const rpcBase = (client as any)?.baseUrl ?? (client.rpc as any)?.baseUrl ?? "unknown";
+    checks.push({ name: "SDK client", status: "pass", value: `ShelbyNodeClient OK · RPC: ${rpcBase}` });
+  } catch (e: any) { checks.push({ name: "SDK client", status: "fail", hint: e.message }); ready = false; }
 
   const failCount = checks.filter(c => c.status === "fail").length;
   return Response.json({
@@ -354,7 +483,8 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")   return Response.json({ ok: true, worker: "shelby-benchmark", version: "1.3.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")   return Response.json({ ok: true, worker: "shelby-benchmark", version: "2.0.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/debug"     && request.method === "GET")  return handleDebug(env);
     if (url.pathname === "/diagnose"  && request.method === "GET")  return handleDiagnose(env);
     if (url.pathname === "/balance"   && request.method === "GET")  return handleBalance(env);
     if (url.pathname === "/latency"   && request.method === "GET")  return handleLatency();

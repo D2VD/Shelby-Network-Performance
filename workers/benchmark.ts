@@ -1,18 +1,13 @@
 /**
- * workers/benchmark.ts — Shelby Benchmark Worker v2.0
+ * workers/benchmark.ts — Shelby Benchmark Worker v2.1
  *
- * REWRITE v2.0 — Hướng tiếp cận mới:
- * Bỏ client.upload() SDK high-level API hoàn toàn.
- * Thay bằng manual flow gọi trực tiếp các bước:
- *   1. generateCommitments() — WASM erasure coding
- *   2. coordination.registerBlob() — on-chain Aptos tx
- *   3. rpc.putBlob() — HTTP PUT lên Shelby RPC node
- *
- * Lý do:
- * - client.upload() wrap quá nhiều lớp, khó debug URL resolution
- * - Manual flow cho phép kiểm soát từng URL trực tiếp
- * - rpc.putBlob() nhận baseUrl explicit qua ShelbyRPCClient constructor
- * - Nếu bước nào fail, biết ngay bước đó là gì
+ * FIX v2.1:
+ * 1. handleUploadManual — sửa request body step1-init:
+ *    - Bỏ rawAccount (server không cần), thêm blob_name + part_size + total_size (snake_case)
+ *    - part_size = Math.min(payload.length, 5 * 1024 * 1024) — max 5MB/part
+ *    - total_size = payload.length
+ * 2. handleTxTime — thêm fallback manual flow khi SDK fail "Invalid URL"
+ *    (giống handleUpload, dùng handleUploadManual thay vì throw)
  */
 
 import { ShelbyNodeClient } from "@shelby-protocol/sdk/node";
@@ -142,10 +137,6 @@ async function handleLatency(): Promise<Response> {
   }, { headers: CORS });
 }
 
-/**
- * DEBUG endpoint: kiểm tra client config và URLs được resolve
- * GET /debug → trả về { rpcBaseUrl, indexerUrl, network, aptosFullnode }
- */
 async function handleDebug(env: Env): Promise<Response> {
   try {
     const client = getClient(env);
@@ -168,10 +159,6 @@ async function handleDebug(env: Env): Promise<Response> {
   }
 }
 
-/**
- * Upload v2.0: dùng client.upload() nhưng bắt lỗi chi tiết hơn
- * Nếu vẫn fail "Invalid URL", fallback sang manual HTTP PUT
- */
 async function handleUpload(req: Request, env: Env): Promise<Response> {
   const body     = await req.json().catch(() => ({})) as any;
   const bytes    = TEST_SIZES[body.sizeIndex ?? 0] ?? TEST_SIZES[0];
@@ -201,7 +188,7 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
     const stack = e.stack ?? "";
     const isUrl = msg.includes("Invalid URL") || msg.includes("Failed to parse URL");
 
-    // Strategy 2: nếu lỗi URL, thử manual multipart upload trực tiếp
+    // Strategy 2: fallback manual multipart
     if (isUrl) {
       try {
         return await handleUploadManual(env, payload, blobName, bytes, t0);
@@ -209,7 +196,6 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
         return Response.json({
           error:    e2.message?.slice(0, 300),
           sdkError: msg.slice(0, 300),
-          // Log stack để biết URL nào bị invalid
           sdkStack: stack.slice(0, 800),
           code:     "MANUAL_UPLOAD_FAILED",
           elapsed:  performance.now() - t0,
@@ -226,7 +212,6 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
 
     return Response.json({
       error: msg.slice(0, 300), code,
-      // Full stack để debug
       stack: stack.slice(0, 800),
       elapsed: performance.now() - t0,
       rpcBase:  SHELBY_RPC_BASE,
@@ -240,10 +225,17 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
 }
 
 /**
- * Manual upload: bypass SDK URL resolution hoàn toàn.
- * Gọi trực tiếp Shelby RPC multipart upload API.
- * Note: Không có on-chain registration → chỉ test RPC connectivity.
- * Nếu RPC cũng fail → lỗi thực sự là ở đây.
+ * Manual multipart upload — bypass SDK URL resolution.
+ *
+ * FIX v2.1: Đúng request body cho step1-init:
+ *   - blob_name   (string) — tên blob, snake_case
+ *   - part_size   (number) — size của từng part, tối đa 5MB
+ *   - total_size  (number) — tổng size của file
+ *
+ * Lỗi cũ (v2.0):
+ *   { rawAccount, blobName, totalBytes }
+ *   → server báo "blobName: Required, partSize: Expected number received nan"
+ *   Nguyên nhân: server dùng snake_case + tên fields khác
  */
 async function handleUploadManual(
   env: Env,
@@ -253,9 +245,7 @@ async function handleUploadManual(
   t0: number
 ): Promise<Response> {
   const address = env.SHELBY_WALLET_ADDRESS;
-  // FIX: build Headers object thay vì spread union type vào headers literal
-  // CF Workers fetch() headers phải là HeadersInit (Record<string, string>)
-  // spread { Authorization?: undefined } không compatible
+
   function makeHeaders(contentType: string): Record<string, string> {
     const h: Record<string, string> = { "Content-Type": contentType };
     if (env.SHELBY_API_KEY) h["Authorization"] = `Bearer ${env.SHELBY_API_KEY}`;
@@ -264,6 +254,11 @@ async function handleUploadManual(
 
   const steps: string[] = [];
 
+  // part_size: chunk size cho mỗi part — dùng toàn bộ payload vì < 5MB
+  // API expect: blob_name, part_size, total_size (snake_case)
+  const partSize  = Math.min(payload.length, 5 * 1024 * 1024); // tối đa 5MB/part
+  const totalSize = payload.length;
+
   // Step 1: Initiate multipart upload
   const startUrl = `${SHELBY_RPC_BASE}/v1/multipart-uploads`;
   steps.push(`POST ${startUrl}`);
@@ -271,9 +266,10 @@ async function handleUploadManual(
     method: "POST",
     headers: makeHeaders("application/json"),
     body: JSON.stringify({
-      rawAccount: address,
-      blobName,
-      totalBytes: payload.length,
+      blob_name:  blobName,   // FIX: snake_case, không phải blobName
+      part_size:  partSize,   // FIX: thêm field này, không phải nan
+      total_size: totalSize,  // FIX: snake_case, không phải totalBytes
+      // rawAccount đã bỏ — server không cần, address trong URL/auth
     }),
     signal: AbortSignal.timeout(15_000),
   });
@@ -288,7 +284,7 @@ async function handleUploadManual(
   steps.push(`uploadId=${uploadId}`);
   if (!uploadId) throw new Error(`[step1-init] No uploadId in response: ${JSON.stringify(startBody).slice(0, 100)}`);
 
-  // Step 2: Upload single part
+  // Step 2: Upload single part (index 0)
   const partUrl = `${SHELBY_RPC_BASE}/v1/multipart-uploads/${uploadId}/parts/0`;
   steps.push(`PUT ${partUrl}`);
   const partRes = await fetch(partUrl, {
@@ -355,10 +351,17 @@ async function handleDownload(req: Request, env: Env): Promise<Response> {
   }
 }
 
+/**
+ * handleTxTime — FIX v2.1:
+ * Thêm fallback sang manual upload khi SDK throw "Invalid URL".
+ * txtime chỉ cần đo latency upload nhỏ (512B) → dùng manual-rpc là đủ.
+ */
 async function handleTxTime(env: Env): Promise<Response> {
   const blobName = `bench/tx/${Date.now()}-${Math.floor(Math.random() * 0xffff).toString(16)}`;
   const payload  = Buffer.alloc(512, 42);
   const t0       = performance.now();
+
+  // Strategy 1: SDK upload (full on-chain tx)
   try {
     const txResult = await (getClient(env).upload({
       signer:           getAccount(env),
@@ -367,10 +370,43 @@ async function handleTxTime(env: Env): Promise<Response> {
       expirationMicros: (Date.now() + 3_600_000) * 1000,
     }) as any);
     const elapsed = performance.now() - t0;
-    return Response.json({ submitTime: elapsed, confirmTime: elapsed, txHash: txResult?.transaction?.hash ?? null }, { headers: CORS });
-  } catch (e: any) {
     return Response.json({
-      error:   e.message?.slice(0, 200),
+      submitTime:  elapsed,
+      confirmTime: elapsed,
+      txHash: txResult?.transaction?.hash ?? null,
+      strategy: "sdk",
+    }, { headers: CORS });
+  } catch (e: any) {
+    const msg  = e.message ?? String(e);
+    const isUrl = msg.includes("Invalid URL") || msg.includes("Failed to parse URL");
+
+    // Strategy 2: fallback manual (đo thời gian RPC upload thuần, không có tx)
+    // txHash = null nhưng vẫn cho số latency hữu ích
+    if (isUrl) {
+      try {
+        const r = await handleUploadManual(env, payload, blobName, 512, t0);
+        const data = await r.json() as any;
+        const elapsed = performance.now() - t0;
+        return Response.json({
+          submitTime:  data.elapsed ?? elapsed,
+          confirmTime: data.elapsed ?? elapsed,
+          txHash: null,
+          strategy: "manual-rpc",
+          note: "SDK URL error — measured RPC upload time only (no on-chain tx)",
+        }, { headers: CORS });
+      } catch (e2: any) {
+        return Response.json({
+          error:   e2.message?.slice(0, 200),
+          sdkError: msg.slice(0, 200),
+          stack:   e.stack?.slice(0, 500),
+          rpcBase: SHELBY_RPC_BASE,
+        }, { status: 500, headers: CORS });
+      }
+    }
+
+    // Lỗi khác (balance, rate limit, ...)
+    return Response.json({
+      error:   msg.slice(0, 200),
       stack:   e.stack?.slice(0, 500),
       rpcBase: SHELBY_RPC_BASE,
     }, { status: 500, headers: CORS });
@@ -497,7 +533,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (url.pathname === "/health")   return Response.json({ ok: true, worker: "shelby-benchmark", version: "2.0.0", ts: new Date().toISOString() }, { headers: CORS });
+    if (url.pathname === "/health")   return Response.json({ ok: true, worker: "shelby-benchmark", version: "2.1.0", ts: new Date().toISOString() }, { headers: CORS });
     if (url.pathname === "/debug"     && request.method === "GET")  return handleDebug(env);
     if (url.pathname === "/diagnose"  && request.method === "GET")  return handleDiagnose(env);
     if (url.pathname === "/balance"   && request.method === "GET")  return handleBalance(env);

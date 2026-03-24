@@ -51,21 +51,26 @@ function getAccount(env: Env): Ed25519Account {
 
 function getClient(env: Env): ShelbyNodeClient {
   if (_client) return _client;
+  
   _client = new ShelbyNodeClient({
-    network: Network.SHELBYNET,
+    // Vẫn giữ shelbynet cho ShelbyClient để nó biết cách routing
+    network: "shelbynet" as any, 
     rpc: {
       baseUrl: SHELBY_RPC_BASE,
-      ...(env.SHELBY_API_KEY ? { apiKey: env.SHELBY_API_KEY } : {}),
     },
     indexer: {
       baseUrl: SHELBY_INDEXER,
     },
     aptos: {
-      network:  Network.SHELBYNET,
+      // ĐIỂM QUYẾT ĐỊNH Ở ĐÂY: Bắt buộc dùng Network.CUSTOM
+      // Điều này ngăn Aptos SDK trả về undefined và gây lỗi Invalid URL
+      network: Network.CUSTOM, 
       fullnode: SHELBY_NODE,
+      indexer: SHELBY_INDEXER,
     } as any,
     ...(env.SHELBY_API_KEY ? { apiKey: env.SHELBY_API_KEY } : {}),
   });
+  
   return _client;
 }
 
@@ -166,8 +171,8 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
   const blobName = uniqueBlobName(bytes);
   const t0       = performance.now();
 
-  // Strategy 1: SDK client.upload()
   try {
+    // Gọi SDK: Tự động mã hóa, đăng ký On-chain và Upload RPC
     const result = await (getClient(env).upload({
       signer:           getAccount(env),
       blobData:         payload,
@@ -186,40 +191,15 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
   } catch (e: any) {
     const msg   = e.message ?? String(e);
     const stack = e.stack ?? "";
-    const isUrl = msg.includes("Invalid URL") || msg.includes("Failed to parse URL");
-
-    // Strategy 2: fallback manual multipart
-    if (isUrl) {
-      try {
-        return await handleUploadManual(env, payload, blobName, bytes, t0);
-      } catch (e2: any) {
-        return Response.json({
-          error:    e2.message?.slice(0, 300),
-          sdkError: msg.slice(0, 300),
-          sdkStack: stack.slice(0, 800),
-          code:     "MANUAL_UPLOAD_FAILED",
-          elapsed:  performance.now() - t0,
-          rpcBase:  SHELBY_RPC_BASE,
-          strategy: "manual-failed",
-        }, { status: 500, headers: CORS });
-      }
-    }
-
+    
     const code = msg.includes("INSUFFICIENT") || msg.includes("balance") ? "INSUFFICIENT_BALANCE"
                : msg.includes("rate") || msg.includes("429")              ? "RATE_LIMITED"
-               : msg.includes("erasure") || msg.includes("WASM")          ? "WASM_ERROR"
                : "UPLOAD_FAILED";
 
     return Response.json({
       error: msg.slice(0, 300), code,
-      stack: stack.slice(0, 800),
+      stack: stack, // Trả về full stack để debug nếu còn lỗi
       elapsed: performance.now() - t0,
-      rpcBase:  SHELBY_RPC_BASE,
-      clientBaseUrl: (getClient(env) as any)?.baseUrl,
-      hint: code === "RATE_LIMITED"         ? "Set SHELBY_API_KEY from geomi.dev in Worker secrets"
-          : code === "INSUFFICIENT_BALANCE" ? "Fund wallet via faucet.shelbynet.shelby.xyz"
-          : code === "WASM_ERROR"           ? "SDK WASM error — redeploy worker với nodejs_compat flag"
-          : undefined,
     }, { status: 500, headers: CORS });
   }
 }
@@ -237,86 +217,7 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
  *   → server báo "blobName: Required, partSize: Expected number received nan"
  *   Nguyên nhân: server dùng snake_case + tên fields khác
  */
-async function handleUploadManual(
-  env: Env,
-  payload: Buffer,
-  blobName: string,
-  bytes: number,
-  t0: number
-): Promise<Response> {
-  const address = env.SHELBY_WALLET_ADDRESS;
-  function makeHeaders(contentType: string): Record<string, string> {
-    const h: Record<string, string> = { "Content-Type": contentType };
-    if (env.SHELBY_API_KEY) h["Authorization"] = `Bearer ${env.SHELBY_API_KEY}`;
-    return h;
-  }
 
-  const steps: string[] =[];
-
-  // Step 1: Initiate multipart upload
-  const startUrl = `${SHELBY_RPC_BASE}/v1/multipart-uploads`;
-  steps.push(`POST ${startUrl}`);
-  const startRes = await fetch(startUrl, {
-    method: "POST",
-    headers: makeHeaders("application/json"),
-    body: JSON.stringify({
-      account: address,         // SỬA: rawAccount -> account
-      blobName: blobName,
-      partSize: payload.length, // SỬA: totalBytes -> partSize
-    }),
-    signal: AbortSignal.timeout(15_000),
-  });
-
-  if (!startRes.ok) {
-    const errText = await startRes.text().catch(() => "");
-    throw new Error(`[step1-init] HTTP ${startRes.status}: ${errText.slice(0, 200)}`);
-  }
-
-  const startBody = await startRes.json() as any;
-  const uploadId  = startBody?.uploadId ?? startBody?.upload_id;
-  steps.push(`uploadId=${uploadId}`);
-  if (!uploadId) throw new Error(`[step1-init] No uploadId in response: ${JSON.stringify(startBody).slice(0, 100)}`);
-
-  // Step 2: Upload single part
-  const partUrl = `${SHELBY_RPC_BASE}/v1/multipart-uploads/${uploadId}/parts/0`;
-  steps.push(`PUT ${partUrl}`);
-  const partRes = await fetch(partUrl, {
-    method: "PUT",
-    headers: makeHeaders("application/octet-stream"),
-    body: payload,
-    signal: AbortSignal.timeout(30_000),
-  });
-
-  if (!partRes.ok) {
-    const errText = await partRes.text().catch(() => "");
-    throw new Error(`[step2-part] HTTP ${partRes.status}: ${errText.slice(0, 200)}`);
-  }
-
-  // Step 3: Complete upload
-  const completeUrl = `${SHELBY_RPC_BASE}/v1/multipart-uploads/${uploadId}/complete`;
-  steps.push(`POST ${completeUrl}`);
-  const completeRes = await fetch(completeUrl, {
-    method: "POST",
-    headers: makeHeaders("application/json"),
-    body: JSON.stringify({ parts: [{ partIdx: 0 }] }),
-    signal: AbortSignal.timeout(15_000),
-  });
-
-  if (!completeRes.ok) {
-    const errText = await completeRes.text().catch(() => "");
-    throw new Error(`[step3-complete] HTTP ${completeRes.status}: ${errText.slice(0, 200)}`);
-  }
-
-  const elapsed = performance.now() - t0;
-  return Response.json({
-    bytes, elapsed,
-    speedKbs: (bytes / 1024) / (elapsed / 1000),
-    blobName, txHash: null, status: "uploaded",
-    strategy: "manual-rpc",
-    steps,
-    note: "SDK URL resolution bypassed — used direct RPC HTTP",
-  }, { headers: CORS });
-}
 
 async function handleDownload(req: Request, env: Env): Promise<Response> {
   const { blobName } = await req.json().catch(() => ({})) as any;
@@ -351,41 +252,24 @@ async function handleDownload(req: Request, env: Env): Promise<Response> {
  */
 async function handleTxTime(env: Env): Promise<Response> {
   const blobName = `bench/tx/${Date.now()}-${Math.floor(Math.random() * 0xffff).toString(16)}`;
-  const bytes    = 512;
-  const payload  = Buffer.alloc(bytes, 42); // Dữ liệu thật để test tốc độ
+  const payload  = Buffer.alloc(512, 42);
   const t0       = performance.now();
   
   try {
-    // Thử dùng SDK (Tạo on-chain transaction thật)
     const txResult = await (getClient(env).upload({
       signer:           getAccount(env),
       blobData:         payload,
       blobName,
       expirationMicros: (Date.now() + 3_600_000) * 1000,
     }) as any);
+    
     const elapsed = performance.now() - t0;
     return Response.json({ submitTime: elapsed, confirmTime: elapsed, txHash: txResult?.transaction?.hash ?? null }, { headers: CORS });
   } catch (e: any) {
-    // Nếu SDK lỗi (do môi trường Worker), Fallback sang gọi RPC thật
-    try {
-      const res = await handleUploadManual(env, payload, blobName, bytes, t0);
-      
-      // SỬA LỖI Ở ĐÂY: Thêm `as any` để TypeScript bỏ qua check strict type
-      const data = await res.json() as any; 
-      
-      return Response.json({ 
-        submitTime: data.elapsed, 
-        confirmTime: data.elapsed, 
-        txHash: null, 
-        note: "Manual RPC fallback" 
-      }, { headers: CORS });
-    } catch (e2: any) {
-      return Response.json({
-        error:   e2.message?.slice(0, 200),
-        stack:   e2.stack?.slice(0, 500),
-        rpcBase: SHELBY_RPC_BASE,
-      }, { status: 500, headers: CORS });
-    }
+    return Response.json({
+      error:   e.message?.slice(0, 200),
+      stack:   e.stack?.slice(0, 500),
+    }, { status: 500, headers: CORS });
   }
 }
 

@@ -198,7 +198,8 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
 
   } catch (e: any) {
     const msg   = e.message ?? String(e);
-    const isUrl = msg.includes("Invalid URL") || msg.includes("URL") || msg.includes("url");
+    const stack = e.stack ?? "";
+    const isUrl = msg.includes("Invalid URL") || msg.includes("Failed to parse URL");
 
     // Strategy 2: nếu lỗi URL, thử manual multipart upload trực tiếp
     if (isUrl) {
@@ -208,6 +209,8 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
         return Response.json({
           error:    e2.message?.slice(0, 300),
           sdkError: msg.slice(0, 300),
+          // Log stack để biết URL nào bị invalid
+          sdkStack: stack.slice(0, 800),
           code:     "MANUAL_UPLOAD_FAILED",
           elapsed:  performance.now() - t0,
           rpcBase:  SHELBY_RPC_BASE,
@@ -223,11 +226,12 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
 
     return Response.json({
       error: msg.slice(0, 300), code,
+      // Full stack để debug
+      stack: stack.slice(0, 800),
       elapsed: performance.now() - t0,
-      // Log URLs để debug
       rpcBase:  SHELBY_RPC_BASE,
       clientBaseUrl: (getClient(env) as any)?.baseUrl,
-      hint: code === "RATE_LIMITED"       ? "Set SHELBY_API_KEY from geomi.dev in Worker secrets"
+      hint: code === "RATE_LIMITED"         ? "Set SHELBY_API_KEY from geomi.dev in Worker secrets"
           : code === "INSUFFICIENT_BALANCE" ? "Fund wallet via faucet.shelbynet.shelby.xyz"
           : code === "WASM_ERROR"           ? "SDK WASM error — redeploy worker với nodejs_compat flag"
           : undefined,
@@ -238,6 +242,8 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
 /**
  * Manual upload: bypass SDK URL resolution hoàn toàn.
  * Gọi trực tiếp Shelby RPC multipart upload API.
+ * Note: Không có on-chain registration → chỉ test RPC connectivity.
+ * Nếu RPC cũng fail → lỗi thực sự là ở đây.
  */
 async function handleUploadManual(
   env: Env,
@@ -256,8 +262,11 @@ async function handleUploadManual(
     return h;
   }
 
+  const steps: string[] = [];
+
   // Step 1: Initiate multipart upload
   const startUrl = `${SHELBY_RPC_BASE}/v1/multipart-uploads`;
+  steps.push(`POST ${startUrl}`);
   const startRes = await fetch(startUrl, {
     method: "POST",
     headers: makeHeaders("application/json"),
@@ -271,14 +280,17 @@ async function handleUploadManual(
 
   if (!startRes.ok) {
     const errText = await startRes.text().catch(() => "");
-    throw new Error(`Multipart init failed HTTP ${startRes.status}: ${errText.slice(0, 200)}`);
+    throw new Error(`[step1-init] HTTP ${startRes.status}: ${errText.slice(0, 200)}`);
   }
 
-  const { uploadId } = await startRes.json() as any;
-  if (!uploadId) throw new Error("No uploadId returned from multipart init");
+  const startBody = await startRes.json() as any;
+  const uploadId  = startBody?.uploadId ?? startBody?.upload_id;
+  steps.push(`uploadId=${uploadId}`);
+  if (!uploadId) throw new Error(`[step1-init] No uploadId in response: ${JSON.stringify(startBody).slice(0, 100)}`);
 
-  // Step 2: Upload single part (payload < 5MB, so 1 part is enough)
+  // Step 2: Upload single part
   const partUrl = `${SHELBY_RPC_BASE}/v1/multipart-uploads/${uploadId}/parts/0`;
+  steps.push(`PUT ${partUrl}`);
   const partRes = await fetch(partUrl, {
     method: "PUT",
     headers: makeHeaders("application/octet-stream"),
@@ -288,11 +300,12 @@ async function handleUploadManual(
 
   if (!partRes.ok) {
     const errText = await partRes.text().catch(() => "");
-    throw new Error(`Part upload failed HTTP ${partRes.status}: ${errText.slice(0, 200)}`);
+    throw new Error(`[step2-part] HTTP ${partRes.status}: ${errText.slice(0, 200)}`);
   }
 
   // Step 3: Complete upload
   const completeUrl = `${SHELBY_RPC_BASE}/v1/multipart-uploads/${uploadId}/complete`;
+  steps.push(`POST ${completeUrl}`);
   const completeRes = await fetch(completeUrl, {
     method: "POST",
     headers: makeHeaders("application/json"),
@@ -302,7 +315,7 @@ async function handleUploadManual(
 
   if (!completeRes.ok) {
     const errText = await completeRes.text().catch(() => "");
-    throw new Error(`Complete failed HTTP ${completeRes.status}: ${errText.slice(0, 200)}`);
+    throw new Error(`[step3-complete] HTTP ${completeRes.status}: ${errText.slice(0, 200)}`);
   }
 
   const elapsed = performance.now() - t0;
@@ -311,6 +324,7 @@ async function handleUploadManual(
     speedKbs: (bytes / 1024) / (elapsed / 1000),
     blobName, txHash: null, status: "uploaded",
     strategy: "manual-rpc",
+    steps,
     note: "SDK URL resolution bypassed — used direct RPC HTTP",
   }, { headers: CORS });
 }

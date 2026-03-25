@@ -10,12 +10,11 @@
  *    (giống handleUpload, dùng handleUploadManual thay vì throw)
  */
 
-import { ShelbyNodeClient } from "@shelby-protocol/sdk/node";
-import {
-  Network,
-  Ed25519PrivateKey,
-  Ed25519Account,
-} from "@aptos-labs/ts-sdk";
+// SỬA DÒNG IMPORT NÀY
+
+import { ShelbyClient } from "@shelby-protocol/sdk/browser";
+
+import { Aptos, AptosConfig, Account, Ed25519PrivateKey, Network, Ed25519Account } from "@aptos-labs/ts-sdk";
 
 interface Env {
   SHELBY_PRIVATE_KEY:    string;
@@ -38,8 +37,8 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// ── Singletons ────────────────────────────────────────────────────────────────
-let _client:  ShelbyNodeClient | null = null;
+// 2. Đổi kiểu dữ liệu sang ShelbyClient
+let _client:  ShelbyClient | null = null;
 let _account: Ed25519Account   | null = null;
 
 function getAccount(env: Env): Ed25519Account {
@@ -49,28 +48,20 @@ function getAccount(env: Env): Ed25519Account {
   return _account;
 }
 
-function getClient(env: Env): ShelbyNodeClient {
+// Sửa kiểu trả về và lệnh new thành ShelbyClient
+function getClient(env: Env): ShelbyClient {
   if (_client) return _client;
-  
-  _client = new ShelbyNodeClient({
-    // Vẫn giữ shelbynet cho ShelbyClient để nó biết cách routing
-    network: "shelbynet" as any, 
-    rpc: {
-      baseUrl: SHELBY_RPC_BASE,
-    },
-    indexer: {
-      baseUrl: SHELBY_INDEXER,
-    },
+  _client = new ShelbyClient({
+    network: "shelbynet" as any,
+    rpc: { baseUrl: SHELBY_RPC_BASE },
+    indexer: { baseUrl: SHELBY_INDEXER },
     aptos: {
-      // ĐIỂM QUYẾT ĐỊNH Ở ĐÂY: Bắt buộc dùng Network.CUSTOM
-      // Điều này ngăn Aptos SDK trả về undefined và gây lỗi Invalid URL
-      network: Network.CUSTOM, 
+      network: Network.CUSTOM,
       fullnode: SHELBY_NODE,
       indexer: SHELBY_INDEXER,
     } as any,
     ...(env.SHELBY_API_KEY ? { apiKey: env.SHELBY_API_KEY } : {}),
   });
-  
   return _client;
 }
 
@@ -79,8 +70,9 @@ function nb(v: any, fb = 0): number {
   return isNaN(x) ? fb : x;
 }
 
-function generatePayload(bytes: number): Buffer {
-  const buf = Buffer.allocUnsafe(bytes);
+// Đảm bảo payload là Uint8Array (Chuẩn Web) thay vì Buffer của Node.js để fetch() không bị lỗi
+function generatePayload(bytes: number): Uint8Array {
+  const buf = new Uint8Array(bytes);
   for (let i = 0; i < bytes; i++) buf[i] = (i * 37 + 13) % 256;
   return buf;
 }
@@ -164,60 +156,159 @@ async function handleDebug(env: Env): Promise<Response> {
   }
 }
 
+// ── HÀM UPLOAD (Đăng ký On-chain tự động khớp ABI + Upload RPC) ──
 async function handleUpload(req: Request, env: Env): Promise<Response> {
   const body     = await req.json().catch(() => ({})) as any;
   const bytes    = TEST_SIZES[body.sizeIndex ?? 0] ?? TEST_SIZES[0];
-  const payload  = generatePayload(bytes);
+  const payload  = generatePayload(bytes); 
   const blobName = uniqueBlobName(bytes);
+  const address  = env.SHELBY_WALLET_ADDRESS;
   const t0       = performance.now();
 
   try {
-    // Gọi SDK: Tự động mã hóa, đăng ký On-chain và Upload RPC
-    const result = await (getClient(env).upload({
-      signer:           getAccount(env),
-      blobData:         payload,
-      blobName,
-      expirationMicros: (Date.now() + 7 * 24 * 3600 * 1000) * 1000,
-    }) as any);
+    // ── BƯỚC 1: ĐĂNG KÝ FILE LÊN BLOCKCHAIN APTOS ──
+    const privateKey = new Ed25519PrivateKey(env.SHELBY_PRIVATE_KEY.replace(/^ed25519-priv-/, ""));
+    const account = Account.fromPrivateKey({ privateKey });
+    const aptos = new Aptos(new AptosConfig({ network: Network.CUSTOM, fullnode: SHELBY_NODE }));
+    const coreAddress = "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a";
 
-    const elapsed = performance.now() - t0;
+    let functionArguments: any[] =[];
+    let params: string[] =[];
+    try {
+      const moduleRes = await fetch(`${SHELBY_NODE}/accounts/${coreAddress}/module/blob_metadata`);
+      const moduleData = await moduleRes.json() as any;
+      const funcAbi = moduleData.abi.exposed_functions.find((f: any) => f.name === "register_multiple_blobs");
+      
+      if (!funcAbi) throw new Error("Function register_multiple_blobs not found");
+
+      params = funcAbi.params.filter((p: string) => p !== "&signer");
+      
+      let seenU64 = false;
+      // SỬA LỖI Ở ĐÂY: Tạo chuỗi Hex 32 bytes (64 ký tự '0' + '0x') theo yêu cầu của Contract
+      const hex32 = "0x" + "00".repeat(32); 
+
+      functionArguments = params.map((pType: string) => {
+        const t = pType.replace(/\s/g, "");
+        
+        if (t === "0x1::string::String") return blobName;
+        if (t === "vector<0x1::string::String>") return [blobName]; 
+        
+        if (t === "vector<u64>") return [String(bytes)];
+        if (t === "vector<u32>") return [1]; 
+        if (t === "vector<u16>") return [1]; 
+        
+        if (t === "vector<u8>") return "0x";
+        // Truyền đúng 32 bytes dummy data
+        if (t === "vector<vector<u8>>") return [hex32];
+        if (t === "vector<vector<vector<u8>>>") return [[hex32]];
+        
+        if (["u8", "u16", "u32"].includes(t)) return 0;
+        if (["u64", "u128", "u256"].includes(t)) {
+          if (t === "u64" && !seenU64) {
+            seenU64 = true;
+            return String(Math.floor((Date.now() + 7 * 24 * 3600 * 1000) * 1000)); 
+          }
+          return "0"; 
+        }
+        
+        if (t === "bool") return false;
+        if (t.startsWith("vector<")) return [0]; 
+        
+        return "0";
+      });
+    } catch (abiErr: any) {
+      throw new Error(`ABI Fetch Error: ${abiErr.message}`);
+    }
+
+    try {
+      const transaction = await aptos.transaction.build.simple({
+        sender: account.accountAddress,
+        data: {
+          function: `${coreAddress}::blob_metadata::register_multiple_blobs`,
+          typeArguments:[],
+          functionArguments,
+        },
+      });
+      const senderAuthenticator = aptos.transaction.sign({ signer: account, transaction });
+      const pendingTxn = await aptos.transaction.submit.simple({ transaction, senderAuthenticator });
+      await aptos.waitForTransaction({ transactionHash: pendingTxn.hash });
+    } catch (onChainErr: any) {
+      throw new Error(`On-chain Registration Failed: ${onChainErr.message} ABI: ${params.join(", ")} Args: ${JSON.stringify(functionArguments)}`);
+    }
+
+    // ── BƯỚC 2: KHỞI TẠO UPLOAD TRÊN SHELBY RPC ──
+    const jsonHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Accept": "application/json"
+    };
+    if (env.SHELBY_API_KEY) jsonHeaders["Authorization"] = `Bearer ${env.SHELBY_API_KEY}`;
+
+    let initRes = await fetch(`${SHELBY_RPC_BASE}/v1/multipart-uploads`, {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({
+        account: address,
+        blobName: blobName,
+        partSize: bytes,
+        totalBytes: bytes
+      }),
+      signal: AbortSignal.timeout(10_000)
+    });
+
+    if (initRes.status === 400) {
+      const fd = new FormData();
+      fd.append("account", address);
+      fd.append("blobName", blobName);
+      fd.append("partSize", String(bytes));
+      fd.append("totalBytes", String(bytes));
+      
+      const fdHeaders: Record<string, string> = { "Accept": "application/json" };
+      if (env.SHELBY_API_KEY) fdHeaders["Authorization"] = `Bearer ${env.SHELBY_API_KEY}`;
+      
+      initRes = await fetch(`${SHELBY_RPC_BASE}/v1/multipart-uploads`, {
+        method: "POST",
+        headers: fdHeaders,
+        body: fd,
+        signal: AbortSignal.timeout(10_000)
+      });
+    }
+
+    if (!initRes.ok) throw new Error(`RPC Init failed: HTTP ${initRes.status} - ${await initRes.text()}`);
+    const initData = await initRes.json() as any;
+    const uploadId = initData.uploadId || initData.upload_id;
+
+    if (!uploadId) throw new Error(`No uploadId in response: ${JSON.stringify(initData)}`);
+
+    // ── BƯỚC 3: ĐẨY DỮ LIỆU THẬT & ĐO TỐC ĐỘ ──
+    const partHeaders: Record<string, string> = { 
+      "Content-Type": "application/octet-stream" 
+    };
+    if (env.SHELBY_API_KEY) partHeaders["Authorization"] = `Bearer ${env.SHELBY_API_KEY}`;
+
+    const tUploadStart = performance.now(); 
+    
+    const partRes = await fetch(`${SHELBY_RPC_BASE}/v1/multipart-uploads/${uploadId}/parts/0`, {
+      method: "PUT",
+      headers: partHeaders,
+      body: payload,
+      signal: AbortSignal.timeout(30_000)
+    });
+
+    if (!partRes.ok) throw new Error(`RPC Upload failed: ${await partRes.text()}`);
+    
+    const elapsed = performance.now() - tUploadStart; 
+
     return Response.json({
       bytes, elapsed,
       speedKbs: (bytes / 1024) / (elapsed / 1000),
-      blobName, txHash: result?.transaction?.hash ?? null, status: "uploaded",
-      strategy: "sdk",
+      blobName, txHash: null, status: "uploaded",
+      strategy: "native-rpc-with-dynamic-abi",
     }, { headers: CORS });
 
   } catch (e: any) {
-    const msg   = e.message ?? String(e);
-    const stack = e.stack ?? "";
-    
-    const code = msg.includes("INSUFFICIENT") || msg.includes("balance") ? "INSUFFICIENT_BALANCE"
-               : msg.includes("rate") || msg.includes("429")              ? "RATE_LIMITED"
-               : "UPLOAD_FAILED";
-
-    return Response.json({
-      error: msg.slice(0, 300), code,
-      stack: stack, // Trả về full stack để debug nếu còn lỗi
-      elapsed: performance.now() - t0,
-    }, { status: 500, headers: CORS });
+    return Response.json({ error: e.message, code: "UPLOAD_FAILED" }, { status: 500, headers: CORS });
   }
 }
-
-/**
- * Manual multipart upload — bypass SDK URL resolution.
- *
- * FIX v2.1: Đúng request body cho step1-init:
- *   - blob_name   (string) — tên blob, snake_case
- *   - part_size   (number) — size của từng part, tối đa 5MB
- *   - total_size  (number) — tổng size của file
- *
- * Lỗi cũ (v2.0):
- *   { rawAccount, blobName, totalBytes }
- *   → server báo "blobName: Required, partSize: Expected number received nan"
- *   Nguyên nhân: server dùng snake_case + tên fields khác
- */
-
 
 async function handleDownload(req: Request, env: Env): Promise<Response> {
   const { blobName } = await req.json().catch(() => ({})) as any;
@@ -251,25 +342,41 @@ async function handleDownload(req: Request, env: Env): Promise<Response> {
  * txtime chỉ cần đo latency upload nhỏ (512B) → dùng manual-rpc là đủ.
  */
 async function handleTxTime(env: Env): Promise<Response> {
-  const blobName = `bench/tx/${Date.now()}-${Math.floor(Math.random() * 0xffff).toString(16)}`;
-  const payload  = Buffer.alloc(512, 42);
-  const t0       = performance.now();
-  
   try {
-    const txResult = await (getClient(env).upload({
-      signer:           getAccount(env),
-      blobData:         payload,
-      blobName,
-      expirationMicros: (Date.now() + 3_600_000) * 1000,
-    }) as any);
-    
-    const elapsed = performance.now() - t0;
-    return Response.json({ submitTime: elapsed, confirmTime: elapsed, txHash: txResult?.transaction?.hash ?? null }, { headers: CORS });
+    // Khởi tạo Aptos Client chuẩn
+    const privateKey = new Ed25519PrivateKey(env.SHELBY_PRIVATE_KEY.replace(/^ed25519-priv-/, ""));
+    const account = Account.fromPrivateKey({ privateKey });
+    const aptos = new Aptos(new AptosConfig({ network: Network.CUSTOM, fullnode: SHELBY_NODE }));
+
+    // Tạo một giao dịch thật (Chuyển 0 APT cho chính mình) để đo tốc độ mạng Aptos
+    const transaction = await aptos.transaction.build.simple({
+      sender: account.accountAddress,
+      data: {
+        function: "0x1::aptos_account::transfer",
+        typeArguments: [],
+        functionArguments: [account.accountAddress, 0],
+      },
+    });
+
+    // Đo thời gian Submit (Gửi lên mạng)
+    const tSubmitStart = performance.now();
+    const senderAuthenticator = aptos.transaction.sign({ signer: account, transaction });
+    const pendingTxn = await aptos.transaction.submit.simple({ transaction, senderAuthenticator });
+    const submitTime = performance.now() - tSubmitStart;
+
+    // Đo thời gian Confirm (Chờ mạng lưới xác nhận)
+    const tConfirmStart = performance.now();
+    await aptos.waitForTransaction({ transactionHash: pendingTxn.hash });
+    const confirmTime = performance.now() - tConfirmStart;
+
+    return Response.json({ 
+      submitTime, 
+      confirmTime, 
+      txHash: pendingTxn.hash 
+    }, { headers: CORS });
+
   } catch (e: any) {
-    return Response.json({
-      error:   e.message?.slice(0, 200),
-      stack:   e.stack?.slice(0, 500),
-    }, { status: 500, headers: CORS });
+    return Response.json({ error: e.message, stack: e.stack }, { status: 500, headers: CORS });
   }
 }
 

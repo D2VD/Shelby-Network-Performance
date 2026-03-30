@@ -44,3 +44,6 @@ bucket_name = "shelby-analytics-snapshots"
 #   SHELBY_API_KEY         = "<testnet geomi key>"
 #   SYNC_SECRET            = "<random 32-char string để bảo vệ /sync>"
 #   SHELBY_NODE_URL        = "https://api.shelbynet.shelby.xyz/v1"
+[[rules]]
+globs = ["**/*.wasm"]
+type = "CompiledWasm"

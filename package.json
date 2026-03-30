@@ -20,6 +20,7 @@
   "dependencies": {
     "@aptos-labs/ts-sdk": "^5.2.1",
     "@shelby-protocol/sdk": "^0.2.4",
+    "globe.gl": "^2.45.1",
     "got": "^14.4.6",
     "next": "^15.2.3",
     "react": "^19",

@@ -1,685 +1,305 @@
 "use client";
-// components/globe-engine.tsx — v3.0 (Phase 4)
-// ═══════════════════════════════════════════════════════════════
-// Dot-matrix Globe + Arc FX System
-//
-// Layer stack (bottom → top):
-//   0. Pitch-black space + star field
-//   1. Globe sphere (radial gradient + rim glow)
-//   2. Grid lines (lat/lon, neon dim)
-//   3. Dot-matrix continents (edge-fade opacity)
-//   4. GHOSTING TRAIL arcs  ← NEW Phase 4
-//   5. SYNC arcs (Nodes↔Hubs, thick, slow, cyan/purple)
-//   6. TX sparks (User→Node, thin, fast, random)
-//   7. SP node glow (double-render)
-//   8. Sovereignty layer (gold, always on top)
-//   9. Scanline overlay (CSS)
-// ═══════════════════════════════════════════════════════════════
+/**
+ * components/globe-engine.tsx — v4.1 (globe.gl via CDN)
+ *
+ * Load globe.gl từ CDN script tag — không cần npm install,
+ * tránh Next.js bundle issues với Three.js/WASM.
+ * Layers:
+ *   1. SP nodes       — glowing points tại geo-IP của từng provider
+ *   2. PG replication — animated dashed arcs, erasure 10+6 cross-zone
+ *   3. Upload arcs    — client origin → SP (simulated từ global hubs)
+ *   4. Capacity rings — ring size = capacityTiB
+ *   5. Sovereignty    — Hoàng Sa + Trường Sa gold HTML markers
+ */
 
-import { useEffect, useRef, useState, useMemo, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { StorageProvider } from "@/lib/types";
 
-// ── Types ──────────────────────────────────────────────────────────────────────
 interface GlobeEngineProps {
-  providers: StorageProvider[];
-  network: "shelbynet" | "testnet";
-  accentColor: string;
+  providers:        StorageProvider[];
+  network:          "shelbynet" | "testnet";
+  accentColor:      string;
   onProviderClick?: (provider: StorageProvider) => void;
 }
 
-interface GlobeDots {
-  type: string;
-  count: number;
-  points: [number, number][];
-}
-
-/** Một arc đang bay trên globe */
-interface Arc {
-  id:         number;
-  srcLon:     number;
-  srcLat:     number;
-  dstLon:     number;
-  dstLat:     number;
-  /** 0→1 tiến trình di chuyển */
-  progress:   number;
-  /** px/frame */
-  speed:      number;
-  /** neon màu dòng: "sync" | "tx" */
-  kind:       "sync" | "tx";
-  /** opacity khi sinh ra */
-  alpha:      number;
-  /** độ dày */
-  width:      number;
-  /** trail: mảng các điểm lịch sử [screenX, screenY, opacity] */
-  trail:      Array<[number, number, number]>;
-}
-
-// ── Constants ──────────────────────────────────────────────────────────────────
-const SOVEREIGNTY_POINTS = [
-  { id: "hoangsa",  label: "Hoàng Sa (VN)",  coords: [112.0,  16.5] as [number, number] },
-  { id: "truongsa", label: "Trường Sa (VN)", coords: [114.17, 10.0] as [number, number] },
+// Simulated upload origins — global internet exchange points
+const UPLOAD_ORIGINS = [
+  { lat: 51.51,  lng: -0.13   },  // London
+  { lat: 35.68,  lng: 139.65  },  // Tokyo
+  { lat: 37.77,  lng: -122.42 },  // San Francisco
+  { lat: 40.71,  lng: -74.01  },  // New York
+  { lat: -23.55, lng: -46.63  },  // São Paulo
+  { lat: 28.61,  lng: 77.21   },  // New Delhi
+  { lat: 52.52,  lng: 13.40   },  // Berlin
 ];
 
-// Hub coordinates — global internet exchange points (nơi arc "sync" xuất phát)
-const HUBS: [number, number][] = [
-  [2.35,   48.85],   // Paris
-  [-74.0,  40.71],   // New York
-  [139.69, 35.69],   // Tokyo
-  [103.82,  1.35],   // Singapore
-  [151.21, -33.87],  // Sydney
-  [-122.33, 37.78],  // San Francisco
-  [8.68,   50.11],   // Frankfurt
-  [28.95,  41.01],   // Istanbul
+const SOVEREIGNTY = [
+  { lat: 16.5,  lng: 112.0,  label: "Hoàng Sa (VN)"  },
+  { lat: 10.0,  lng: 114.17, label: "Trường Sa (VN)"  },
 ];
 
-const TRAIL_MAX_LEN = 28;  // điểm lịch sử tối đa cho ghosting effect
-const MAX_SYNC_ARCS = 8;
-const MAX_TX_ARCS   = 20;
+const GLOBE_CDN = "https://cdn.jsdelivr.net/npm/globe.gl@2.34.2/dist/globe.gl.min.js";
 
-let _arcId = 0;
+// ── Load script once globally ──────────────────────────────────────────────────
+let _loaded = false;
+let _loading = false;
+const _cbs: Array<() => void> = [];
 
-// ── Projection ─────────────────────────────────────────────────────────────────
-function lonLatToCanvas(
-  lon: number, lat: number,
-  viewLon: number, viewLat: number,
-  zoom: number, W: number, H: number
-): [number, number] | null {
-  const dLon     = ((lon - viewLon) * Math.PI) / 180;
-  const latR     = (lat  * Math.PI) / 180;
-  const viewLatR = (viewLat * Math.PI) / 180;
-  const cosC = Math.sin(viewLatR) * Math.sin(latR) +
-               Math.cos(viewLatR) * Math.cos(latR) * Math.cos(dLon);
-  if (cosC < 0.02) return null;
-  const scale = (W * zoom) / (2 * Math.PI);
-  return [
-    W / 2 + scale * dLon * Math.cos(latR),
-    H / 2 - scale * (latR - viewLatR),
-  ];
+function loadGlobe(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (_loaded) { resolve(); return; }
+    _cbs.push(resolve);
+    if (_loading) return;
+    _loading = true;
+    const s = document.createElement("script");
+    s.src = GLOBE_CDN;
+    s.async = true;
+    s.onload = () => {
+      _loaded = true;
+      _cbs.forEach(cb => cb());
+      _cbs.length = 0;
+    };
+    s.onerror = () => reject(new Error("Failed to load globe.gl from CDN"));
+    document.head.appendChild(s);
+  });
 }
 
-/** Interpolate geodesic point between two lon/lat at fraction t */
-function geodesicPoint(
-  lon0: number, lat0: number,
-  lon1: number, lat1: number,
-  t: number
-): [number, number] {
-  // Simple slerp on sphere
-  const toRad = Math.PI / 180;
-  const φ0 = lat0 * toRad, λ0 = lon0 * toRad;
-  const φ1 = lat1 * toRad, λ1 = lon1 * toRad;
-  const x0 = Math.cos(φ0) * Math.cos(λ0), y0 = Math.cos(φ0) * Math.sin(λ0), z0 = Math.sin(φ0);
-  const x1 = Math.cos(φ1) * Math.cos(λ1), y1 = Math.cos(φ1) * Math.sin(λ1), z1 = Math.sin(φ1);
-  const dot = Math.min(1, x0*x1 + y0*y1 + z0*z1);
-  const Ω   = Math.acos(dot);
-  let xi, yi, zi;
-  if (Ω < 0.001) {
-    xi = x0 + t * (x1 - x0);
-    yi = y0 + t * (y1 - y0);
-    zi = z0 + t * (z1 - z0);
-  } else {
-    const s = Math.sin(Ω);
-    const a = Math.sin((1 - t) * Ω) / s;
-    const b = Math.sin(t * Ω) / s;
-    xi = a*x0 + b*x1; yi = a*y0 + b*y1; zi = a*z0 + b*z1;
-  }
-  const lat = Math.atan2(zi, Math.sqrt(xi*xi + yi*yi)) / toRad;
-  const lon = Math.atan2(yi, xi) / toRad;
-  return [lon, lat];
-}
-
-// ── Hex → RGB ──────────────────────────────────────────────────────────────────
-function hexToRGB(hex: string): { r: number; g: number; b: number } {
+function hexToRgb(hex: string): [number, number, number] {
   const h = hex.replace("#", "");
-  return {
-    r: parseInt(h.substring(0, 2), 16),
-    g: parseInt(h.substring(2, 4), 16),
-    b: parseInt(h.substring(4, 6), 16),
-  };
+  return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
 }
 
-// ── Main Component ─────────────────────────────────────────────────────────────
-export default function GlobeEngine({
-  providers, network, accentColor, onProviderClick,
-}: GlobeEngineProps) {
-  const canvasRef  = useRef<HTMLCanvasElement>(null);
-  const animRef    = useRef<number>(0);
-  const isDragging = useRef(false);
-  const lastMouse  = useRef<{ x: number; y: number } | null>(null);
+// ── Component ──────────────────────────────────────────────────────────────────
+export default function GlobeEngine({ providers, network, accentColor, onProviderClick }: GlobeEngineProps) {
+  const mountRef = useRef<HTMLDivElement>(null);
+  const globeRef = useRef<any>(null);
+  const [status, setStatus] = useState<"loading"|"ready"|"error">("loading");
+  const [errorMsg, setErrorMsg] = useState("");
 
-  // Globe state
-  const [dots,      setDots]      = useState<[number, number][]>([]);
-  const [viewState, setViewState] = useState({ lon: 110, lat: 15, zoom: 1.0, autoRotate: true });
+  // ── Data builders ────────────────────────────────────────────────────────────
+  const getPoints = () => providers
+    .filter(p => p.geo?.lat != null && p.geo?.lng != null)
+    .map(p => ({
+      lat: p.geo!.lat, lng: p.geo!.lng,
+      size: p.health === "Healthy" ? 0.55 : 0.3,
+      color: p.health === "Healthy" ? accentColor : "#ef4444",
+      label: `<div style="font-family:monospace;font-size:11px;line-height:1.6;padding:8px 10px;background:rgba(7,11,16,.95);border:1px solid ${accentColor}55;border-radius:8px;min-width:160px">
+        <div style="color:${accentColor};font-weight:600;margin-bottom:2px">${p.addressShort}</div>
+        <div style="color:#d1d5db">${p.geo?.city ?? ""}${p.geo?.countryCode ? ", "+p.geo.countryCode : ""}</div>
+        <div style="color:${p.health==="Healthy"?"#34d399":"#f87171"}">${p.health}</div>
+        ${p.capacityTiB ? `<div style="color:#6b7280">${p.capacityTiB.toFixed(2)} TiB</div>` : ""}
+      </div>`,
+      provider: p,
+    }));
 
-  // Interaction state
-  const [hoveredSP,  setHoveredSP]  = useState<StorageProvider | null>(null);
-  const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number } | null>(null);
+  const getRings = () => providers
+    .filter(p => p.geo?.lat != null && p.geo?.lng != null && p.health === "Healthy")
+    .map(p => ({
+      lat: p.geo!.lat, lng: p.geo!.lng,
+      maxR: Math.min(2.5 + (p.capacityTiB ?? 1) * 0.35, 5.5),
+      propagationSpeed: 1.0 + Math.random() * 0.8,
+      repeatPeriod: 2500 + Math.floor(Math.random() * 1500),
+    }));
 
-  // Arc system state — mutable ref để tránh re-render loop
-  const arcsRef     = useRef<Arc[]>([]);
-  const frameRef    = useRef(0);     // frame counter cho spawn timing
-  const viewRef     = useRef(viewState);
+  const getArcs = () => {
+    const arcs: any[] = [];
+    const healthy = providers.filter(p => p.geo?.lat != null && p.geo?.lng != null && p.health === "Healthy");
+    if (healthy.length < 2) return arcs;
 
-  // Sync viewRef với viewState (để draw callback đọc được mới nhất)
-  useEffect(() => { viewRef.current = viewState; }, [viewState]);
-
-  // Parse accent color
-  const rgb = useMemo(() => hexToRGB(accentColor), [accentColor]);
-
-  // ── Load globe dots ──────────────────────────────────────────────────────────
-  useEffect(() => {
-    fetch("/geo/globe-dots.json")
-      .then(r => r.json() as Promise<GlobeDots>)
-      .then(d => setDots(d.points))
-      .catch(() => {
-        const fb: [number, number][] = [];
-        for (let lon = -170; lon < 180; lon += 8)
-          for (let lat = -80; lat < 80; lat += 8)
-            fb.push([lon + (Math.random()-.5)*6, lat + (Math.random()-.5)*6]);
-        setDots(fb);
-      });
-  }, []);
-
-  // ── Resize observer ──────────────────────────────────────────────────────────
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const obs = new ResizeObserver(entries => {
-      for (const e of entries) {
-        const { width, height } = e.contentRect;
-        canvas.width  = width  * window.devicePixelRatio;
-        canvas.height = height * window.devicePixelRatio;
-      }
+    // Group by AZ for PG replication arcs
+    const byZone = new Map<string, StorageProvider[]>();
+    healthy.forEach(p => {
+      const z = p.availabilityZone ?? "unknown";
+      if (!byZone.has(z)) byZone.set(z, []);
+      byZone.get(z)!.push(p);
     });
-    obs.observe(canvas.parentElement!);
-    return () => obs.disconnect();
-  }, []);
+    const zones = Array.from(byZone.values());
 
-  // ── Arc spawner ──────────────────────────────────────────────────────────────
-  const spawnArcs = useCallback(() => {
-    if (!providers.length) return;
-    const arcs = arcsRef.current;
-
-    // Spawn SYNC arc: Hub → random SP (thick, slow, trail 5-10s @ 30fps = 150-300 frames)
-    const syncCount = arcs.filter(a => a.kind === "sync").length;
-    if (syncCount < MAX_SYNC_ARCS) {
-      const hub = HUBS[Math.floor(Math.random() * HUBS.length)];
-      const sp  = providers[Math.floor(Math.random() * providers.length)];
-      if (sp.coordinates) {
+    // Cross-zone replication arcs (erasure coding 10+6)
+    for (let i = 0; i < zones.length; i++) {
+      for (let j = i + 1; j < zones.length; j++) {
+        const a = zones[i][0], b = zones[j][0];
         arcs.push({
-          id:       _arcId++,
-          srcLon:   hub[0], srcLat: hub[1],
-          dstLon:   sp.coordinates[0], dstLat: sp.coordinates[1],
-          progress: 0,
-          speed:    0.003 + Math.random() * 0.002,   // slow
-          kind:     "sync",
-          alpha:    0.7 + Math.random() * 0.3,
-          width:    1.8 + Math.random() * 0.8,
-          trail:    [],
+          startLat: a.geo!.lat, startLng: a.geo!.lng,
+          endLat:   b.geo!.lat, endLng:   b.geo!.lng,
+          color: [accentColor+"ee", accentColor+"11"],
+          stroke: 0.5, arcAlt: 0.15 + Math.random()*0.1,
+          dashAnimTime: 3500,
         });
       }
     }
 
-    // Spawn TX arc: random SP → another random SP (thin, fast)
-    const txCount = arcs.filter(a => a.kind === "tx").length;
-    if (txCount < MAX_TX_ARCS && providers.length >= 2) {
-      const idxA = Math.floor(Math.random() * providers.length);
-      let   idxB = Math.floor(Math.random() * providers.length);
-      if (idxB === idxA) idxB = (idxA + 1) % providers.length;
-      const spA = providers[idxA], spB = providers[idxB];
-      if (spA.coordinates && spB.coordinates) {
-        arcs.push({
-          id:       _arcId++,
-          srcLon:   spA.coordinates[0], srcLat: spA.coordinates[1],
-          dstLon:   spB.coordinates[0], dstLat: spB.coordinates[1],
-          progress: 0,
-          speed:    0.012 + Math.random() * 0.018,  // fast
-          kind:     "tx",
-          alpha:    0.4 + Math.random() * 0.4,
-          width:    0.7 + Math.random() * 0.5,
-          trail:    [],
-        });
-      }
-    }
+    // Upload arcs: origin → random SP
+    UPLOAD_ORIGINS.slice(0,6).forEach(origin => {
+      const sp = healthy[Math.floor(Math.random()*healthy.length)];
+      arcs.push({
+        startLat: origin.lat, startLng: origin.lng,
+        endLat:   sp.geo!.lat, endLng: sp.geo!.lng,
+        color: ["#ffffff33", accentColor+"ff"],
+        stroke: 0.35, arcAlt: 0.28 + Math.random()*0.18,
+        dashAnimTime: 1600,
+      });
+    });
 
-    // Prune dead arcs
-    arcsRef.current = arcs.filter(a => a.progress < 1.05);
-  }, [providers]);
+    return arcs;
+  };
 
-  // ── Main render + animation loop ─────────────────────────────────────────────
+  const getSovPoints = () => SOVEREIGNTY.map(s => ({ lat: s.lat, lng: s.lng, label: s.label }));
+
+  // ── Init globe ───────────────────────────────────────────────────────────────
   useEffect(() => {
-    const dotsSnap = dots; // capture stable ref
+    if (!mountRef.current) return;
+    let active = true;
 
-    const loop = (time: number) => {
-      animRef.current = requestAnimationFrame(loop);
+    (async () => {
+      try {
+        await loadGlobe();
+        if (!active || !mountRef.current) return;
 
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
+        const GlobeGL = (window as any).Globe;
+        if (typeof GlobeGL !== "function") throw new Error("Globe not found on window after CDN load");
 
-      const dpr  = window.devicePixelRatio;
-      const W    = canvas.width  / dpr;
-      const H    = canvas.height / dpr;
-      const { lon: viewLon, lat: viewLat, zoom } = viewRef.current;
+        const el = mountRef.current;
+        const [r,g,b] = hexToRgb(accentColor);
 
-      // ✅ FIX BUG 1: clearRect dùng pixel thực (TRƯỚC save/scale)
-      // canvas.width/height là kích thước pixel vật lý, không bị ảnh hưởng bởi DPR scale
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.save();
-      ctx.scale(dpr, dpr);
+        const globe = GlobeGL({ waitForGlobeReady: true, animateIn: true })(el)
+          .width(el.clientWidth || 600)
+          .height(el.clientHeight || 480)
+          .backgroundColor("rgba(0,0,0,0)")
+          .showAtmosphere(true)
+          .atmosphereColor(accentColor)
+          .atmosphereAltitude(0.22)
+          // SP nodes
+          .pointsData(getPoints())
+          .pointLat("lat").pointLng("lng")
+          .pointAltitude(0.008).pointRadius("size").pointColor("color").pointLabel("label")
+          .onPointClick((d:any) => { if (onProviderClick && d?.provider) onProviderClick(d.provider); })
+          .onPointHover((d:any) => { el.style.cursor = d ? "pointer" : "default"; })
+          // Capacity rings
+          .ringsData(getRings())
+          .ringLat("lat").ringLng("lng")
+          .ringMaxRadius("maxR").ringPropagationSpeed("propagationSpeed").ringRepeatPeriod("repeatPeriod")
+          .ringColor(() => (t:number) => `rgba(${r},${g},${b},${Math.max(0,(1-t)*0.5).toFixed(3)})`)
+          // Arcs
+          .arcsData(getArcs())
+          .arcStartLat("startLat").arcStartLng("startLng")
+          .arcEndLat("endLat").arcEndLng("endLng")
+          .arcColor("color").arcStroke("stroke").arcAltitude("arcAlt")
+          .arcDashLength(0.35).arcDashGap(0.15)
+          .arcDashAnimateTime("dashAnimTime")
+          // Sovereignty HTML
+          .htmlElementsData(getSovPoints())
+          .htmlLat("lat").htmlLng("lng").htmlAltitude(0.01)
+          .htmlElement((d:any) => {
+            const div = document.createElement("div");
+            div.style.cssText = "display:flex;align-items:center;gap:4px;pointer-events:none;white-space:nowrap";
+            div.innerHTML = `<div style="width:7px;height:7px;border-radius:50%;background:#FFD700;box-shadow:0 0 6px #FFD700;flex-shrink:0"></div><span style="font-size:9px;font-family:monospace;color:#FFD700;text-shadow:0 1px 3px rgba(0,0,0,.9)">${d.label}</span>`;
+            return div;
+          })
+          .pointOfView({ lat: 15, lng: 108, altitude: 2.2 }, 1200);
 
-      const radius = Math.min(W, H) * 0.42 * zoom;
-      const cx = W / 2, cy = H / 2;
+        // Camera controls
+        const ctrl = globe.controls();
+        ctrl.autoRotate = true;
+        ctrl.autoRotateSpeed = 0.35;
+        ctrl.enableDamping = true;
+        ctrl.dampingFactor = 0.08;
 
-      // ── 0. Star field ──────────────────────────────────────────────────────
-      // Static stars (seeded by position, cheap)
-      ctx.save();
-      for (let i = 0; i < 180; i++) {
-        const sx = ((i * 137.508 + 41) % W);
-        const sy = ((i * 97.313  + 17) % H);
-        // Skip inside globe
-        const ddx = sx - cx, ddy = sy - cy;
-        if (ddx*ddx + ddy*ddy < radius*radius*1.15) continue;
-        const r = (i % 3 === 0) ? 1.2 : 0.7;
-        ctx.beginPath();
-        ctx.arc(sx, sy, r, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(180,210,255,${0.1 + (i % 5) * 0.05})`;
-        ctx.fill();
+        globeRef.current = globe;
+
+        // onGlobeReady callback
+        globe.onGlobeReady(() => { if (active) setStatus("ready"); });
+        // Safety timeout
+        setTimeout(() => { if (active) setStatus(s => s === "loading" ? "ready" : s); }, 6000);
+
+        // Resize
+        const ro = new ResizeObserver(entries => {
+          for (const e of entries) globe.width(e.contentRect.width).height(e.contentRect.height);
+        });
+        ro.observe(el);
+
+      } catch (err: any) {
+        if (active) { setErrorMsg(err?.message ?? String(err)); setStatus("error"); }
       }
-      ctx.restore();
+    })();
 
-      // ── 1. Globe sphere ──────────────────────────────────────────────────
-      const sg = ctx.createRadialGradient(cx - radius*0.2, cy - radius*0.2, 0, cx, cy, radius);
-      sg.addColorStop(0, "#0e1825");
-      sg.addColorStop(0.6, "#070c12");
-      sg.addColorStop(1, "#020507");
-      ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI*2);
-      ctx.fillStyle = sg; ctx.fill();
-
-      // Rim glow
-      const rimG = ctx.createRadialGradient(cx, cy, radius*0.88, cx, cy, radius*1.1);
-      rimG.addColorStop(0,   `rgba(${rgb.r},${rgb.g},${rgb.b},0)`);
-      rimG.addColorStop(0.7, `rgba(${rgb.r},${rgb.g},${rgb.b},0.07)`);
-      rimG.addColorStop(1,   `rgba(${rgb.r},${rgb.g},${rgb.b},0)`);
-      ctx.beginPath(); ctx.arc(cx, cy, radius*1.1, 0, Math.PI*2);
-      ctx.fillStyle = rimG; ctx.fill();
-
-      // ── 2. Grid lines ────────────────────────────────────────────────────
-      ctx.save();
-      ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI*2); ctx.clip();
-      ctx.strokeStyle = `rgba(${rgb.r},${rgb.g},${rgb.b},0.04)`;
-      ctx.lineWidth = 0.5;
-      for (let la = -60; la <= 60; la += 30) {
-        const pts: [number,number][] = [];
-        for (let lo = -180; lo <= 180; lo += 2) {
-          const p = lonLatToCanvas(lo, la, viewLon, viewLat, zoom, W, H);
-          if (p) pts.push(p);
-        }
-        if (pts.length > 2) {
-          ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
-          pts.slice(1).forEach(p => ctx.lineTo(p[0], p[1]));
-          ctx.stroke();
-        }
-      }
-      for (let lo = -180; lo < 180; lo += 30) {
-        const pts: [number,number][] = [];
-        for (let la = -85; la <= 85; la += 3) {
-          const p = lonLatToCanvas(lo, la, viewLon, viewLat, zoom, W, H);
-          if (p) pts.push(p);
-        }
-        if (pts.length > 2) {
-          ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
-          pts.slice(1).forEach(p => ctx.lineTo(p[0], p[1]));
-          ctx.stroke();
-        }
-      }
-      ctx.restore();
-
-      // ── 3. Dot-matrix continents ──────────────────────────────────────────
-      ctx.save();
-      ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI*2); ctx.clip();
-      for (const [dLon, dLat] of dotsSnap) {
-        const pt = lonLatToCanvas(dLon, dLat, viewLon, viewLat, zoom, W, H);
-        if (!pt) continue;
-        const dx = pt[0] - cx, dy = pt[1] - cy;
-        const edgeFade = Math.pow(1 - Math.max(0, Math.sqrt(dx*dx+dy*dy)/radius - 0.5)*2, 2);
-        ctx.beginPath(); ctx.arc(pt[0], pt[1], 1.2, 0, Math.PI*2);
-        ctx.fillStyle = `rgba(${rgb.r},${rgb.g},${rgb.b},${(0.5*edgeFade).toFixed(3)})`;
-        ctx.fill();
-      }
-      ctx.restore();
-
-      // ── 4+5+6. Arc system — GHOSTING TRAIL + SYNC + TX ────────────────────
-      ctx.save();
-      ctx.beginPath(); ctx.arc(cx, cy, radius*1.02, 0, Math.PI*2); ctx.clip();
-
-      // Advance + draw each arc
-      const arcs = arcsRef.current;
-      for (const arc of arcs) {
-        // Advance progress
-        arc.progress = Math.min(1.02, arc.progress + arc.speed);
-
-        // Current head position on geodesic
-        const t = Math.min(1, arc.progress);
-        const [headLon, headLat] = geodesicPoint(
-          arc.srcLon, arc.srcLat, arc.dstLon, arc.dstLat, t
-        );
-        const headPt = lonLatToCanvas(headLon, headLat, viewLon, viewLat, zoom, W, H);
-
-        if (headPt) {
-          // Add to trail
-          arc.trail.push([headPt[0], headPt[1], arc.alpha]);
-          if (arc.trail.length > TRAIL_MAX_LEN) arc.trail.shift();
-        }
-
-        // Draw trail (ghosting effect)
-        if (arc.trail.length >= 2) {
-          for (let i = 1; i < arc.trail.length; i++) {
-            const [x0, y0] = arc.trail[i-1];
-            const [x1, y1] = arc.trail[i];
-            // Fade from tail (0) to head (full)
-            const trailAlpha = (i / arc.trail.length) * arc.alpha * 0.85;
-            const w = arc.width * (i / arc.trail.length);
-
-            if (arc.kind === "sync") {
-              // Thick sync arc — cyan or purple based on network
-              ctx.beginPath();
-              ctx.moveTo(x0, y0); ctx.lineTo(x1, y1);
-              ctx.strokeStyle = `rgba(${rgb.r},${rgb.g},${rgb.b},${trailAlpha.toFixed(3)})`;
-              ctx.lineWidth   = w;
-              ctx.lineCap     = "round";
-              ctx.stroke();
-              // Glow core
-              if (i === arc.trail.length - 1) {
-                ctx.beginPath();
-                ctx.moveTo(x0, y0); ctx.lineTo(x1, y1);
-                ctx.strokeStyle = `rgba(${rgb.r},${rgb.g},${rgb.b},${(trailAlpha * 0.6).toFixed(3)})`;
-                ctx.lineWidth   = w * 3;
-                ctx.filter      = "blur(2px)";
-                ctx.stroke();
-                ctx.filter = "none";
-              }
-            } else {
-              // Thin TX arc — slightly shifted hue (complementary)
-              // For cyan (0,245,255) → shift to slightly warm white; for purple → white
-              const tr = Math.min(255, rgb.r + 120);
-              const tg = Math.min(255, rgb.g + 40);
-              const tb = Math.min(255, rgb.b);
-              ctx.beginPath();
-              ctx.moveTo(x0, y0); ctx.lineTo(x1, y1);
-              ctx.strokeStyle = `rgba(${tr},${tg},${tb},${(trailAlpha * 0.7).toFixed(3)})`;
-              ctx.lineWidth   = w;
-              ctx.lineCap     = "round";
-              ctx.stroke();
-            }
-          }
-
-          // Head sparkle (bright dot at tip)
-          if (headPt && arc.progress < 1) {
-            const sparkR = arc.kind === "sync" ? 2.5 : 1.5;
-            ctx.beginPath(); ctx.arc(headPt[0], headPt[1], sparkR, 0, Math.PI*2);
-            ctx.fillStyle = arc.kind === "sync"
-              ? `rgba(${rgb.r},${rgb.g},${rgb.b},0.95)`
-              : `rgba(255,255,255,0.8)`;
-            ctx.fill();
-
-            // Halo at head
-            const haloG = ctx.createRadialGradient(
-              headPt[0], headPt[1], 0,
-              headPt[0], headPt[1], sparkR * 5
-            );
-            haloG.addColorStop(0, `rgba(${rgb.r},${rgb.g},${rgb.b},0.5)`);
-            haloG.addColorStop(1, `rgba(${rgb.r},${rgb.g},${rgb.b},0)`);
-            ctx.beginPath(); ctx.arc(headPt[0], headPt[1], sparkR*5, 0, Math.PI*2);
-            ctx.fillStyle = haloG; ctx.fill();
-          }
-        }
-      }
-      ctx.restore();
-
-      // ── 7. SP Nodes — neon double-render ─────────────────────────────────
-      for (const sp of providers) {
-        if (!sp.coordinates) continue;
-        const pt = lonLatToCanvas(sp.coordinates[0], sp.coordinates[1], viewLon, viewLat, zoom, W, H);
-        if (!pt) continue;
-
-        const isHov = hoveredSP?.address === sp.address;
-        const glowR = isHov ? 20 : 13;
-
-        // Outer glow
-        const gGrad = ctx.createRadialGradient(pt[0], pt[1], 0, pt[0], pt[1], glowR);
-        gGrad.addColorStop(0, `rgba(${rgb.r},${rgb.g},${rgb.b},${isHov ? 0.55 : 0.28})`);
-        gGrad.addColorStop(1, `rgba(${rgb.r},${rgb.g},${rgb.b},0)`);
-        ctx.beginPath(); ctx.arc(pt[0], pt[1], glowR, 0, Math.PI*2);
-        ctx.fillStyle = gGrad; ctx.fill();
-
-        // Inner dot
-        ctx.beginPath(); ctx.arc(pt[0], pt[1], isHov ? 5.5 : 3.5, 0, Math.PI*2);
-        ctx.fillStyle = `rgb(${rgb.r},${rgb.g},${rgb.b})`; ctx.fill();
-
-        // Hover ring
-        if (isHov) {
-          // Animated pulse ring — use frameRef for offset
-          const pulseScale = 1 + 0.4 * Math.sin(frameRef.current * 0.08);
-          ctx.beginPath(); ctx.arc(pt[0], pt[1], 10 * pulseScale, 0, Math.PI*2);
-          ctx.strokeStyle = `rgba(${rgb.r},${rgb.g},${rgb.b},0.6)`;
-          ctx.lineWidth = 1; ctx.stroke();
-        }
-      }
-
-      // ── 8. Sovereignty — gold, always on top ───────────────────────────────
-      for (const s of SOVEREIGNTY_POINTS) {
-        const pt = lonLatToCanvas(s.coords[0], s.coords[1], viewLon, viewLat, zoom, W, H);
-        if (!pt) continue;
-
-        // Gold glow
-        const gg = ctx.createRadialGradient(pt[0], pt[1], 0, pt[0], pt[1], 18);
-        gg.addColorStop(0, "rgba(255,215,0,0.55)");
-        gg.addColorStop(1, "rgba(255,215,0,0)");
-        ctx.beginPath(); ctx.arc(pt[0], pt[1], 18, 0, Math.PI*2);
-        ctx.fillStyle = gg; ctx.fill();
-
-        // Gold dot
-        ctx.beginPath(); ctx.arc(pt[0], pt[1], 4, 0, Math.PI*2);
-        ctx.fillStyle   = "#FFD700";
-        ctx.shadowBlur  = 12;
-        ctx.shadowColor = "#FFD700";
-        ctx.fill();
-        ctx.shadowBlur = 0;
-
-        // Label
-        ctx.font      = "bold 9px 'DM Mono', monospace";
-        ctx.fillStyle = "rgba(255,215,0,0.88)";
-        ctx.fillText(s.label, pt[0] + 8, pt[1] + 3);
-      }
-
-      ctx.restore();
-
-      // ── Advance frame + spawn arcs ─────────────────────────────────────────
-      frameRef.current++;
-
-      // Auto-rotate
-      if (viewRef.current.autoRotate && !isDragging.current) {
-        setViewState(v => ({ ...v, lon: v.lon + 0.05 }));
-      }
-
-      // Spawn new arcs every ~40 frames (~1.3s)
-      if (frameRef.current % 40 === 0) spawnArcs();
-    };
-
-    animRef.current = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(animRef.current);
+    return () => { active = false; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dots, providers, rgb, hoveredSP, spawnArcs]);
+  }, []);
 
-  // ✅ FIX BUG 2: Wheel zoom dùng addEventListener với { passive: false }
-  // React synthetic onWheel event là passive: true trên modern browsers → không thể preventDefault
-  // → page vẫn scroll. Giải pháp: attach native listener thủ công sau khi canvas mount.
+  // ── Update data on provider change ──────────────────────────────────────────
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const handler = (e: WheelEvent) => {
-      e.preventDefault();
-      setViewState(v => ({
-        ...v,
-        zoom: Math.max(0.6, Math.min(3.0, v.zoom - e.deltaY * 0.001)),
-      }));
-    };
-    canvas.addEventListener("wheel", handler, { passive: false });
-    return () => canvas.removeEventListener("wheel", handler);
-  }, []);
+    const g = globeRef.current;
+    if (!g) return;
+    g.pointsData(getPoints());
+    g.ringsData(getRings());
+    g.arcsData(getArcs());
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [providers, accentColor]);
 
-  // ── Mouse handlers ────────────────────────────────────────────────────────────
-  const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    isDragging.current = true;
-    lastMouse.current  = { x: e.clientX, y: e.clientY };
-    setViewState(v => ({ ...v, autoRotate: false }));
-  }, []);
-
-  const handleMouseMove = useCallback((e: React.MouseEvent) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const mx   = e.clientX - rect.left;
-    const my   = e.clientY - rect.top;
-
-    if (isDragging.current && lastMouse.current) {
-      const dx = e.clientX - lastMouse.current.x;
-      const dy = e.clientY - lastMouse.current.y;
-      lastMouse.current = { x: e.clientX, y: e.clientY };
-      setViewState(v => ({
-        ...v,
-        lon: v.lon - dx * 0.4,
-        lat: Math.max(-80, Math.min(80, v.lat + dy * 0.3)),
-      }));
-      return;
-    }
-
-    // Hover detect
-    const { lon: vLon, lat: vLat, zoom } = viewRef.current;
-    const W = rect.width, H = rect.height;
-    let found: StorageProvider | null = null;
-    for (const sp of providers) {
-      if (!sp.coordinates) continue;
-      const pt = lonLatToCanvas(sp.coordinates[0], sp.coordinates[1], vLon, vLat, zoom, W, H);
-      if (!pt) continue;
-      if ((mx - pt[0])**2 + (my - pt[1])**2 < 196) { found = sp; break; }
-    }
-    setHoveredSP(found);
-    setTooltipPos(found ? { x: mx, y: my } : null);
-    canvas.style.cursor = found ? "pointer" : "grab";
-  }, [providers]);
-
-  const handleMouseUp    = useCallback(() => { isDragging.current = false; lastMouse.current = null; }, []);
-  const handleMouseLeave = useCallback(() => {
-    isDragging.current = false; lastMouse.current = null;
-    setHoveredSP(null); setTooltipPos(null);
-  }, []);
-
-  const handleClick = useCallback(() => {
-    if (hoveredSP && onProviderClick) onProviderClick(hoveredSP);
-  }, [hoveredSP, onProviderClick]);
-
-  const handleDblClick = useCallback(() => {
-    setViewState(v => ({ ...v, lon: 110, lat: 15, autoRotate: true }));
-  }, []);
-
-  // ── Render ────────────────────────────────────────────────────────────────────
+  // ── Render ───────────────────────────────────────────────────────────────────
   return (
-    <div style={{ position: "relative", width: "100%", height: "100%", background: "#030507", userSelect: "none" }}>
+    <div style={{ position:"relative", width:"100%", height:"100%", background:"#030507", overflow:"hidden" }}>
 
-      {/* ✅ onWheel removed — handled by native addEventListener above */}
-      <canvas
-        ref={canvasRef}
-        style={{ display: "block", width: "100%", height: "100%", cursor: "grab" }}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseLeave}
-        onClick={handleClick}
-        onDoubleClick={handleDblClick}
+      <div ref={mountRef}
+        style={{ width:"100%", height:"100%", opacity: status==="ready" ? 1 : 0, transition:"opacity .7s" }}
       />
 
-      {/* Scanline overlay */}
-      <div style={{
-        position: "absolute", inset: 0, pointerEvents: "none", zIndex: 1,
-        background: "repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,0.05) 3px,rgba(0,0,0,0.05) 4px)",
-      }} />
-
-      {/* SP hover tooltip */}
-      {hoveredSP && tooltipPos && (
-        <div style={{
-          position: "absolute", left: tooltipPos.x + 16, top: tooltipPos.y - 10,
-          zIndex: 20, pointerEvents: "none",
-          background: "rgba(7,11,16,0.94)", backdropFilter: "blur(12px)",
-          border: `1px solid ${accentColor}44`, borderRadius: 10,
-          padding: "10px 14px", minWidth: 200,
-          boxShadow: `0 8px 32px rgba(0,0,0,0.6)`,
-        }}>
-          <div style={{ fontSize: 9, color: "#3d5570", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 4 }}>
-            Storage Provider
-          </div>
-          <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: accentColor, marginBottom: 6 }}>
-            {hoveredSP.addressShort}
-          </div>
-          <div style={{ display: "flex", gap: 10, fontSize: 10, color: "#7a9ab8", flexWrap: "wrap" }}>
-            {hoveredSP.geo?.city && <span>{hoveredSP.geo.city}, {hoveredSP.geo.countryCode}</span>}
-            <span style={{ color: hoveredSP.health === "Healthy" ? "#34d399" : "#f87171" }}>
-              {hoveredSP.health}
-            </span>
-            {hoveredSP.capacityTiB && <span>{hoveredSP.capacityTiB.toFixed(2)} TiB</span>}
-          </div>
+      {/* Loading */}
+      {status==="loading" && (
+        <div style={{ position:"absolute", inset:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:12, color:"#4b5563", fontFamily:"monospace", fontSize:13 }}>
+          <style>{`@keyframes _gs{to{transform:rotate(360deg)}}`}</style>
+          <svg width="36" height="36" viewBox="0 0 36 36" fill="none">
+            <circle cx="18" cy="18" r="14" stroke="#1f2937" strokeWidth="2"/>
+            <circle cx="18" cy="18" r="14" stroke={accentColor} strokeWidth="2" strokeDasharray="22 66" strokeLinecap="round" style={{transformOrigin:"18px 18px",animation:"_gs 1.2s linear infinite"}}/>
+          </svg>
+          Loading globe…
         </div>
       )}
 
-      {/* Legend — arc types */}
-      <div style={{
-        position: "absolute", bottom: 42, right: 16, zIndex: 10,
-        pointerEvents: "none",
-        display: "flex", flexDirection: "column", gap: 5, alignItems: "flex-end",
-      }}>
-        {[
-          { label: "Sync arc (Node↔Hub)", thick: true,  color: accentColor },
-          { label: "TX arc (Node→Node)",  thick: false, color: "#ffffff" },
-        ].map(({ label, thick, color }) => (
-          <div key={label} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ fontSize: 8.5, color: "#3d5570", fontFamily: "'DM Mono',monospace" }}>{label}</span>
-            <span style={{ width: thick ? 20 : 16, height: thick ? 2.5 : 1.2, background: color, borderRadius: 2, opacity: 0.7, boxShadow: `0 0 4px ${color}` }} />
-          </div>
-        ))}
-      </div>
+      {/* Error */}
+      {status==="error" && (
+        <div style={{ position:"absolute", inset:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:8, color:"#9ca3af", fontFamily:"monospace", fontSize:12, textAlign:"center", padding:"0 24px" }}>
+          <span style={{fontSize:22}}>⚠</span>
+          <span>Globe failed to load</span>
+          <span style={{fontSize:10,color:"#6b7280",maxWidth:300}}>{errorMsg}</span>
+          <button onClick={()=>window.location.reload()} style={{marginTop:8,padding:"5px 14px",borderRadius:7,border:"1px solid #374151",background:"transparent",color:"#9ca3af",cursor:"pointer",fontFamily:"monospace",fontSize:11}}>
+            Retry
+          </button>
+        </div>
+      )}
 
-      {/* Controls hint */}
-      <div style={{
-        position: "absolute", bottom: 12, right: 16, zIndex: 10,
-        fontSize: 9, fontFamily: "'DM Mono',monospace", color: "#3d5570",
-        lineHeight: 1.7, textAlign: "right", pointerEvents: "none",
-      }}>
-        <div>drag · scroll · dbl-click reset</div>
-      </div>
+      {/* Legend */}
+      {status==="ready" && (
+        <div style={{ position:"absolute", bottom:42, right:16, zIndex:10, pointerEvents:"none", display:"flex", flexDirection:"column", gap:5, alignItems:"flex-end" }}>
+          {[
+            { label:"PG replication (erasure 10+6)", dashed:true,  color:accentColor },
+            { label:"Upload arc (client → SP)",      dashed:false, color:"#ffffff"   },
+            { label:"Capacity ring (healthy SP)",    dashed:false, color:accentColor },
+          ].map(({label,dashed,color}) => (
+            <div key={label} style={{display:"flex",alignItems:"center",gap:6}}>
+              <span style={{fontSize:9,color:"#3d5570",fontFamily:"monospace"}}>{label}</span>
+              <span style={{display:"inline-block",width:18,height:dashed?0:1.5,borderTop:dashed?`1.5px dashed ${color}`:"none",background:dashed?"transparent":color,borderRadius:2,opacity:.75}}/>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Node count */}
-      {providers.length > 0 && (
-        <div style={{
-          position: "absolute", top: 12, left: 16, zIndex: 10,
-          fontSize: 10, fontFamily: "'DM Mono',monospace",
-          background: "rgba(0,0,0,0.6)", border: `1px solid ${accentColor}33`,
-          borderRadius: 6, padding: "4px 10px", color: accentColor,
-          backdropFilter: "blur(4px)",
-        }}>
+      {status==="ready" && providers.length>0 && (
+        <div style={{ position:"absolute", top:12, left:16, zIndex:10, fontSize:10, fontFamily:"monospace", background:"rgba(0,0,0,.6)", border:`1px solid ${accentColor}33`, borderRadius:6, padding:"4px 10px", color:accentColor, backdropFilter:"blur(4px)" }}>
           {providers.length} nodes online
         </div>
       )}
 
-      {/* Sovereignty badge */}
-      <div style={{
-        position: "absolute", top: 12, right: 16, zIndex: 10,
-        fontSize: 9, fontFamily: "'DM Mono',monospace",
-        background: "rgba(0,0,0,0.6)", border: "1px solid rgba(255,215,0,0.3)",
-        borderRadius: 6, padding: "4px 10px", color: "#ffd700",
-        backdropFilter: "blur(4px)",
-      }}>
+      {/* Sovereignty */}
+      <div style={{ position:"absolute", top:12, right:16, zIndex:10, fontSize:9, fontFamily:"monospace", background:"rgba(0,0,0,.6)", border:"1px solid rgba(255,215,0,.3)", borderRadius:6, padding:"4px 10px", color:"#ffd700", backdropFilter:"blur(4px)" }}>
         🇻🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
+      </div>
+
+      {/* Controls */}
+      <div style={{ position:"absolute", bottom:12, right:16, zIndex:10, fontSize:9, fontFamily:"monospace", color:"#3d5570", lineHeight:1.7, textAlign:"right", pointerEvents:"none" }}>
+        drag · scroll · click node
       </div>
     </div>
   );

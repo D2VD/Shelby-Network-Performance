@@ -28,3 +28,8 @@ binding = "SHELBY_KV_MAINNET"
 id      = "5cb5ee699b924052812beda7ae936569"
 
 # ── KHÔNG có CRON — worker này chỉ handle HTTP requests ───────
+# ── WASM Bundling ───────────────────────────────────────────────
+# BẮT BUỘC: Chỉ cho Wrangler biết để bundle file .wasm vào chung với worker.
+# SDK @shelby-protocol/clay-codes sẽ tìm và load module này khi chạy.
+# Dùng [wasm_modules] (một object), không phải [[wasm_modules]] (mảng object).
+

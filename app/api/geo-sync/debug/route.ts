@@ -1,4 +1,4 @@
-// app/api/geo-sync/stats/live/route.ts — VPS edition
+// app/api/geo-sync/debug/route.ts — VPS edition
 import { NextRequest, NextResponse } from "next/server";
 import { VPS_API_URL } from "@/app/api/_proxy";
 
@@ -9,14 +9,11 @@ export async function GET(req: NextRequest) {
   const network = searchParams.get("network") ?? "shelbynet";
   try {
     const res = await fetch(
-      `${VPS_API_URL}/api/geo-sync/stats/live?network=${network}`,
-      { signal: AbortSignal.timeout(20_000), headers: { Accept: "application/json" } }
+      `${VPS_API_URL}/api/geo-sync/debug?network=${network}`,
+      { signal: AbortSignal.timeout(30_000) }
     );
     const data = await res.json();
-    return NextResponse.json(data, {
-      status:  res.status,
-      headers: { "Cache-Control": "no-store" },
-    });
+    return NextResponse.json(data, { status: res.status });
   } catch (err: any) {
     return NextResponse.json({ ok: false, error: err.message }, { status: 500 });
   }

@@ -1,41 +1,16 @@
-// app/api/geo-sync/benchmark-results/route.ts
-// Proxy benchmark results sang VPS geo-sync service để lưu vào Redis.
-
-import { NextRequest, NextResponse } from "next/server";
+// app/api/geo-sync/benchmark-results/route.ts — VPS edition
+import { NextRequest } from "next/server";
+import { proxyToGeoSync, parseBody } from "@/app/api/_proxy";
 
 export const runtime = "edge";
 
-const WORKER_URL =
-  process.env.SHELBY_WORKER_URL ??
-  "https://shelby-geo-sync.doanvandanh20000.workers.dev";
-
 export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    const res  = await fetch(`${WORKER_URL}/benchmark-results`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify(body),
-      signal:  AbortSignal.timeout(8_000),
-    });
-    const data = await res.json();
-    return NextResponse.json(data, { status: res.status });
-  } catch (err: any) {
-    // Không throw — frontend không nên fail chỉ vì save analytics thất bại
-    return NextResponse.json({ ok: false, error: err.message }, { status: 200 });
-  }
+  const body = await parseBody(req);
+  return proxyToGeoSync(req, "/benchmark-results", "POST", body);
 }
 
 export async function GET(req: NextRequest) {
-  const params  = new URL(req.url).searchParams;
-  const qs      = params.toString();
-  try {
-    const res  = await fetch(`${WORKER_URL}/benchmark-results${qs ? `?${qs}` : ""}`, {
-      signal: AbortSignal.timeout(8_000),
-    });
-    const data = await res.json();
-    return NextResponse.json(data, { status: res.status });
-  } catch (err: any) {
-    return NextResponse.json({ ok: false, error: err.message }, { status: 500 });
-  }
+  const { searchParams } = new URL(req.url);
+  const qs = searchParams.toString();
+  return proxyToGeoSync(req, `/benchmark-results${qs ? `?${qs}` : ""}`, "GET");
 }

@@ -1,191 +1,168 @@
-// app/api/network/providers/route.ts — v3
-// ✅ edge runtime
-// FIX testnet: dùng đúng indexer + contract address cho testnet
-// FIX: GraphQL query providers nếu KV không có
-import { NextRequest, NextResponse } from "next/server";
-import type { StorageProvider, KVNodeRecord } from "@/lib/types";
-import { ZONE_META } from "@/lib/types";
+// app/api/network/providers/route.ts — v3.0
+// Lấy Storage Provider data trực tiếp từ on-chain RPC + Indexer
+// KHÔNG phụ thuộc vào CF KV hay bất kỳ cache layer nào nữa — data từ source truth
+// Cache 60s (SPs không thay đổi thường xuyên)
 
-export const runtime    = "edge";
-export const revalidate = 60;
+import { type NextRequest, NextResponse } from "next/server";
+import { VPS_API_URL } from "@/app/api/_proxy";
 
-const NETWORK_CONFIG: Record<string, {
-  coreAddress: string;
-  nodeUrl:     string;
-  indexerUrl:  string;
-}> = {
-  shelbynet: {
-    coreAddress: "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a",
-    nodeUrl:     "https://api.shelbynet.shelby.xyz/v1",
-    indexerUrl:  "https://api.shelbynet.shelby.xyz/v1/graphql",
-  },
-  testnet: {
-    coreAddress: "0xc63d6a5efb0080a6029403131715bd4971e1149f7cc099aac69bb0069b3ddbf5",
-    nodeUrl:     "https://api.testnet.aptoslabs.com/v1",
-    indexerUrl:  "https://api.testnet.aptoslabs.com/v1/graphql",
-  },
+export const runtime = "edge";
+
+const SHELBY_NODE     = "https://api.shelbynet.shelby.xyz/v1";
+const SHELBY_INDEXER  = "https://api.shelbynet.shelby.xyz/v1/graphql";
+const CORE_ADDRESS    = "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a";
+
+// Approximate lat/lng từ zone name (cho map positioning)
+const ZONE_GEO: Record<string, { lat: number; lng: number; city: string; country: string; countryCode: string }> = {
+  dc_asia:      { lat:   1.35, lng: 103.82, city: "Singapore",  country: "Singapore",      countryCode: "SG" },
+  dc_australia: { lat: -33.87, lng: 151.21, city: "Sydney",     country: "Australia",      countryCode: "AU" },
+  dc_europe:    { lat:  50.11, lng:   8.68, city: "Frankfurt",  country: "Germany",         countryCode: "DE" },
+  dc_us_east:   { lat:  39.04, lng: -77.44, city: "Virginia",   country: "United States",  countryCode: "US" },
+  dc_us_west:   { lat:  37.34, lng:-121.89, city: "San Jose",   country: "United States",  countryCode: "US" },
 };
 
-function truncate(addr: string, front = 6, back = 4): string {
-  if (!addr || addr.length <= front + back + 3) return addr;
-  return `${addr.slice(0, front)}...${addr.slice(-back)}`;
+function nb(v: any, fb = 0): number {
+  const x = Number(v ?? fb);
+  return isNaN(x) ? fb : x;
 }
 
-function zoneToCoords(zone: string): [number, number] {
-  const meta = ZONE_META[zone];
-  if (meta) return [meta.fallbackLng, meta.fallbackLat];
-  return [0, 0];
-}
+// Fetch SPs từ on-chain resource
+// Shelby contract lưu SPs trong storage_provider_registry::StorageProviders
+// grouped by availability zone (az_key → [SP entries])
+async function fetchStorageProviders(): Promise<any[]> {
+  const url = `${SHELBY_NODE}/accounts/${CORE_ADDRESS}/resource/${CORE_ADDRESS}::storage_provider_registry::StorageProviders`;
+  const r = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+  if (!r.ok) throw new Error(`SP registry HTTP ${r.status}`);
+  const data = await r.json() as any;
 
-// ── Source 1: Cloudflare KV ────────────────────────────────────────────────
-async function readFromKV(networkParam: string): Promise<StorageProvider[] | null> {
-  try {
-    const kv = networkParam === "shelbynet"
-      ? (process.env as any).SHELBY_KV_MAINNET
-      : (process.env as any).SHELBY_KV_TESTNET;
-    if (!kv) return null;
+  const providers: any[] = [];
 
-    const indexStr: string | null = await kv.get("index:providers");
-    if (!indexStr) return null;
-    const index: { addresses: string[] } = JSON.parse(indexStr);
-    if (!index.addresses?.length) return null;
+  // Parse active_providers_by_az structure
+  // Structure: { data: { active_providers_by_az: { root: { children: { entries: [ { key: "dc_asia", value: { value: [SP...] } } ] } } } } }
+  const entries: any[] = data?.data?.active_providers_by_az?.root?.children?.entries ?? [];
 
-    const nodeStrings: (string | null)[] = await Promise.all(
-      index.addresses.map((addr: string) => kv.get(`node:${addr}`))
-    );
-    const providers = nodeStrings
-      .filter((s): s is string => s !== null)
-      .map((s): StorageProvider => {
-        const r: KVNodeRecord = JSON.parse(s);
-        return {
-          address: r.address, addressShort: r.addressShort,
-          availabilityZone: r.availabilityZone, state: r.state as any,
-          health: r.health as any, blsKey: r.blsKey, fullBlsKey: r.fullBlsKey,
-          capacityTiB: r.capacityTiB, netAddress: r.netAddress, geo: r.geo,
-          coordinates: [r.geo.lng, r.geo.lat],
-        };
+  entries.forEach((entry: any) => {
+    const zone    = entry.key as string;
+    const spArray: any[] = entry.value?.value ?? [];
+
+    spArray.forEach((sp: any, idx: number) => {
+      const address = sp.addr ?? sp.address ?? "";
+      const geoInfo = ZONE_GEO[zone];
+
+      providers.push({
+        address:          address,
+        addressShort:     address ? `${address.slice(0, 6)}…${address.slice(-4)}` : `SP-${zone}-${idx}`,
+        availabilityZone: zone,
+        state:            sp.state ?? "Active",
+        health:           sp.health ?? (sp.is_faulty ? "Faulty" : "Healthy"),
+        blsKey:           sp.bls_pk ?? sp.bls_key ?? "",
+        fullBlsKey:       sp.bls_pk ?? "",
+        capacityTiB:      sp.capacity_bytes ? nb(sp.capacity_bytes) / (1024 ** 4) : null,
+        netAddress:       sp.net_address ?? null,
+        geo: geoInfo ? {
+          lat:         geoInfo.lat,
+          lng:         geoInfo.lng,
+          city:        geoInfo.city,
+          country:     geoInfo.country,
+          countryCode: geoInfo.countryCode,
+          source:      "zone-fallback" as const,
+        } : null,
       });
-    return providers.length > 0 ? providers : null;
-  } catch { return null; }
-}
-
-// ── Source 2: GraphQL Indexer ──────────────────────────────────────────────
-async function fetchFromIndexer(indexerUrl: string): Promise<any[] | null> {
-  try {
-    const query = `query {
-      current_storage_providers {
-        address zone state health bls_key capacity used net_address
-      }
-    }`;
-    const res = await fetch(indexerUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query }),
-      signal: AbortSignal.timeout(6_000),
     });
-    if (!res.ok) return null;
-    const json = await res.json() as any;
-    const sps = json.data?.current_storage_providers;
-    return sps?.length ? sps : null;
-  } catch { return null; }
+  });
+
+  return providers;
 }
 
-// ── Source 3: On-chain RPC ─────────────────────────────────────────────────
-async function fetchFromRPC(nodeUrl: string, coreAddress: string): Promise<any[] | null> {
-  try {
-    const regRes = await fetch(
-      `${nodeUrl}/accounts/${coreAddress}/resource/${coreAddress}::storage_provider_registry::StorageProviders`,
-      { signal: AbortSignal.timeout(8_000) }
-    );
-    if (!regRes.ok) return null;
-    const regJson = await regRes.json() as any;
-    const zones: any[] = regJson?.data?.active_providers_by_az?.root?.children?.entries ?? [];
-    if (!zones.length) return null;
-
-    const nodes: any[] = [];
-    for (const zone of zones) {
-      for (const node of (zone.value?.value ?? [])) {
-        nodes.push({
-          address: node.addr, zone: zone.key,
-          state: "Active",
-          health: node.status?.condition === 0 ? "Healthy" : "Faulty",
-          bls_key: "", net_address: "",
-          capacity: node.status?.quota?.value,
-        });
+// Fallback: query Indexer nếu on-chain resource parse thất bại
+async function fetchSPsFromIndexer(): Promise<any[]> {
+  const query = `{
+    account_transactions(
+      where: {
+        account_address: { _eq: "${CORE_ADDRESS}" }
       }
+      order_by: { transaction_version: desc }
+      limit: 1
+    ) {
+      transaction_version
     }
-    return nodes.length ? nodes : null;
-  } catch { return null; }
-}
+  }`;
 
-function mapRawProvider(p: any): StorageProvider {
-  return {
-    address:          p.address,
-    addressShort:     truncate(p.address),
-    availabilityZone: p.zone ?? "unknown",
-    state:            p.state ?? "Active",
-    health:           p.health ?? "Healthy",
-    blsKey:           p.bls_key ? truncate(p.bls_key, 8, 8) : "—",
-    fullBlsKey:       p.bls_key ?? "",
-    capacityTiB:      p.capacity ? Number(p.capacity) / (1024 ** 4) : undefined,
-    netAddress:       p.net_address ?? "",
-    geo: {
-      lat: zoneToCoords(p.zone ?? "")[1],
-      lng: zoneToCoords(p.zone ?? "")[0],
-      source: "zone-fallback",
-      geocodedAt: new Date().toISOString(),
-    },
-    coordinates: zoneToCoords(p.zone ?? ""),
-  };
+  // Indexer không có direct SP table — chỉ dùng để verify connectivity
+  const r = await fetch(SHELBY_INDEXER, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+    signal: AbortSignal.timeout(8_000),
+  });
+  if (!r.ok) throw new Error(`Indexer HTTP ${r.status}`);
+  return []; // Trả empty, trigger VPS fallback
 }
 
 export async function GET(req: NextRequest) {
-  const fetchedAt    = new Date().toISOString();
   const { searchParams } = new URL(req.url);
-  const networkParam = searchParams.get("network") || "shelbynet";
-  const cfg          = NETWORK_CONFIG[networkParam] ?? NETWORK_CONFIG.shelbynet;
+  const network = searchParams.get("network") ?? "shelbynet";
 
-  let providers:  StorageProvider[] = [];
-  let dataSource: string = "none";
-
-  // Priority 1: KV
-  const kvProviders = await readFromKV(networkParam);
-  if (kvProviders?.length) {
-    providers  = kvProviders;
-    dataSource = "kv-geo";
-  }
-
-  // Priority 2: Indexer GraphQL
-  if (!providers.length) {
-    const rawIndexer = await fetchFromIndexer(cfg.indexerUrl);
-    if (rawIndexer?.length) {
-      providers  = rawIndexer.map(mapRawProvider);
-      dataSource = "indexer";
-    }
-  }
-
-  // Priority 3: RPC on-chain
-  if (!providers.length) {
-    const rawRPC = await fetchFromRPC(cfg.nodeUrl, cfg.coreAddress);
-    if (rawRPC?.length) {
-      providers  = rawRPC.map(mapRawProvider);
-      dataSource = "rpc";
-    }
-  }
-
-  if (providers.length === 0) {
+  // Testnet: không có data
+  if (network === "testnet") {
     return NextResponse.json({
-      ok: false, network: networkParam,
-      error: "All data sources unavailable",
+      ok: true,
+      network,
       source: "none",
       data: { providers: [], count: 0 },
-      fetchedAt,
-    }, { status: 200 });
+      fetchedAt: new Date().toISOString(),
+    }, {
+      headers: { "Cache-Control": "public, max-age=30" },
+    });
   }
 
+  // Try 1: On-chain RPC (most accurate)
+  try {
+    const providers = await fetchStorageProviders();
+    if (providers.length > 0) {
+      return NextResponse.json({
+        ok: true,
+        network,
+        source: "on-chain-rpc",
+        data: { providers, count: providers.length },
+        fetchedAt: new Date().toISOString(),
+      }, {
+        headers: { "Cache-Control": "public, max-age=60, stale-while-revalidate=300" },
+      });
+    }
+  } catch (e1: any) {
+    console.warn("[providers] on-chain RPC failed:", e1.message);
+  }
+
+  // Try 2: VPS proxy (VPS có SDK đọc đầy đủ hơn)
+  try {
+    const res = await fetch(
+      `${VPS_API_URL}/api/geo-sync/providers?network=${network}`,
+      { signal: AbortSignal.timeout(10_000), headers: { Accept: "application/json" } }
+    );
+    if (res.ok) {
+      const data = await res.json() as any;
+      if (data.data?.providers?.length > 0) {
+        return NextResponse.json({
+          ...data,
+          source: "vps-sdk",
+          fetchedAt: new Date().toISOString(),
+        }, {
+          headers: { "Cache-Control": "public, max-age=60, stale-while-revalidate=300" },
+        });
+      }
+    }
+  } catch (e2: any) {
+    console.warn("[providers] VPS fallback failed:", e2.message);
+  }
+
+  // Fallback: empty response
   return NextResponse.json({
-    ok: true, network: networkParam, source: dataSource,
-    data: { providers, count: providers.length },
-    fetchedAt,
-  });
+    ok: false,
+    network,
+    source: "none",
+    error: "Unable to fetch provider data",
+    data: { providers: [], count: 0 },
+    fetchedAt: new Date().toISOString(),
+  }, { status: 200 }); // 200 để frontend không crash
 }

@@ -1,324 +1,430 @@
 "use client";
 /**
- * app/dashboard/providers/page.tsx — v6.2
- *
- * Fix:
- *  - Legend: màu phân biệt rõ, font lớn hơn, nằm riêng góc dưới trái sidebar
- *  - Sidebar light mode
- *  - Network metrics chính xác hơn (thêm log source)
+ * app/dashboard/providers/page.tsx — v3.0
+ * Layout: Map (70vh) trên / SP info grid dưới
+ * Design: light mode, giống Celestia/Solana explorer
  */
 
-import { useState, useMemo } from "react";
-import dynamic from "next/dynamic";
+import { useState, useEffect, useCallback } from "react";
 import { useNetwork } from "@/components/network-context";
-import { useProviders } from "@/lib/use-providers";
+import { ProviderMap } from "@/components/provider-map";
 import { TestnetBanner } from "@/components/testnet-banner";
 import type { StorageProvider } from "@/lib/types";
 import { ZONE_META } from "@/lib/types";
-import useSWR from "swr";
 
-const GlobeMap = dynamic(() => import("@/components/map-wrapper"), {
-  ssr: false,
-  loading: () => (
-    <div style={{ width:"100%", height:"100%", display:"flex", alignItems:"center", justifyContent:"center", background:"#f0f7ff", color:"#9ca3af", fontFamily:"var(--font-mono)", fontSize:13, flexDirection:"column", gap:10 }}>
-      <style>{`@keyframes _sp{to{transform:rotate(360deg)}}`}</style>
-      <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
-        <circle cx="16" cy="16" r="12" stroke="#e5e7eb" strokeWidth="2"/>
-        <circle cx="16" cy="16" r="12" stroke="#0ea5e9" strokeWidth="2" strokeDasharray="19 57" strokeLinecap="round" style={{ transformOrigin:"16px 16px", animation:"_sp 1.2s linear infinite" }}/>
-      </svg>
-      Loading globe…
-    </div>
-  ),
-});
-
-interface Stats {
-  totalBlobs:            number | null;
-  totalStorageUsedBytes: number | null;
-  totalBlobEvents:       number | null;
-  slices:                number | null;
-  placementGroups:       number | null;
-  storageProviders:      number | null;
-}
-interface NodeInfo { blockHeight: number; ledgerVersion: number; chainId: number }
-
-function fmt(v: number | null): string {
-  if (v == null) return "—";
-  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`;
-  return v.toLocaleString("en-US");
-}
-function fmtBytes(b: number | null): string {
-  if (b == null) return "—";
-  if (b >= 1e12) return `${(b / 1e12).toFixed(2)} TB`;
-  if (b >= 1e9)  return `${(b / 1e9).toFixed(2)} GB`;
-  if (b >= 1e6)  return `${(b / 1e6).toFixed(1)} MB`;
-  return `${b} B`;
-}
-
-function ProviderPanel({ p, accentColor, network, onClose }: {
-  p: StorageProvider & { fullBlsKey?: string }; accentColor: string; network: string; onClose: () => void;
-}) {
+// ── SP health / state badge ────────────────────────────────────────────────────
+function Badge({ label, variant }: { label: string; variant: "green" | "red" | "yellow" | "gray" }) {
+  const colors = {
+    green:  { bg: "#f0fdf4", color: "#16a34a", dot: "#22c55e" },
+    red:    { bg: "#fef2f2", color: "#dc2626", dot: "#ef4444" },
+    yellow: { bg: "#fffbeb", color: "#d97706", dot: "#f59e0b" },
+    gray:   { bg: "#f4f4f4", color: "#6b7280", dot: "#9ca3af" },
+  };
+  const c = colors[variant];
   return (
-    <div style={{ position:"absolute", top:12, right:12, zIndex:30, width:280, background:"rgba(255,255,255,0.97)", backdropFilter:"blur(16px)", border:"1px solid #e5e7eb", borderRadius:14, padding:"16px 18px", boxShadow:"0 8px 32px rgba(0,0,0,0.12)" }}>
-      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10 }}>
-        <div>
-          <div style={{ fontSize:9, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.12em", marginBottom:2 }}>Storage Provider</div>
-          <div style={{ fontFamily:"var(--font-mono)", fontSize:12, color:"#0369a1", fontWeight:600 }}>{p.addressShort}</div>
-        </div>
-        <button onClick={onClose} style={{ background:"none", border:"none", cursor:"pointer", color:"#9ca3af", fontSize:18, lineHeight:1 }}>×</button>
-      </div>
-      <div style={{ display:"flex", gap:5, marginBottom:10, flexWrap:"wrap" }}>
-        <span className={`badge badge-${p.state==="Active"?"green":"red"}`}><span className="badge-dot"/>{p.state}</span>
-        <span className={`badge badge-${p.health==="Healthy"?"green":"red"}`}><span className="badge-dot"/>{p.health}</span>
-      </div>
-      {p.geo?.city && (
-        <div style={{ marginBottom:10, padding:"7px 10px", background:"#f9fafb", border:"1px solid #f0f0f0", borderRadius:7 }}>
-          <div style={{ fontSize:8, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:2 }}>Location</div>
-          <div style={{ fontFamily:"var(--font-mono)", fontSize:11, color:"#374151" }}>{[p.geo.city, p.geo.countryCode].filter(Boolean).join(", ")}</div>
-        </div>
-      )}
-      {[
-        { l:"Zone",     v: ZONE_META[p.availabilityZone]?.label ?? p.availabilityZone },
-        { l:"Capacity", v: p.capacityTiB ? `${p.capacityTiB.toFixed(2)} TiB` : "—" },
-        { l:"Net IP",   v: p.netAddress || "—" },
-      ].map(({ l, v }) => (
-        <div key={l} style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
-          <span style={{ fontSize:9, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.1em" }}>{l}</span>
-          <span style={{ fontFamily:"var(--font-mono)", fontSize:10, color:"#6b7280", maxWidth:"60%", textAlign:"right", wordBreak:"break-all" }}>{v}</span>
-        </div>
-      ))}
-      <a href={`https://explorer.aptoslabs.com/account/${p.address}?network=${network}`} target="_blank" rel="noreferrer"
-        style={{ display:"block", textAlign:"center", padding:"7px 0", borderRadius:7, fontSize:11, marginTop:8, background:"#eff6ff", border:"1px solid #bfdbfe", color:"#2563eb", textDecoration:"none", fontFamily:"var(--font-mono)" }}>
-        View on Explorer ↗
-      </a>
-    </div>
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: 5,
+      padding: "2px 9px", borderRadius: 6, fontSize: 11, fontWeight: 600,
+      background: c.bg, color: c.color,
+    }}>
+      <span style={{ width: 5, height: 5, borderRadius: "50%", background: c.dot }} />
+      {label}
+    </span>
   );
 }
 
-// ─── Legend component — màu phân biệt rõ ──────────────────────────────────────
-function GlobeLegend() {
-  const items = [
-    {
-      label:    "Data chunk arc (client → SP)",
-      sublabel: "Blob write: erasure 10 of 16",
-      color:    "#2563eb",
-      type:     "line",
-    },
-    {
-      label:    "Parity chunk arc",
-      sublabel: "Erasure +6 parity chunks",
-      color:    "#7dd3fc",
-      type:     "line-dashed",
-    },
-    {
-      label:    "Capacity ring",
-      sublabel: "SP healthy, size = TiB",
-      color:    "#0ea5e9",
-      type:     "ring",
-    },
-    {
-      label:    "SP node (healthy)",
-      sublabel: "Active storage provider",
-      color:    "#0ea5e9",
-      type:     "dot-healthy",
-    },
-    {
-      label:    "SP node (faulty)",
-      sublabel: "Degraded / offline",
-      color:    "#ef4444",
-      type:     "dot-faulty",
-    },
-    {
-      label:    "Hoàng Sa · Trường Sa",
-      sublabel: "Chủ quyền Việt Nam 🇻🇳",
-      color:    "#d97706",
-      type:     "sov",
-    },
+function healthVariant(h: string): "green" | "red" {
+  return h === "Healthy" ? "green" : "red";
+}
+
+function stateVariant(s: string): "green" | "yellow" | "gray" | "red" {
+  if (s === "Active")     return "green";
+  if (s === "Waitlisted") return "yellow";
+  if (s === "Frozen")     return "gray";
+  if (s === "Leaving")    return "yellow";
+  return "gray";
+}
+
+// ── SP detail row ──────────────────────────────────────────────────────────────
+function SPRow({ p, idx }: { p: StorageProvider; idx: number }) {
+  const zoneMeta = ZONE_META[p.availabilityZone];
+  return (
+    <tr style={{
+      borderBottom: "1px solid #f3f4f6",
+      background: idx % 2 === 0 ? "#fff" : "#fafafa",
+      transition: "background 0.1s",
+    }}
+      onMouseEnter={e => (e.currentTarget.style.background = "#f0f7ff")}
+      onMouseLeave={e => (e.currentTarget.style.background = idx % 2 === 0 ? "#fff" : "#fafafa")}
+    >
+      <td style={{ padding: "10px 16px", width: 28 }}>
+        <div style={{
+          width: 8, height: 8, borderRadius: "50%",
+          background: p.health === "Healthy" ? "#22c55e" : "#ef4444",
+          boxShadow: p.health === "Healthy" ? "0 0 6px #22c55e88" : "none",
+        }} />
+      </td>
+      <td style={{ padding: "10px 12px" }}>
+        <div style={{ fontFamily: "var(--font-mono, monospace)", fontSize: 12, color: "#111827", fontWeight: 600 }}>
+          {p.addressShort}
+        </div>
+        {p.geo?.city && (
+          <div style={{ fontSize: 10, color: "#9ca3af", marginTop: 1 }}>
+            {p.geo.city}{p.geo.countryCode ? `, ${p.geo.countryCode}` : ""}
+          </div>
+        )}
+      </td>
+      <td style={{ padding: "10px 12px" }}>
+        <div style={{ fontSize: 11, color: "#374151", fontWeight: 500 }}>
+          {zoneMeta?.label ?? p.availabilityZone}
+        </div>
+      </td>
+      <td style={{ padding: "10px 12px" }}>
+        <Badge label={p.health} variant={healthVariant(p.health)} />
+      </td>
+      <td style={{ padding: "10px 12px" }}>
+        <Badge label={p.state} variant={stateVariant(p.state)} />
+      </td>
+      <td style={{ padding: "10px 12px", textAlign: "right" }}>
+        {p.capacityTiB != null
+          ? <span style={{ fontFamily: "monospace", fontSize: 12, color: "#374151" }}>
+              {p.capacityTiB.toFixed(2)} TiB
+            </span>
+          : <span style={{ color: "#d1d5db" }}>—</span>
+        }
+      </td>
+      <td style={{ padding: "10px 16px" }}>
+        {p.blsKey && (
+          <span style={{
+            fontFamily: "monospace", fontSize: 10, color: "#9ca3af",
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+            display: "block", maxWidth: 120,
+          }} title={p.blsKey}>
+            {p.blsKey.slice(0, 10)}…
+          </span>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+// ── Summary stats bar ──────────────────────────────────────────────────────────
+function SummaryBar({ providers }: { providers: StorageProvider[] }) {
+  const healthy    = providers.filter(p => p.health  === "Healthy").length;
+  const active     = providers.filter(p => p.state   === "Active").length;
+  const zones      = new Set(providers.map(p => p.availabilityZone)).size;
+  const totalTiB   = providers.reduce((s, p) => s + (p.capacityTiB ?? 0), 0);
+
+  const stats = [
+    { label: "Total SPs",    value: providers.length, sub: "providers",    color: "#2563eb" },
+    { label: "Healthy",      value: healthy,           sub: `of ${providers.length}`, color: "#16a34a" },
+    { label: "Active",       value: active,            sub: "state",        color: "#0891b2" },
+    { label: "Zones",        value: zones,             sub: "regions",      color: "#8b5cf6" },
+    { label: "Total Capacity",value: totalTiB > 0 ? `${totalTiB.toFixed(0)} TiB` : "—",
+      sub: "raw storage", color: "#d97706", isString: true },
   ];
 
   return (
-    <div style={{ padding:"14px 20px 18px", borderTop:"1px solid #f0f0f0" }}>
-      <div style={{ fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.08em", color:"#6b7280", marginBottom:10 }}>
-        Globe legend
-      </div>
-      <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-        {items.map(item => (
-          <div key={item.label} style={{ display:"flex", alignItems:"center", gap:10 }}>
-            {/* Icon */}
-            <div style={{ flexShrink:0, width:24, display:"flex", alignItems:"center", justifyContent:"center" }}>
-              {item.type === "line" && (
-                <svg width="22" height="8" viewBox="0 0 22 8">
-                  <line x1="0" y1="4" x2="22" y2="4" stroke={item.color} strokeWidth="2.5" strokeLinecap="round"/>
-                </svg>
-              )}
-              {item.type === "line-dashed" && (
-                <svg width="22" height="8" viewBox="0 0 22 8">
-                  <line x1="0" y1="4" x2="22" y2="4" stroke={item.color} strokeWidth="2" strokeDasharray="4 3" strokeLinecap="round"/>
-                </svg>
-              )}
-              {item.type === "ring" && (
-                <svg width="16" height="16" viewBox="0 0 16 16">
-                  <circle cx="8" cy="8" r="6" fill="none" stroke={item.color} strokeWidth="1.5" strokeDasharray="3 2" opacity="0.8"/>
-                </svg>
-              )}
-              {item.type === "dot-healthy" && (
-                <svg width="12" height="12" viewBox="0 0 12 12">
-                  <circle cx="6" cy="6" r="5" fill={item.color} opacity="0.9"/>
-                </svg>
-              )}
-              {item.type === "dot-faulty" && (
-                <svg width="12" height="12" viewBox="0 0 12 12">
-                  <circle cx="6" cy="6" r="5" fill={item.color} opacity="0.9"/>
-                </svg>
-              )}
-              {item.type === "sov" && (
-                <svg width="12" height="12" viewBox="0 0 12 12">
-                  <circle cx="6" cy="6" r="5" fill={item.color}/>
-                </svg>
-              )}
-            </div>
-            {/* Text */}
-            <div>
-              <div style={{ fontSize:11, fontWeight:500, color:"#374151", lineHeight:1.3 }}>{item.label}</div>
-              <div style={{ fontSize:9.5, color:"#9ca3af", marginTop:1 }}>{item.sublabel}</div>
-            </div>
+    <div style={{
+      display: "grid",
+      gridTemplateColumns: "repeat(5, 1fr)",
+      gap: 1,
+      background: "#e5e7eb",
+      borderRadius: 12,
+      overflow: "hidden",
+      border: "1px solid #e5e7eb",
+    }}>
+      {stats.map(s => (
+        <div key={s.label} style={{
+          background: "#fff",
+          padding: "14px 18px",
+          textAlign: "center",
+        }}>
+          <div style={{
+            fontFamily: "var(--font-mono, monospace)",
+            fontSize: s.isString ? 18 : 24,
+            fontWeight: 700,
+            color: s.color,
+            letterSpacing: -0.5,
+            lineHeight: 1.1,
+          }}>
+            {s.value}
           </div>
-        ))}
-      </div>
-      <div style={{ marginTop:12, fontSize:9.5, color:"#d1d5db", borderTop:"1px solid #f9fafb", paddingTop:8 }}>
-        drag · scroll · click node to inspect
-      </div>
+          <div style={{ fontSize: 10, color: "#9ca3af", marginTop: 4, fontWeight: 500, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            {s.label}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
 
+// ── Page ───────────────────────────────────────────────────────────────────────
 export default function ProvidersPage() {
-  const { network, config } = useNetwork();
-  const { providers, loading: provLoad, error, refresh } = useProviders();
-  const [selected, setSelected] = useState<StorageProvider | null>(null);
+  const { network } = useNetwork();
+  const [providers, setProviders]   = useState<StorageProvider[]>([]);
+  const [loading,   setLoading]     = useState(true);
+  const [error,     setError]       = useState<string | null>(null);
+  const [lastAt,    setLastAt]      = useState<Date | null>(null);
+  const [filter,    setFilter]      = useState<"all" | "healthy" | "faulty">("all");
+  const [sortBy,    setSortBy]      = useState<"zone" | "health" | "state">("zone");
 
-  const { data: statsData } = useSWR<any>(
-    `/api/network/stats?network=${network}`,
-    (url: string) => fetch(url).then(r => r.json()),
-    { refreshInterval: 15_000 }
-  );
+  const fetchProviders = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/network/providers?network=${network}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const d = await res.json() as any;
+      if (d.ok && d.data?.providers) {
+        setProviders(d.data.providers);
+        setLastAt(new Date());
+        setError(null);
+      }
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [network]);
 
-  const stats: Stats       = statsData?.data?.stats ?? {};
-  const node:  NodeInfo | null = statsData?.data?.node ?? null;
-  const statsSource: string    = statsData?.data?.statsMethod ?? statsData?.data?.statsSource ?? "—";
-
-  const activeCount  = providers.filter(p => p.state === "Active").length;
-  const healthyCount = providers.filter(p => p.health === "Healthy").length;
-  const zones        = useMemo(() => new Set(providers.map(p => p.availabilityZone)).size, [providers]);
+  useEffect(() => {
+    setLoading(true);
+    setProviders([]);
+    fetchProviders();
+    const id = setInterval(fetchProviders, 60_000);
+    return () => clearInterval(id);
+  }, [fetchProviders]);
 
   if (network === "testnet") return <TestnetBanner />;
 
+  // Filter + sort
+  const filtered = providers
+    .filter(p => {
+      if (filter === "healthy") return p.health === "Healthy";
+      if (filter === "faulty")  return p.health !== "Healthy";
+      return true;
+    })
+    .sort((a, b) => {
+      if (sortBy === "zone")   return (a.availabilityZone ?? "").localeCompare(b.availabilityZone ?? "");
+      if (sortBy === "health") return a.health.localeCompare(b.health);
+      if (sortBy === "state")  return a.state.localeCompare(b.state);
+      return 0;
+    });
+
   return (
-    <div style={{ position:"fixed", inset:0, top:60, display:"flex", background:"#f3f4f6", overflow:"hidden" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 0, minHeight: "calc(100vh - 60px)" }}>
 
-      {/* ── LEFT SIDEBAR ── */}
-      <div style={{ width:340, flexShrink:0, background:"#ffffff", borderRight:"1px solid #e5e7eb", overflowY:"auto", display:"flex", flexDirection:"column", boxShadow:"2px 0 8px rgba(0,0,0,0.04)", zIndex:10 }}>
+      {/* ── MAP SECTION ──────────────────────────────────────────────────── */}
+      <div style={{
+        background: "#f8fafc",
+        borderBottom: "1px solid #e5e7eb",
+        padding: "0",
+        position: "relative",
+      }}>
+        {/* Map header overlay */}
+        <div style={{
+          position: "absolute", top: 12, left: 16, zIndex: 10,
+          display: "flex", alignItems: "center", gap: 10,
+        }}>
+          <div style={{
+            background: "rgba(255,255,255,0.95)",
+            border: "1px solid #e5e7eb",
+            borderRadius: 8,
+            padding: "5px 12px",
+            display: "flex", alignItems: "center", gap: 6,
+            boxShadow: "0 1px 4px rgba(0,0,0,0.08)",
+          }}>
+            <span style={{
+              width: 7, height: 7, borderRadius: "50%",
+              background: "#22c55e",
+              boxShadow: "0 0 6px #22c55e",
+              display: "inline-block",
+              animation: "live-pulse 2s ease-in-out infinite",
+            }} />
+            <span style={{ fontSize: 11, fontWeight: 600, color: "#374151", fontFamily: "monospace" }}>
+              {loading ? "Loading…" : `${providers.filter(p => p.health === "Healthy").length} nodes online`}
+            </span>
+          </div>
 
-        {/* Header */}
-        <div style={{ padding:"18px 20px 14px" }}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
-            <div style={{ display:"flex", alignItems:"center", gap:7 }}>
-              <span style={{ width:7, height:7, borderRadius:"50%", background:"#22c55e", display:"inline-block", animation:"pulse 2s infinite" }} />
-              <span style={{ fontSize:11, color:"#6b7280", fontFamily:"var(--font-mono)" }}>{provLoad ? "Loading…" : "Live"}</span>
+          {lastAt && (
+            <div style={{
+              background: "rgba(255,255,255,0.9)",
+              border: "1px solid #e5e7eb",
+              borderRadius: 6,
+              padding: "3px 9px",
+              fontSize: 10,
+              color: "#9ca3af",
+              fontFamily: "monospace",
+            }}>
+              {lastAt.toLocaleTimeString()}
             </div>
-            {node && <span style={{ fontSize:10, color:"#9ca3af", fontFamily:"var(--font-mono)" }}>Block #{node.blockHeight.toLocaleString()}</span>}
-          </div>
-          <div style={{ fontSize:20, fontWeight:700, color:"#111827", letterSpacing:-0.5 }}>Shelby Globe</div>
-          <div style={{ fontSize:12, color:"#9ca3af", marginTop:2 }}>{config.label} · Storage provider network</div>
+          )}
         </div>
 
-        <div style={{ height:1, background:"#f3f4f6" }} />
-
-        {/* Provider summary */}
-        <div style={{ padding:"14px 20px" }}>
-          <div style={{ fontSize:10, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.08em", color:"#9ca3af", marginBottom:10 }}>Provider overview</div>
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
-            {[
-              { label:"Total",   value: providers.length, color:"#2563eb" },
-              { label:"Active",  value: activeCount,      color:"#059669" },
-              { label:"Healthy", value: healthyCount,     color:"#7c3aed" },
-              { label:"Regions", value: zones,            color:"#d97706" },
-            ].map(({ label, value, color }) => (
-              <div key={label} style={{ padding:"10px 12px", background:"#f9fafb", border:"1px solid #f0f0f0", borderRadius:10, borderTop:`3px solid ${color}` }}>
-                <div style={{ fontSize:10, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.06em", marginBottom:4 }}>{label}</div>
-                <div style={{ fontFamily:"var(--font-mono)", fontSize:22, fontWeight:700, color }}>{value}</div>
-              </div>
-            ))}
-          </div>
+        {/* Sovereignty badge */}
+        <div style={{
+          position: "absolute", top: 12, right: 16, zIndex: 10,
+          background: "rgba(255,255,255,0.95)",
+          border: "1px solid rgba(217,119,6,0.3)",
+          borderRadius: 8,
+          padding: "4px 10px",
+          fontSize: 9,
+          color: "#92400e",
+          fontFamily: "monospace",
+          boxShadow: "0 1px 4px rgba(0,0,0,0.06)",
+        }}>
+          🇻🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
         </div>
 
-        <div style={{ height:1, background:"#f3f4f6" }} />
-
-        {/* Network metrics */}
-        <div style={{ padding:"14px 20px" }}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
-            <div style={{ fontSize:10, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.08em", color:"#9ca3af" }}>Network metrics</div>
-            {statsSource !== "—" && (
-              <span style={{ fontSize:9, color:"#9ca3af", background:"#f3f4f6", padding:"1px 6px", borderRadius:4, fontFamily:"var(--font-mono)" }}>
-                {statsSource}
-              </span>
-            )}
+        {loading && providers.length === 0 ? (
+          <div style={{
+            height: 340,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            background: "#f0f7ff",
+            color: "#9ca3af", fontSize: 13, fontFamily: "monospace",
+          }}>
+            <div style={{ textAlign: "center" }}>
+              <div style={{
+                width: 32, height: 32, border: "2px solid #e5e7eb",
+                borderTop: "2px solid #2563eb", borderRadius: "50%",
+                margin: "0 auto 12px",
+                animation: "spin 1s linear infinite",
+              }} />
+              Loading providers…
+            </div>
           </div>
-          <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-            {[
-              { label:"Total blobs",  value: fmt(stats.totalBlobs),            icon:"◈", color:"#2563eb" },
-              { label:"Storage used", value: fmtBytes(stats.totalStorageUsedBytes), icon:"▣", color:"#059669" },
-              { label:"Blob events",  value: fmt(stats.totalBlobEvents),        icon:"↯", color:"#9333ea" },
-              { label:"Slices",       value: fmt(stats.slices),                 icon:"⬡", color:"#d97706" },
-              { label:"Pl. groups",   value: fmt(stats.placementGroups),        icon:"▦", color:"#0891b2" },
-            ].map(({ label, value, icon, color }) => (
-              <div key={label} style={{ display:"flex", alignItems:"center", gap:10, padding:"8px 12px", background:"#f9fafb", border:"1px solid #f0f0f0", borderRadius:8 }}>
-                <span style={{ fontSize:14, color, opacity:0.85, flexShrink:0 }}>{icon}</span>
-                <div style={{ flex:1, minWidth:0 }}>
-                  <div style={{ fontSize:9, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.06em" }}>{label}</div>
-                  <div style={{ fontFamily:"var(--font-mono)", fontSize:15, fontWeight:700, color:"#111827", marginTop:1 }}>{value}</div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div style={{ height:1, background:"#f3f4f6" }} />
-
-        {/* Provider list */}
-        <div style={{ padding:"14px 20px", flex:1 }}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
-            <div style={{ fontSize:10, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.08em", color:"#9ca3af" }}>Storage providers</div>
-            <button onClick={refresh} style={{ background:"none", border:"none", cursor:"pointer", fontSize:11, color:"#6b7280", padding:"2px 6px", borderRadius:5, fontFamily:"var(--font-mono)" }}>⟳ Refresh</button>
-          </div>
-          {error && <div style={{ fontSize:11, color:"#ef4444", marginBottom:8 }}>⚠ {error}</div>}
-          <div style={{ display:"flex", flexDirection:"column", gap:3 }}>
-            {providers.map(p => (
-              <button key={p.address} onClick={() => setSelected(s => s?.address === p.address ? null : p)}
-                style={{ display:"flex", alignItems:"center", gap:8, padding:"7px 10px", borderRadius:8, width:"100%", textAlign:"left", cursor:"pointer", transition:"all 0.12s", background: selected?.address === p.address ? "#eff6ff" : "transparent", border:`1px solid ${selected?.address === p.address ? "#bfdbfe" : "transparent"}` }}
-                onMouseEnter={e => { if (selected?.address !== p.address) e.currentTarget.style.background = "#f9fafb"; }}
-                onMouseLeave={e => { if (selected?.address !== p.address) e.currentTarget.style.background = "transparent"; }}
-              >
-                <span style={{ width:7, height:7, borderRadius:"50%", flexShrink:0, background: p.health === "Healthy" ? "#22c55e" : "#ef4444", boxShadow: p.health === "Healthy" ? "0 0 4px #22c55e" : "none" }} />
-                <span style={{ fontFamily:"var(--font-mono)", fontSize:11, color:"#374151", flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{p.addressShort}</span>
-                <span style={{ fontSize:9, fontWeight:600, color:"#9ca3af", background:"#f3f4f6", padding:"1px 5px", borderRadius:4, flexShrink:0 }}>
-                  {ZONE_META[p.availabilityZone]?.shortLabel ?? p.availabilityZone.replace("dc_","").toUpperCase()}
-                </span>
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* ── Legend — màu phân biệt, font đủ lớn ── */}
-        <GlobeLegend />
-      </div>
-
-      {/* ── RIGHT: Globe ── */}
-      <div style={{ flex:1, position:"relative", overflow:"hidden", background:"#f0f7ff" }}>
-        <GlobeMap providers={providers} onProviderClick={setSelected} />
-        {selected && (
-          <ProviderPanel p={selected as any} accentColor={config.color} network={network} onClose={() => setSelected(null)} />
+        ) : (
+          <ProviderMap providers={providers} onProviderClick={undefined} />
         )}
       </div>
+
+      {/* ── STATS BAR ────────────────────────────────────────────────────── */}
+      <div style={{ padding: "16px 24px", background: "#fff", borderBottom: "1px solid #f0f0f0" }}>
+        <SummaryBar providers={providers} />
+      </div>
+
+      {/* ── PROVIDER TABLE ───────────────────────────────────────────────── */}
+      <div style={{ flex: 1, background: "#fff", padding: "20px 24px" }}>
+
+        {/* Table header */}
+        <div style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          marginBottom: 14, flexWrap: "wrap", gap: 10,
+        }}>
+          <div>
+            <h2 style={{ fontSize: 16, fontWeight: 700, color: "#111827", margin: 0 }}>
+              Storage Providers
+            </h2>
+            <p style={{ fontSize: 12, color: "#9ca3af", margin: "3px 0 0", fontFamily: "monospace" }}>
+              {filtered.length} of {providers.length} providers · Auto-refresh 60s
+            </p>
+          </div>
+
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            {/* Filter buttons */}
+            <div style={{
+              display: "flex", gap: 2, background: "#f4f4f4",
+              borderRadius: 8, padding: 2,
+            }}>
+              {(["all", "healthy", "faulty"] as const).map(f => (
+                <button key={f} onClick={() => setFilter(f)} style={{
+                  padding: "5px 12px", borderRadius: 6, border: "none",
+                  fontSize: 11, fontWeight: 500, cursor: "pointer",
+                  background: filter === f ? "#fff" : "transparent",
+                  color: filter === f ? "#111827" : "#9ca3af",
+                  boxShadow: filter === f ? "0 1px 3px rgba(0,0,0,0.08)" : "none",
+                  transition: "all 0.1s",
+                  textTransform: "capitalize",
+                }}>
+                  {f}
+                </button>
+              ))}
+            </div>
+
+            {/* Sort */}
+            <select
+              value={sortBy}
+              onChange={e => setSortBy(e.target.value as any)}
+              style={{
+                padding: "5px 10px", borderRadius: 7, border: "1px solid #e5e7eb",
+                fontSize: 11, color: "#374151", background: "#fff",
+                cursor: "pointer", outline: "none",
+              }}
+            >
+              <option value="zone">Sort: Zone</option>
+              <option value="health">Sort: Health</option>
+              <option value="state">Sort: State</option>
+            </select>
+
+            {/* Refresh */}
+            <button onClick={fetchProviders} style={{
+              padding: "5px 12px", borderRadius: 7,
+              border: "1px solid #e5e7eb", background: "#fff",
+              fontSize: 11, color: "#6b7280", cursor: "pointer",
+            }}>
+              ⟳ Refresh
+            </button>
+          </div>
+        </div>
+
+        {error && (
+          <div style={{
+            background: "#fef2f2", border: "1px solid #fecaca",
+            borderRadius: 8, padding: "10px 14px", marginBottom: 12,
+            fontSize: 12, color: "#dc2626",
+          }}>
+            ⚠ {error}
+          </div>
+        )}
+
+        {/* Table */}
+        <div style={{ borderRadius: 10, border: "1px solid #e5e7eb", overflow: "hidden" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ background: "#f8fafc", borderBottom: "1px solid #e5e7eb" }}>
+                {["", "Address", "Zone", "Health", "State", "Capacity", "BLS Key"].map((h, i) => (
+                  <th key={i} style={{
+                    padding: "9px 12px",
+                    textAlign: i === 5 ? "right" : "left",
+                    fontSize: 10, fontWeight: 600,
+                    color: "#9ca3af",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.06em",
+                    whiteSpace: "nowrap",
+                    ...(i === 0 ? { width: 28, padding: "9px 16px" } : {}),
+                    ...(i === 6 ? { padding: "9px 16px" } : {}),
+                  }}>
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={7} style={{
+                    padding: "48px 16px", textAlign: "center",
+                    color: "#9ca3af", fontSize: 13,
+                  }}>
+                    {loading ? "Loading providers…" : "No providers found"}
+                  </td>
+                </tr>
+              ) : (
+                filtered.map((p, i) => <SPRow key={p.address} p={p} idx={i} />)
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <style>{`
+        @keyframes live-pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.5; }
+        }
+        @keyframes spin {
+          to { transform: rotate(360deg); }
+        }
+      `}</style>
     </div>
   );
 }

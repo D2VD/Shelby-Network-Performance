@@ -1,30 +1,49 @@
 "use client";
-// components/nav.tsx — v7.0
-// Bỏ "Monitor" tab. Giữ: Benchmark | Analytics | Globe View | Charts
+// components/nav.tsx — v7.1
+// FIX: active state logic chính xác — tránh 2 tab active cùng lúc
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useNetwork, type NetworkId } from "./network-context";
 
 const NAV_TABS = [
-  { href: "/",                    label: "Benchmark"  },
-  { href: "/dashboard",           label: "Analytics"  },
-  { href: "/dashboard/providers", label: "Map"        },
-  { href: "/dashboard/charts",    label: "Charts"     },
+  { href: "/",                    label: "Benchmark", exact: true  },
+  { href: "/dashboard",           label: "Analytics", exact: true  },
+  { href: "/dashboard/providers", label: "Map",       exact: false },
+  { href: "/dashboard/charts",    label: "Charts",    exact: false },
 ] as const;
 
 export function Nav() {
   const pathname = usePathname();
   const { network, setNetwork } = useNetwork();
 
-  const isActive = (href: string) =>
-    href === "/" ? pathname === "/" : pathname?.startsWith(href);
+  // FIX: exact match cho "/" và "/dashboard"
+  // prefix match chỉ cho các sub-pages
+  const isActive = (href: string, exact: boolean) => {
+    if (exact) return pathname === href;
+    return pathname === href || pathname?.startsWith(href + "/") || pathname === href;
+  };
 
   return (
     <nav className="nav">
       {/* Logo */}
       <div className="nav-logo">
-        <div className="nav-logo-icon">⬡</div>
+        {/* Logo có thể thay qua /public/logo.svg */}
+        <div className="nav-logo-icon">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/logo.svg"
+            alt="Shelby"
+            width={20}
+            height={20}
+            onError={e => {
+              // Fallback nếu không có logo.svg
+              (e.target as HTMLImageElement).style.display = "none";
+              const parent = (e.target as HTMLImageElement).parentElement;
+              if (parent) parent.textContent = "⬡";
+            }}
+          />
+        </div>
         <span className="nav-logo-text">
           Shelby<span> Analytics</span>
         </span>
@@ -32,11 +51,11 @@ export function Nav() {
 
       {/* Center tabs */}
       <div className="nav-tabs">
-        {NAV_TABS.map(({ href, label }) => (
+        {NAV_TABS.map(({ href, label, exact }) => (
           <Link
             key={href}
             href={`${href}${network === "testnet" ? "?network=testnet" : ""}`}
-            className={`nav-tab${isActive(href) ? " active" : ""}`}
+            className={`nav-tab${isActive(href, exact) ? " active" : ""}`}
           >
             {label}
           </Link>

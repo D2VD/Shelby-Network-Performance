@@ -1,4 +1,5 @@
 // app/api/network/stats/live/route.ts
+// Proxy → VPS /api/geo-sync/stats/live (có cache 5 phút, nhanh)
 import { type NextRequest } from "next/server";
 import { proxyToGeoSync } from "@/app/api/_proxy";
 

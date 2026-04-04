@@ -667,7 +667,7 @@ export default function BenchmarkPage() {
                   background: benchMode === m ? "var(--net-bg, #eff6ff)" : "transparent",
                   color:      benchMode === m ? "var(--net-color, #2563eb)" : "var(--gray-500)",
                 }}>
-                  {m === "adaptive" ? "🔬 Adaptive" : "⚡ Quick"}
+                  {m === "adaptive" ? "Adaptive" : "Quick"}
                 </button>
               ))}
               <span style={{ fontSize: 11, color: "var(--gray-400)" }}>

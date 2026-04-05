@@ -35,7 +35,15 @@ interface HistoryEntry {
   mode: string;
 }
 
-interface TsPoint { tsMs: number; activeBlobs: number; totalStorageGB: number; totalBlobEvents: number; pendingOrFailed: number; deletedBlobs: number; }
+interface TsPoint { 
+  tsMs: number; 
+  activeBlobs: number; 
+  totalStorageGB: number; 
+  totalBlobEvents: number; 
+  pendingOrFailed: number; 
+  deletedBlobs: number; 
+  blockHeight?: number; // Thêm dòng này (dấu ? để cho phép không bắt buộc có)
+}
 
 type Tab = "network" | "benchmark";
 type TimeRange = "1h" | "24h" | "7d" | "30d";

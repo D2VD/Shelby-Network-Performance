@@ -1,29 +1,24 @@
 "use client";
-// components/nav.tsx — v7.2
-// Fix: active state dùng exact match cho /dashboard
-// Grafana link → domain VPS trực tiếp (không qua CF Pages)
+// components/nav.tsx — v7.3
+// Thứ tự: Map | Analytics | Charts | Benchmark
+// Bỏ Monitor (truy cập trực tiếp qua api.shelbyanalytics.site/grafana)
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useNetwork, type NetworkId } from "./network-context";
 
-// GRAFANA_URL = domain VPS của bạn + /grafana
-// Ví dụ: https://api.shelbyanalytics.site/grafana
-// Hoặc subdomain riêng: https://grafana.shelbyanalytics.site
-const GRAFANA_URL = "https://api.shelbyanalytics.site/grafana";
-
+// exact=true: chỉ active khi pathname === href (tránh 2 tab active)
 const NAV_TABS = [
-  { href: "/",                    label: "Benchmark", exact: true  },
-  { href: "/dashboard",           label: "Analytics", exact: true  },
   { href: "/dashboard/providers", label: "Map",       exact: false },
+  { href: "/dashboard",           label: "Analytics", exact: true  },
   { href: "/dashboard/charts",    label: "Charts",    exact: false },
+  { href: "/",                    label: "Benchmark", exact: true  },
 ] as const;
 
 export function Nav() {
   const pathname = usePathname();
   const { network, setNetwork } = useNetwork();
 
-  // FIX: exact match cho / và /dashboard để tránh 2 tab active
   const isActive = (href: string, exact: boolean) => {
     if (exact) return pathname === href;
     return pathname === href || pathname?.startsWith(href + "/");
@@ -35,19 +30,14 @@ export function Nav() {
       <div className="nav-logo">
         <div className="nav-logo-icon">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
-            src="/logo.svg"
-            alt="Shelby"
-            width={20} height={20}
-            style={{ display: "block" }}
-          />
+          <img src="/logo.svg" alt="Shelby" width={20} height={20} style={{ display: "block" }} />
         </div>
         <span className="nav-logo-text">
           Shelby<span> Analytics</span>
         </span>
       </div>
 
-      {/* Center tabs */}
+      {/* Tabs */}
       <div className="nav-tabs">
         {NAV_TABS.map(({ href, label, exact }) => (
           <Link
@@ -58,16 +48,6 @@ export function Nav() {
             {label}
           </Link>
         ))}
-        {/* Grafana — external link tới VPS (không phải CF Pages route) */}
-        <a
-          href={GRAFANA_URL}
-          target="_blank"
-          rel="noreferrer"
-          className="nav-tab"
-          title="Grafana monitoring dashboard (VPS)"
-        >
-          Monitor ↗
-        </a>
       </div>
 
       {/* Right */}

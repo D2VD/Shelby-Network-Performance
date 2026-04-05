@@ -1,8 +1,11 @@
 "use client";
 /**
- * app/dashboard/charts/page.tsx — v7.1
- * Fix #5: Khôi phục time range filter 1h / 24h / 7d / 30d
- * Fix #4: Số đầy đủ, font lớn hơn
+ * app/dashboard/charts/page.tsx — v8.0
+ * Design theo gmonads.com:
+ * - Sections rõ ràng: Network Overview, Blob Analytics, Storage, Benchmark
+ * - Crosshair hover tooltip trên chart
+ * - Time range: 1h / 24h / 7d / 30d
+ * - Dark theme chart style
  */
 
 import { useEffect, useState, useCallback, useRef } from "react";
@@ -19,33 +22,8 @@ interface LivePoint {
   pendingOrFailed: number | null;
   deletedBlobs: number | null;
 }
-
-interface HistoryEntry {
-  id: number;
-  latency: { avg: number; min: number; max: number };
-  uploads: { bytes: number; elapsed: number; speedKbs: number; blobName: string; txHash: string | null }[];
-  downloads: { bytes: number; elapsed: number; speedKbs: number }[];
-  tx: { submitTime: number; confirmTime: number; txHash: string | null };
-  avgUploadKbs: number;
-  avgDownloadKbs: number;
-  score: number;
-  tier: string;
-  runAt: string;
-  maxSuccessfulBytes?: number;
-  mode: string;
-}
-
-interface TsPoint { 
-  tsMs: number; 
-  activeBlobs: number; 
-  totalStorageGB: number; 
-  totalBlobEvents: number; 
-  pendingOrFailed: number; 
-  deletedBlobs: number; 
-  blockHeight?: number; // Thêm dòng này (dấu ? để cho phép không bắt buộc có)
-}
-
-type Tab = "network" | "benchmark";
+interface TsPoint { tsMs: number; activeBlobs: number; totalStorageGB: number; totalBlobEvents: number; pendingOrFailed: number; deletedBlobs: number; blockHeight?: number; }
+interface BenchEntry { id: number; score: number; avgUploadKbs: number; avgDownloadKbs: number; latency: { avg: number }; tx: { submitTime: number; confirmTime: number }; mode: string; runAt: string; }
 type TimeRange = "1h" | "24h" | "7d" | "30d";
 
 const MAX_LOCAL = 120;
@@ -53,15 +31,21 @@ const POLL_MS   = 30_000;
 const LOCAL_KEY = "shelby_bench_history_v3";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+function fmtN(v: number | null): string {
+  if (v == null) return "—";
+  if (v >= 1_000_000) return `${(v/1_000_000).toFixed(2)}M`;
+  if (v >= 1_000)     return `${(v/1_000).toFixed(1)}K`;
+  return v.toLocaleString("en-US");
+}
 function fmtFull(v: number | null): string {
   if (v == null) return "—";
   return v.toLocaleString("en-US");
 }
 function fmtBytes(b: number | null): string {
-  if (b == null || b === 0) return "0 B";
-  if (b >= 1e12) return `${(b / 1e12).toFixed(2)} TB`;
-  if (b >= 1e9)  return `${(b / 1e9).toFixed(2)} GB`;
-  if (b >= 1e6)  return `${(b / 1e6).toFixed(1)} MB`;
+  if (b == null || b === 0) return "—";
+  if (b >= 1e12) return `${(b/1e12).toFixed(2)} TB`;
+  if (b >= 1e9)  return `${(b/1e9).toFixed(2)} GB`;
+  if (b >= 1e6)  return `${(b/1e6).toFixed(1)} MB`;
   return `${b} B`;
 }
 function fmtMs(ms: number): string { return ms >= 1000 ? `${(ms/1000).toFixed(2)}s` : `${ms.toFixed(0)}ms`; }
@@ -72,144 +56,259 @@ function tLabel(ts: number, range: TimeRange): string {
   return `${d.getMonth()+1}/${d.getDate()}`;
 }
 
-// ─── Line Chart ───────────────────────────────────────────────────────────────
-function LineChart({ data, color = "#2563eb", height = 140, fmtY }: {
-  data: number[]; color?: string; height?: number; fmtY?: (v: number) => string;
+// ─── Crosshair Chart ──────────────────────────────────────────────────────────
+// Styled theo gmonads.com: dark bg, hover crosshair + tooltip
+interface ChartSeries { data: number[]; color: string; name: string; fmtVal?: (v: number) => string; }
+
+function CrosshairChart({
+  series, labels, height = 160, title, sub, range,
+}: {
+  series: ChartSeries[]; labels: string[]; height?: number;
+  title?: string; sub?: string; range: TimeRange;
 }) {
-  if (data.length < 2) return (
-    <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "#d1d5db", fontSize: 13, flexDirection: "column", gap: 8 }}>
-      <div style={{ width: 22, height: 22, borderRadius: "50%", border: "2px solid #e5e7eb", borderTopColor: color, animation: "spin 1s linear infinite" }} />
+  const [hover, setHover] = useState<{ idx: number; x: number; y: number } | null>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+  const W = 600, pad = { t: 16, b: 24, l: 60, r: 12 };
+  const iW = W - pad.l - pad.r, iH = height - pad.t - pad.b;
+
+  const allData = series.flatMap(s => s.data);
+  const n = Math.max(...series.map(s => s.data.length), 1);
+  if (allData.filter(v => v > 0).length < 2) return (
+    <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: 12, flexDirection: "column", gap: 6 }}>
+      <div style={{ width: 20, height: 20, border: "2px solid #1e3a5f", borderTopColor: "#2563eb", borderRadius: "50%", animation: "spin 1s linear infinite" }} />
       Collecting data…
     </div>
   );
-  const W = 600, pad = { t: 10, b: 20, l: 58, r: 10 };
-  const iW = W - pad.l - pad.r, iH = height - pad.t - pad.b;
-  const min = Math.min(...data), max = Math.max(...data), range = max - min || 1;
-  const xs = data.map((_, i) => pad.l + (i / (data.length - 1)) * iW);
-  const ys = data.map(v => pad.t + iH - ((v - min) / range) * iH);
-  const line = xs.map((x, i) => `${x.toFixed(1)},${ys[i].toFixed(1)}`).join(" ");
-  const area = `${pad.l},${pad.t+iH} ${line} ${(pad.l+iW).toFixed(1)},${pad.t+iH}`;
-  const gId = `lc${color.replace(/[^a-z0-9]/gi, "")}`;
-  const fmt = fmtY ?? ((v: number) => {
+
+  const globalMin = Math.min(...allData.filter(v => v > 0));
+  const globalMax = Math.max(...allData);
+  const range_ = globalMax - globalMin || 1;
+
+  const xs = (i: number) => pad.l + (i / (n - 1)) * iW;
+  const ys = (v: number) => pad.t + iH - ((v - globalMin) / range_) * iH;
+
+  const fmtY = (v: number) => {
     if (v >= 1e9) return `${(v/1e9).toFixed(1)}G`;
     if (v >= 1e6) return `${(v/1e6).toFixed(1)}M`;
     if (v >= 1e3) return `${(v/1e3).toFixed(0)}K`;
     return String(Math.round(v));
-  });
+  };
+
+  const onMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const relX = ((e.clientX - rect.left) / rect.width) * W;
+    const idx = Math.round(((relX - pad.l) / iW) * (n - 1));
+    const clamped = Math.max(0, Math.min(n - 1, idx));
+    setHover({ idx: clamped, x: relX, y: e.clientY - rect.top });
+  };
+
   return (
-    <svg viewBox={`0 0 ${W} ${height}`} style={{ width: "100%", height, display: "block" }}>
-      <defs>
-        <linearGradient id={gId} x1="0" x2="0" y1="0" y2="1">
-          <stop offset="0%" stopColor={color} stopOpacity={0.15} />
-          <stop offset="100%" stopColor={color} stopOpacity={0.01} />
-        </linearGradient>
-      </defs>
-      {[0, 0.5, 1].map(f => {
-        const y = pad.t + iH - f * iH;
-        return (
-          <g key={f}>
-            <line x1={pad.l} x2={W-pad.r} y1={y} y2={y} stroke="#f0f0f0" />
-            <text x={pad.l-5} y={y+3} textAnchor="end" fontSize={9} fill="#ccc">{fmt(min + f * range)}</text>
+    <div style={{ position: "relative" }}>
+      {title && (
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: "#f1f5f9" }}>{title}</div>
+          {sub && <div style={{ fontSize: 11, color: "#475569" }}>{sub}</div>}
+        </div>
+      )}
+      <svg
+        ref={svgRef}
+        viewBox={`0 0 ${W} ${height}`}
+        style={{ width: "100%", height, display: "block", cursor: "crosshair" }}
+        onMouseMove={onMouseMove}
+        onMouseLeave={() => setHover(null)}
+      >
+        {/* Grid */}
+        {[0, 0.25, 0.5, 0.75, 1].map(f => {
+          const y = pad.t + iH - f * iH;
+          return (
+            <g key={f}>
+              <line x1={pad.l} x2={W-pad.r} y1={y} y2={y} stroke="#1e293b" strokeWidth={1} />
+              <text x={pad.l-5} y={y+3} textAnchor="end" fontSize={9} fill="#475569">{fmtY(globalMin + f * range_)}</text>
+            </g>
+          );
+        })}
+
+        {/* Gradient fills */}
+        <defs>
+          {series.map((s, si) => (
+            <linearGradient key={si} id={`g${si}`} x1="0" x2="0" y1="0" y2="1">
+              <stop offset="0%" stopColor={s.color} stopOpacity={0.2} />
+              <stop offset="100%" stopColor={s.color} stopOpacity={0.02} />
+            </linearGradient>
+          ))}
+        </defs>
+
+        {/* Series */}
+        {series.map((s, si) => {
+          if (s.data.length < 2) return null;
+          const pts = s.data.map((v, i) => `${xs(i).toFixed(1)},${ys(v).toFixed(1)}`).join(" ");
+          const area = `${pad.l},${pad.t+iH} ${pts} ${xs(s.data.length-1).toFixed(1)},${pad.t+iH}`;
+          return (
+            <g key={si}>
+              <polygon points={area} fill={`url(#g${si})`} />
+              <polyline points={pts} fill="none" stroke={s.color} strokeWidth={1.8} strokeLinejoin="round" />
+            </g>
+          );
+        })}
+
+        {/* Crosshair */}
+        {hover && (
+          <g>
+            <line x1={Math.min(Math.max(hover.x, pad.l), W-pad.r)} y1={pad.t} x2={Math.min(Math.max(hover.x, pad.l), W-pad.r)} y2={pad.t+iH} stroke="#334155" strokeWidth={1} strokeDasharray="3 3" />
+            {series.map((s, si) => {
+              const v = s.data[hover.idx];
+              if (v == null) return null;
+              return <circle key={si} cx={xs(hover.idx)} cy={ys(v)} r={4} fill={s.color} stroke="#0f172a" strokeWidth={2} />;
+            })}
           </g>
-        );
-      })}
-      <polygon points={area} fill={`url(#${gId})`} />
-      <polyline points={line} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" />
-      {xs.length > 0 && <circle cx={xs[xs.length-1]} cy={ys[ys.length-1]} r={4} fill={color} stroke="#fff" strokeWidth={2} />}
-    </svg>
-  );
-}
+        )}
 
-function MiniStat({ label, value, color }: { label: string; value: string; color: string }) {
-  return (
-    <div style={{ textAlign: "right" }}>
-      <div style={{ fontSize: 10, color: "#9ca3af", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</div>
-      <div style={{ fontFamily: "monospace", fontSize: 15, fontWeight: 700, color }}>{value}</div>
+        {/* X axis labels */}
+        {labels.length > 0 && [0, Math.floor(labels.length/2), labels.length-1].map(i => (
+          labels[i] ? (
+            <text key={i} x={xs(i)} y={height-4} textAnchor="middle" fontSize={9} fill="#475569">{labels[i]}</text>
+          ) : null
+        ))}
+      </svg>
+
+      {/* Hover tooltip */}
+      {hover && (
+        <div style={{
+          position: "absolute",
+          left: Math.min(hover.x * (100/600) + 2, 60),
+          top: Math.max(hover.y - 60, 0),
+          background: "rgba(15,23,42,0.97)",
+          border: "1px solid #334155",
+          borderRadius: 8, padding: "8px 12px",
+          fontSize: 11, pointerEvents: "none", zIndex: 50,
+          minWidth: 120,
+        }}>
+          {labels[hover.idx] && <div style={{ color: "#64748b", fontSize: 10, marginBottom: 4 }}>{labels[hover.idx]}</div>}
+          {series.map((s, si) => {
+            const v = s.data[hover.idx];
+            if (v == null) return null;
+            const fv = s.fmtVal ? s.fmtVal(v) : fmtFull(v);
+            return (
+              <div key={si} style={{ display: "flex", justifyContent: "space-between", gap: 10, color: s.color }}>
+                <span>{s.name}</span>
+                <span style={{ fontWeight: 700, fontFamily: "monospace" }}>{fv}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
 
-function StatBadge({ label, value, color = "#374151" }: { label: string; value: string; color?: string }) {
+// ─── Section wrapper ──────────────────────────────────────────────────────────
+function Section({ title, sub, children }: { title: string; sub?: string; children: React.ReactNode }) {
   return (
-    <div>
-      <div style={{ fontSize: 10, color: "#9ca3af", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>{label}</div>
-      <div style={{ fontFamily: "monospace", fontSize: 15, fontWeight: 700, color }}>{value}</div>
+    <div style={{ marginBottom: 32 }}>
+      <div style={{ marginBottom: 18 }}>
+        <h2 style={{ fontSize: 20, fontWeight: 800, color: "#f1f5f9", margin: 0 }}>{title}</h2>
+        {sub && <p style={{ fontSize: 13, color: "#475569", margin: "4px 0 0" }}>{sub}</p>}
+      </div>
+      {children}
     </div>
   );
 }
 
-// ─── Time Range Selector ──────────────────────────────────────────────────────
-function RangeBtn({ r, active, onClick }: { r: TimeRange; active: boolean; onClick: () => void }) {
+function ChartCard({ children, title, sub, latest, latestColor = "#2563eb" }: {
+  children: React.ReactNode; title: string; sub?: string; latest?: string; latestColor?: string;
+}) {
   return (
-    <button onClick={onClick} style={{
-      padding: "5px 14px", borderRadius: 8, fontSize: 12, fontWeight: active ? 700 : 400,
-      border: `1px solid ${active ? "var(--net-color, #2563eb)" : "var(--gray-200, #e5e7eb)"}`,
-      background: active ? "var(--net-bg, #eff6ff)" : "transparent",
-      color: active ? "var(--net-color, #2563eb)" : "var(--gray-500, #6b7280)",
-      cursor: "pointer", transition: "all 0.1s",
-    }}>
-      {r}
-    </button>
+    <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, padding: "18px 20px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#cbd5e1" }}>{title}</div>
+          {sub && <div style={{ fontSize: 11, color: "#475569" }}>{sub}</div>}
+        </div>
+        {latest && <div style={{ fontFamily: "monospace", fontSize: 16, fontWeight: 800, color: latestColor }}>{latest}</div>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+// ─── Overview stat strip ──────────────────────────────────────────────────────
+function OverviewStat({ label, value, change, color = "#22c55e" }: { label: string; value: string; change?: string; color?: string }) {
+  return (
+    <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 10, padding: "14px 18px" }}>
+      <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 22, fontWeight: 800, color, fontFamily: "monospace", fontVariantNumeric: "tabular-nums" }}>{value}</div>
+      {change && <div style={{ fontSize: 10, color: "#475569", marginTop: 3 }}>{change}</div>}
+    </div>
+  );
+}
+
+// ─── Time range selector ──────────────────────────────────────────────────────
+function RangeSelector({ range, onChange }: { range: TimeRange; onChange: (r: TimeRange) => void }) {
+  return (
+    <div style={{ display: "flex", gap: 4, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: 3 }}>
+      {(["1h","24h","7d","30d"] as TimeRange[]).map(r => (
+        <button key={r} onClick={() => onChange(r)} style={{
+          padding: "5px 14px", borderRadius: 6, fontSize: 12, fontWeight: range === r ? 700 : 400,
+          border: "none", cursor: "pointer",
+          background: range === r ? "#1e40af" : "transparent",
+          color: range === r ? "#93c5fd" : "#475569",
+          transition: "all 0.1s",
+        }}>
+          {r}
+        </button>
+      ))}
+    </div>
   );
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 export default function ChartsPage() {
   const { network, config } = useNetwork();
-  const [tab,      setTab]      = useState<Tab>("network");
-  const [range,    setRange]    = useState<TimeRange>("24h"); // FIX #5: time range
+  const [range,    setRange]    = useState<TimeRange>("24h");
   const [points,   setPoints]   = useState<LivePoint[]>([]);
-  const [polling,  setPolling]  = useState(false);
-  const [lastError, setLastError] = useState<string | null>(null);
-  const [lastFetch, setLastFetch] = useState<Date | null>(null);
-  const [history,  setHistory]  = useState<HistoryEntry[]>([]);
-  // Timeseries from VPS Redis
   const [tsData,   setTsData]   = useState<TsPoint[]>([]);
+  const [polling,  setPolling]  = useState(false);
+  const [lastFetch, setLastFetch] = useState<Date | null>(null);
+  const [bench,    setBench]    = useState<BenchEntry[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // ── Network fetch ──
+  // Fetch live stats
   const fetchLive = useCallback(async () => {
     setPolling(true);
     try {
       const res  = await fetch(`/api/network/stats/live?network=${network}`);
       const json = await res.json() as any;
-      if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
       const d = json.data ?? json;
-      const point: LivePoint = {
-        ts:                Date.now(),
-        blockHeight:       d.blockHeight ?? d.node?.blockHeight ?? 0,
-        activeBlobs:       d.activeBlobs  ?? d.stats?.totalBlobs ?? null,
-        totalStorageBytes: d.totalStorageBytes ?? d.stats?.totalStorageUsedBytes ?? null,
-        totalBlobEvents:   d.totalBlobEvents ?? d.stats?.totalBlobEvents ?? null,
-        pendingOrFailed:   d.pendingOrFailed ?? null,
-        deletedBlobs:      d.deletedBlobs ?? null,
-      };
-      setPoints(prev => [...prev, point].slice(-MAX_LOCAL));
+      setPoints(prev => [...prev, {
+        ts: Date.now(),
+        blockHeight: d.blockHeight ?? 0,
+        activeBlobs: d.activeBlobs ?? null,
+        totalStorageBytes: d.totalStorageBytes ?? null,
+        totalBlobEvents: d.totalBlobEvents ?? null,
+        pendingOrFailed: d.pendingOrFailed ?? null,
+        deletedBlobs: d.deletedBlobs ?? null,
+      }].slice(-MAX_LOCAL));
       setLastFetch(new Date());
-      setLastError(null);
-    } catch (e: any) {
-      setLastError(e.message);
-    } finally {
-      setPolling(false);
-    }
+    } catch {}
+    setPolling(false);
   }, [network]);
 
-  // ── Timeseries fetch (VPS Redis) ── FIX #5
-  const fetchTimeseries = useCallback(async (r: TimeRange) => {
+  // Fetch timeseries
+  const fetchTs = useCallback(async (r: TimeRange) => {
     try {
-      const resolution = r === "1h" ? "5m" : r === "24h" ? "5m" : "1h";
-      const res = await fetch(`/api/network/stats/timeseries?network=${network}&resolution=${resolution}&range=${r}`);
+      const res_ = r === "1h" || r === "24h" ? "5m" : "1h";
+      const res = await fetch(`/api/network/stats/timeseries?network=${network}&resolution=${res_}&range=${r}`);
       if (!res.ok) return;
       const j = await res.json() as any;
-      const series: TsPoint[] = (j.data?.series ?? []).map((s: any) => ({
-        tsMs:            s.tsMs,
-        activeBlobs:     s.activeBlobs ?? 0,
-        totalStorageGB:  s.totalStorageGB ?? 0,
+      setTsData((j.data?.series ?? []).map((s: any) => ({
+        tsMs: s.tsMs, activeBlobs: s.activeBlobs ?? 0,
+        totalStorageGB: s.totalStorageGB ?? 0,
         totalBlobEvents: s.totalBlobEvents ?? 0,
         pendingOrFailed: s.pendingOrFailed ?? 0,
-        deletedBlobs:    s.deletedBlobs ?? 0,
-      }));
-      setTsData(series);
+        deletedBlobs: s.deletedBlobs ?? 0,
+        blockHeight: s.blockHeight ?? 0,
+      })));
     } catch {}
   }, [network]);
 
@@ -220,257 +319,205 @@ export default function ChartsPage() {
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
   }, [fetchLive]);
 
-  useEffect(() => {
-    if (tab === "network") fetchTimeseries(range);
-  }, [tab, range, fetchTimeseries]);
+  useEffect(() => { fetchTs(range); }, [range, fetchTs]);
 
-  // ── Benchmark ──
+  // Bench from localStorage
   useEffect(() => {
-    if (tab !== "benchmark") return;
     try {
       const s = localStorage.getItem(LOCAL_KEY);
-      if (s) setHistory(JSON.parse(s) as HistoryEntry[]);
+      if (s) setBench(JSON.parse(s));
     } catch {}
-  }, [tab]);
+  }, []);
 
-  // Chart data: nếu có timeseries từ VPS dùng đó, không thì dùng local points
-  const chartData = tsData.length > 0 ? tsData : points.map(p => ({
-    tsMs:            p.ts,
-    activeBlobs:     p.activeBlobs ?? 0,
-    totalStorageGB:  p.totalStorageBytes ? p.totalStorageBytes / 1e9 : 0,
+  // Use timeseries if available, else local points
+  const cd = tsData.length > 0 ? tsData : points.map(p => ({
+    tsMs: p.ts, activeBlobs: p.activeBlobs ?? 0,
+    totalStorageGB: p.totalStorageBytes ? p.totalStorageBytes/1e9 : 0,
     totalBlobEvents: p.totalBlobEvents ?? 0,
     pendingOrFailed: p.pendingOrFailed ?? 0,
-    deletedBlobs:    p.deletedBlobs ?? 0,
+    deletedBlobs: p.deletedBlobs ?? 0,
+    blockHeight: p.blockHeight,
   }));
 
+  const labels = cd.map(p => tLabel(p.tsMs, range));
   const latest = points[points.length - 1];
+  const latestTs = cd[cd.length - 1];
 
   if (network === "testnet") return <TestnetBanner />;
 
   return (
-    <div>
+    <div style={{ background: "#020617", minHeight: "100vh", padding: "0 0 48px" }}>
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
 
-      {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 14, marginBottom: 22 }}>
+      {/* Page Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 14, marginBottom: 28 }}>
         <div>
-          <h1 style={{ fontSize: 26, fontWeight: 800, color: "#111827", margin: 0, letterSpacing: -0.6 }}>Network Charts</h1>
-          <p style={{ fontSize: 13, color: "#9ca3af", margin: "4px 0 0" }}>
-            {config.label} · {POLL_MS/1000}s polling · {points.length} local pts
-            {lastFetch && ` · ${lastFetch.toLocaleTimeString()}`}
+          <h1 style={{ fontSize: 26, fontWeight: 800, color: "#f1f5f9", margin: 0, letterSpacing: -0.5 }}>Network Analytics</h1>
+          <p style={{ fontSize: 13, color: "#475569", margin: "4px 0 0" }}>
+            {config.label} · {POLL_MS/1000}s polling · {lastFetch ? lastFetch.toLocaleTimeString() : "—"}
           </p>
         </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          {/* Tab */}
-          <div style={{ display: "flex", background: "#f4f4f4", borderRadius: 10, padding: 3, gap: 2 }}>
-            {(["network", "benchmark"] as Tab[]).map(t => (
-              <button key={t} onClick={() => setTab(t)} style={{
-                padding: "6px 16px", borderRadius: 8, fontSize: 13, cursor: "pointer",
-                fontWeight: tab === t ? 700 : 400, color: tab === t ? "#0a0a0a" : "#999",
-                background: tab === t ? "#fff" : "transparent",
-                boxShadow: tab === t ? "0 1px 4px rgba(0,0,0,0.08)" : "none", border: "none",
-              }}>
-                {t === "network" ? "🌐 Network" : "⚡ Benchmark"}
-              </button>
-            ))}
-          </div>
-          <button onClick={fetchLive} disabled={polling} className="btn btn-secondary" style={{ fontSize: 12 }}>
-            {polling ? "⟳ Fetching…" : "⟳ Refresh"}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <RangeSelector range={range} onChange={setRange} />
+          <button onClick={fetchLive} disabled={polling} style={{
+            padding: "7px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600,
+            background: "#1e293b", border: "1px solid #334155", color: "#94a3b8", cursor: "pointer",
+          }}>
+            {polling ? "⟳ Syncing…" : "⟳ Refresh"}
           </button>
         </div>
       </div>
 
-      {lastError && (
-        <div className="alert alert-error" style={{ marginBottom: 16 }}>⚠ {lastError}</div>
-      )}
+      {/* ── Block Overview ── */}
+      <Section title="Block Overview" sub="Last block stats from Shelbynet">
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10, marginBottom: 18 }}>
+          <OverviewStat label="Block Height"       value={latest ? `#${latest.blockHeight.toLocaleString("en-US")}` : "—"} color="#38bdf8" />
+          <OverviewStat label="Active Blobs"       value={fmtN(latestTs?.activeBlobs ?? null)}       color="#22c55e" />
+          <OverviewStat label="Storage Used"       value={latestTs ? `${latestTs.totalStorageGB.toFixed(2)} GB` : "—"} color="#a78bfa" />
+          <OverviewStat label="Blob Events"        value={fmtN(latestTs?.totalBlobEvents ?? null)}   color="#fb923c" />
+          <OverviewStat label="Pending Blobs"      value={fmtN(latestTs?.pendingOrFailed ?? null)}   color="#fbbf24" />
+          <OverviewStat label="Deleted Blobs"      value={fmtN(latestTs?.deletedBlobs ?? null)}      color="#f87171" />
+        </div>
+      </Section>
 
-      {/* ── NETWORK TAB ── */}
-      {tab === "network" && (
-        <>
-          {/* FIX #5: Time range selector */}
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 18, flexWrap: "wrap" }}>
-            <span style={{ fontSize: 13, color: "#6b7280", fontWeight: 500 }}>Time range:</span>
-            {(["1h", "24h", "7d", "30d"] as TimeRange[]).map(r => (
-              <RangeBtn key={r} r={r} active={range === r} onClick={() => setRange(r)} />
+      {/* ── Blob Analytics ── */}
+      <Section title="Blob Analytics" sub="Blob count and activity over time">
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+          <ChartCard title="Active Blobs" sub={`${range} window`}
+            latest={fmtN(latestTs?.activeBlobs ?? null)} latestColor="#22c55e">
+            <CrosshairChart range={range} series={[{ data: cd.map(p => p.activeBlobs), color: "#22c55e", name: "Active", fmtVal: fmtFull }]} labels={labels} height={150} />
+          </ChartCard>
+          <ChartCard title="Blob Events" sub="blob_activities_aggregate count"
+            latest={fmtN(latestTs?.totalBlobEvents ?? null)} latestColor="#fb923c">
+            <CrosshairChart range={range} series={[{ data: cd.map(p => p.totalBlobEvents), color: "#fb923c", name: "Events", fmtVal: fmtFull }]} labels={labels} height={150} />
+          </ChartCard>
+        </div>
+        <ChartCard title="Pending & Deleted Blobs" sub="Anomaly tracking">
+          <CrosshairChart range={range} height={130} labels={labels} series={[
+            { data: cd.map(p => p.pendingOrFailed), color: "#fbbf24", name: "Pending", fmtVal: fmtFull },
+            { data: cd.map(p => p.deletedBlobs),    color: "#f87171", name: "Deleted", fmtVal: fmtFull },
+          ]} />
+        </ChartCard>
+      </Section>
+
+      {/* ── Storage Analytics ── */}
+      <Section title="Storage Analytics" sub="Storage capacity and utilization">
+        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 14 }}>
+          <ChartCard title="Storage Used (GB)" sub="Active blobs sum.size from Shelby Indexer"
+            latest={latestTs ? `${latestTs.totalStorageGB.toFixed(2)} GB` : "—"} latestColor="#a78bfa">
+            <CrosshairChart range={range} height={160} labels={labels} series={[
+              { data: cd.map(p => p.totalStorageGB), color: "#a78bfa", name: "GB", fmtVal: v => `${v.toFixed(2)} GB` },
+            ]} />
+          </ChartCard>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {[
+              { label: "Total Storage", val: latestTs ? `${latestTs.totalStorageGB.toFixed(2)} GB`: "-", c: "#a78bfa" },
+              { label: "Active Blobs",  val: fmtN(latestTs?.activeBlobs ?? null), c: "#22c55e" },
+              { label: "Avg Blob Size", val: latestTs && latestTs.activeBlobs > 0 ? `${((latestTs.totalStorageGB*1e9)/latestTs.activeBlobs/1024).toFixed(0)} KB` : "—", c: "#38bdf8" },
+            ].map(({ label, val, c }) => (
+              <div key={label} style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 10, padding: "14px 16px", flex: 1 }}>
+                <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 5 }}>{label}</div>
+                <div style={{ fontSize: 22, fontWeight: 800, color: c, fontFamily: "monospace" }}>{val}</div>
+              </div>
             ))}
-            <span style={{ fontSize: 11, color: "#d1d5db", fontFamily: "monospace" }}>
-              {tsData.length > 0 ? `${tsData.length} pts (VPS timeseries)` : `${points.length} pts (local)`}
-            </span>
+          </div>
+        </div>
+      </Section>
+
+      {/* ── Block Height ── */}
+      <Section title="Block Performance" sub="Block height progression on Shelbynet">
+        <ChartCard title="Block Height" sub="Aptos block progression"
+          latest={latest ? `#${latest.blockHeight.toLocaleString("en-US")}` : "—"} latestColor="#38bdf8">
+          <CrosshairChart range={range} height={140} labels={labels} series={[
+            { data: cd.map(p => p.blockHeight ?? 0).filter(Boolean).length > 0 ? cd.map(p => p.blockHeight ?? 0) : points.map(p => p.blockHeight).filter(Boolean), color: "#38bdf8", name: "Block", fmtVal: v => `#${Math.round(v).toLocaleString("en-US")}` },
+          ]} />
+        </ChartCard>
+      </Section>
+
+      {/* ── Benchmark ── */}
+      {bench.length > 0 && (
+        <Section title="Benchmark Analytics" sub="Historical performance from your benchmark runs">
+          {/* Summary strip */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10, marginBottom: 18 }}>
+            {(() => {
+              const n = bench.length;
+              const avg = (fn: (h: BenchEntry) => number) => Math.round(bench.reduce((s,h) => s + fn(h), 0) / n);
+              return [
+                { label: "Total Runs",  val: String(n),                                   c: "#94a3b8" },
+                { label: "Avg Score",   val: `${avg(h=>h.score)}/1000`,                   c: avg(h=>h.score)>=700?"#22c55e":"#fbbf24" },
+                { label: "Avg Upload",  val: fmtKbs(avg(h=>h.avgUploadKbs)),              c: "#38bdf8" },
+                { label: "Avg Download",val: fmtKbs(avg(h=>h.avgDownloadKbs)),            c: "#34d399" },
+                { label: "Avg Latency", val: fmtMs(avg(h=>h.latency?.avg??0)),            c: "#c084fc" },
+                { label: "Avg TX",      val: fmtMs(avg(h=>h.tx?.confirmTime??0)),         c: "#fb923c" },
+              ].map(({ label, val, c }) => <OverviewStat key={label} label={label} value={val} color={c} />);
+            })()}
           </div>
 
-          {/* Live strip */}
-          {latest && (
-            <div className="card" style={{ marginBottom: 18 }}>
-              <div className="card-body" style={{ padding: "14px 22px", display: "flex", gap: 24, flexWrap: "wrap", alignItems: "center" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#22c55e", display: "inline-block" }} />
-                  <span style={{ fontSize: 13, color: "#6b7280" }}>Live</span>
-                </div>
-                {[
-                  { label: "Block",   value: `#${latest.blockHeight.toLocaleString("en-US")}`,        color: "var(--net-color, #2563eb)" },
-                  { label: "Blobs",   value: fmtFull(latest.activeBlobs),                              color: "#374151" },
-                  { label: "Storage", value: fmtBytes(latest.totalStorageBytes),                        color: "#16a34a" },
-                  { label: "Events",  value: fmtFull(latest.totalBlobEvents),                           color: "#9333ea" },
-                  { label: "Pending", value: fmtFull(latest.pendingOrFailed),                           color: "#f59e0b" },
-                ].map(({ label, value, color }) => (
-                  <StatBadge key={label} label={label} value={value} color={color} />
-                ))}
-                <div style={{ marginLeft: "auto", fontSize: 11, color: "#d1d5db", fontFamily: "monospace" }}>
-                  Range: {range}
-                </div>
-              </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+            <ChartCard title="Score per Run" sub="Benchmark score history"
+              latest={`${bench[bench.length-1]?.score ?? 0}/1000`}
+              latestColor={bench[bench.length-1]?.score >= 700 ? "#22c55e" : "#fbbf24"}>
+              <CrosshairChart range={range} height={130} labels={bench.map(h => h.runAt.split(" ")[1]?.slice(0,5) ?? "")} series={[
+                { data: bench.map(h => h.score), color: "#818cf8", name: "Score", fmtVal: v => `${Math.round(v)}/1000` },
+              ]} />
+            </ChartCard>
+            <ChartCard title="Upload & Download Speed" sub="KB/s performance">
+              <CrosshairChart range={range} height={130} labels={bench.map(h => h.runAt.split(" ")[1]?.slice(0,5) ?? "")} series={[
+                { data: bench.map(h => h.avgUploadKbs),   color: "#38bdf8", name: "Upload",   fmtVal: fmtKbs },
+                { data: bench.map(h => h.avgDownloadKbs), color: "#34d399", name: "Download", fmtVal: fmtKbs },
+              ]} />
+            </ChartCard>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14, marginBottom: 18 }}>
+            {[
+              { title: "Avg Latency",  data: bench.map(h=>h.latency?.avg??0), color: "#c084fc", fmtV: fmtMs },
+              { title: "TX Submit",    data: bench.map(h=>h.tx?.submitTime??0), color: "#fb923c", fmtV: fmtMs },
+              { title: "TX Confirm",   data: bench.map(h=>h.tx?.confirmTime??0), color: "#f87171", fmtV: fmtMs },
+            ].map(({ title, data, color, fmtV }) => (
+              <ChartCard key={title} title={title} latest={data.length > 0 ? fmtV(data[data.length-1]) : "—"} latestColor={color}>
+                <CrosshairChart range={range} height={100} labels={bench.map(h=>h.runAt.split(" ")[1]?.slice(0,5)??"") } series={[{ data, color, name: title, fmtVal: fmtV }]} />
+              </ChartCard>
+            ))}
+          </div>
+
+          {/* Run history table */}
+          <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 12, overflow: "hidden" }}>
+            <div style={{ padding: "14px 18px", borderBottom: "1px solid #1e293b" }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: "#cbd5e1" }}>Run History</div>
+              <div style={{ fontSize: 11, color: "#475569" }}>{bench.length} runs</div>
             </div>
-          )}
-
-          {/* Charts */}
-          {[
-            { title: "Active Blobs", sub: `${range} window`, key: "activeBlobs" as keyof TsPoint, color: "#2563eb", latest: fmtFull(latest?.activeBlobs ?? null), height: 140 },
-            { title: "Block Height", sub: "Chain progress",  key: "blockHeight" as keyof TsPoint, color: "#059669", latest: latest ? `#${latest.blockHeight.toLocaleString("en-US")}` : "—", height: 120 },
-            { title: "Storage Used (GB)", sub: "Shelby Indexer", key: "totalStorageGB" as keyof TsPoint, color: "#9333ea", latest: chartData.length > 0 ? `${chartData[chartData.length-1].totalStorageGB.toFixed(2)} GB` : "—", height: 120 },
-            { title: "Blob Events",  sub: "blob_activities", key: "totalBlobEvents" as keyof TsPoint, color: "#d97706", latest: fmtFull(latest?.totalBlobEvents ?? null), height: 120 },
-            { title: "Pending/Failed Blobs", sub: "is_written=0", key: "pendingOrFailed" as keyof TsPoint, color: "#f59e0b", latest: fmtFull(latest?.pendingOrFailed ?? null), height: 110 },
-            { title: "Deleted Blobs", sub: "is_deleted=1",   key: "deletedBlobs" as keyof TsPoint,  color: "#ef4444", latest: fmtFull(latest?.deletedBlobs ?? null), height: 110 },
-          ].map(({ title, sub, key, color, latest: lat, height }) => {
-            const data = key === "blockHeight"
-              ? points.map(p => p.blockHeight).filter(Boolean)
-              : chartData.map(p => Number(p[key] ?? 0)).filter(v => v > 0);
-            return (
-              <div key={title} className="card" style={{ marginBottom: 16 }}>
-                <div className="card-header">
-                  <div>
-                    <div className="card-title" style={{ fontSize: 15 }}>{title} — {range}</div>
-                    <div className="card-subtitle">{sub}</div>
-                  </div>
-                  {data.length > 0 && <MiniStat label="Latest" value={lat} color={color} />}
-                </div>
-                <div className="card-body" style={{ paddingTop: 8, paddingBottom: 4 }}>
-                  <LineChart data={data} color={color} height={height} />
-                </div>
-                {/* X-axis labels */}
-                {chartData.length > 1 && (
-                  <div style={{ padding: "0 22px 10px", display: "flex", justifyContent: "space-between", fontSize: 10, color: "#d1d5db", fontFamily: "monospace" }}>
-                    <span>{tLabel(chartData[0].tsMs, range)}</span>
-                    <span>{tLabel(chartData[chartData.length-1].tsMs, range)}</span>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </>
-      )}
-
-      {/* ── BENCHMARK TAB ── */}
-      {tab === "benchmark" && (
-        <>
-          {history.length === 0 ? (
-            <div className="card" style={{ padding: "40px 24px", textAlign: "center" }}>
-              <div style={{ fontSize: 30, marginBottom: 10 }}>📊</div>
-              <div style={{ fontSize: 15, color: "#9ca3af" }}>No benchmark data yet</div>
-              <div style={{ fontSize: 12, color: "#d1d5db", marginTop: 6 }}>Run benchmarks on the Benchmark page</div>
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead>
+                  <tr style={{ background: "#0a1628" }}>
+                    {["#","Mode","Score","Upload","Download","Latency","TX Submit","TX Confirm","At"].map(h => (
+                      <th key={h} style={{ padding: "8px 12px", textAlign: "left", fontSize: 10, fontWeight: 600, color: "#475569", textTransform: "uppercase", letterSpacing: "0.06em", whiteSpace: "nowrap" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...bench].reverse().map((h, i) => {
+                    const c = h.score >= 900 ? "#22c55e" : h.score >= 600 ? "#fbbf24" : "#f87171";
+                    return (
+                      <tr key={h.id ?? i} style={{ borderTop: "1px solid #1e293b" }}>
+                        <td style={{ padding: "8px 12px", color: "#475569", fontFamily: "monospace" }}>#{h.id ?? i}</td>
+                        <td><span style={{ fontSize: 10, fontWeight: 700, color: "#818cf8", textTransform: "uppercase" }}>{h.mode}</span></td>
+                        <td><span style={{ fontFamily: "monospace", fontWeight: 800, color: c }}>{h.score}</span></td>
+                        <td style={{ fontFamily: "monospace", color: "#38bdf8" }}>{fmtKbs(h.avgUploadKbs)}</td>
+                        <td style={{ fontFamily: "monospace", color: "#34d399" }}>{h.avgDownloadKbs > 0 ? fmtKbs(h.avgDownloadKbs) : <span style={{ color: "#334155" }}>—</span>}</td>
+                        <td style={{ fontFamily: "monospace", color: "#c084fc" }}>{fmtMs(h.latency?.avg ?? 0)}</td>
+                        <td style={{ fontFamily: "monospace", color: "#fb923c" }}>{fmtMs(h.tx?.submitTime ?? 0)}</td>
+                        <td style={{ fontFamily: "monospace", color: "#f87171" }}>{fmtMs(h.tx?.confirmTime ?? 0)}</td>
+                        <td style={{ color: "#334155", fontFamily: "monospace", fontSize: 10 }}>{h.runAt}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
-          ) : (
-            <>
-              {/* Summary */}
-              <div className="card" style={{ marginBottom: 16 }}>
-                <div className="card-body" style={{ padding: "14px 22px", display: "flex", gap: 28, flexWrap: "wrap" }}>
-                  {(() => {
-                    const n   = history.length;
-                    const avg = (fn: (h: HistoryEntry) => number) => Math.round(history.reduce((s, h) => s + fn(h), 0) / n);
-                    return [
-                      { label: "Total Runs",   value: String(n), color: "#374151" },
-                      { label: "Avg Score",    value: `${avg(h => h.score)}/1000`, color: avg(h => h.score) >= 700 ? "#16a34a" : "#d97706" },
-                      { label: "Avg Upload",   value: fmtKbs(avg(h => h.avgUploadKbs)), color: "#2563eb" },
-                      { label: "Avg Download", value: fmtKbs(avg(h => h.avgDownloadKbs)), color: "#16a34a" },
-                      { label: "Avg Latency",  value: fmtMs(avg(h => h.latency?.avg ?? 0)), color: "#9333ea" },
-                      { label: "Avg TX",       value: fmtMs(avg(h => h.tx?.confirmTime ?? 0)), color: "#f59e0b" },
-                    ].map(p => <StatBadge key={p.label} {...p} />);
-                  })()}
-                </div>
-              </div>
-
-              {/* Score chart */}
-              <div className="card" style={{ marginBottom: 16 }}>
-                <div className="card-header">
-                  <div><div className="card-title" style={{ fontSize: 15 }}>Score per run</div></div>
-                  <MiniStat label="Latest" value={`${history[history.length-1]?.score ?? 0}/1000`} color="#2563eb" />
-                </div>
-                <div className="card-body" style={{ paddingTop: 8, paddingBottom: 4 }}>
-                  <LineChart data={history.map(h => h.score)} color="#2563eb" height={140} fmtY={v => `${v}`} />
-                </div>
-              </div>
-
-              {/* Upload + Download */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
-                {[
-                  { title: "Upload Speed", data: history.map(h => h.avgUploadKbs), color: "#2563eb", fmt: fmtKbs },
-                  { title: "Download Speed", data: history.map(h => h.avgDownloadKbs), color: "#16a34a", fmt: fmtKbs },
-                ].map(({ title, data, color, fmt }) => (
-                  <div key={title} className="card">
-                    <div className="card-header">
-                      <div><div className="card-title">{title}</div></div>
-                      {data.length > 0 && <MiniStat label="Latest" value={fmt(data[data.length-1])} color={color} />}
-                    </div>
-                    <div className="card-body" style={{ paddingTop: 8, paddingBottom: 4 }}>
-                      <LineChart data={data} color={color} height={110} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {/* Latency + TX Submit + TX Confirm */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16, marginBottom: 16 }}>
-                {[
-                  { title: "Avg Latency",  data: history.map(h => h.latency?.avg ?? 0), color: "#9333ea" },
-                  { title: "TX Submit",    data: history.map(h => h.tx?.submitTime ?? 0), color: "#f59e0b" },
-                  { title: "TX Confirm",   data: history.map(h => h.tx?.confirmTime ?? 0), color: "#ef4444" },
-                ].map(({ title, data, color }) => (
-                  <div key={title} className="card">
-                    <div className="card-header">
-                      <div><div className="card-title">{title}</div></div>
-                      {data.length > 0 && <MiniStat label="Latest" value={fmtMs(data[data.length-1])} color={color} />}
-                    </div>
-                    <div className="card-body" style={{ paddingTop: 8, paddingBottom: 4 }}>
-                      <LineChart data={data} color={color} height={100} fmtY={v => `${v.toFixed(0)}ms`} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {/* Run history table */}
-              <div className="card">
-                <div className="card-header">
-                  <div><div className="card-title" style={{ fontSize: 15 }}>Run History</div><div className="card-subtitle">{history.length} runs</div></div>
-                </div>
-                <div className="card-body" style={{ padding: 0, overflowX: "auto" }}>
-                  <table className="data-table" style={{ minWidth: 750 }}>
-                    <thead>
-                      <tr><th>#</th><th>Mode</th><th>Score</th><th>Upload</th><th>Download</th><th>Latency</th><th>TX Submit</th><th>TX Confirm</th><th>At</th></tr>
-                    </thead>
-                    <tbody>
-                      {[...history].reverse().map((h, i) => {
-                        const TIER_C: Record<string, string> = { "Blazing Fast": "#16a34a", "Excellent": "#059669", "Good": "#ca8a04", "Fair": "#d97706", "Poor": "#dc2626" };
-                        const c = TIER_C[h.tier] ?? "#6b7280";
-                        return (
-                          <tr key={h.id ?? i}>
-                            <td style={{ fontSize: 12 }}><span style={{ color: "#9ca3af", fontFamily: "monospace" }}>#{h.id ?? i}</span></td>
-                            <td><span style={{ fontSize: 11, fontWeight: 700, color: "#2563eb", textTransform: "uppercase" }}>{h.mode}</span></td>
-                            <td><span style={{ fontFamily: "monospace", fontWeight: 700, color: c, fontSize: 14 }}>{h.score}</span></td>
-                            <td style={{ fontFamily: "monospace", fontSize: 13 }}>{fmtKbs(h.avgUploadKbs)}</td>
-                            <td style={{ fontFamily: "monospace", fontSize: 13 }}>{h.avgDownloadKbs > 0 ? fmtKbs(h.avgDownloadKbs) : <span style={{ color: "#d1d5db" }}>—</span>}</td>
-                            <td style={{ fontFamily: "monospace", fontSize: 13 }}>{fmtMs(h.latency?.avg ?? 0)}</td>
-                            <td style={{ fontFamily: "monospace", fontSize: 13 }}>{fmtMs(h.tx?.submitTime ?? 0)}</td>
-                            <td style={{ fontFamily: "monospace", fontSize: 13 }}>{fmtMs(h.tx?.confirmTime ?? 0)}</td>
-                            <td style={{ fontSize: 11, color: "#9ca3af", fontFamily: "monospace" }}>{h.runAt}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </>
-          )}
-        </>
+          </div>
+        </Section>
       )}
     </div>
   );

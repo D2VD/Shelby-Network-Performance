@@ -40,7 +40,7 @@ const ADAPTIVE_SIZES = [1_024, 65_536, 524_288, 2_097_152, 5_242_880, 10_485_760
 const STANDARD_SIZES = [1_024, 10_240, 102_400];
 const MAX_CUSTOM_BYTES = 10 * 1024 * 1024;
 const LOCAL_KEY = "shelby_bench_history_v3";
-const MAX_HISTORY = 20;
+const MAX_HISTORY = 10;
 
 const STEPS = [
   { phase: "checking", label: "Wallet",   icon: "◎", pct: 5  },
@@ -389,18 +389,28 @@ function CustomUploadCard({ running, network }: { running: boolean; network: str
 }
 
 function HistoryTable({ history }: { history: HistoryEntry[] }) {
+  const [page, setPage] = useState(0);
+  const PER_PAGE = 10;
+  const pages = Math.ceil(history.length / PER_PAGE);
+  const reversed = [...history].reverse();
+  const paged = reversed.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
+ 
   if (!history.length) return (
     <div className="card" style={{ padding: "40px 24px", textAlign: "center" }}>
       <div style={{ fontSize: 28, marginBottom: 10 }}>📊</div>
       <div style={{ fontSize: 14, color: "var(--gray-400)" }}>Chưa có data — chạy benchmark để thu thập</div>
     </div>
   );
+ 
   return (
     <div className="card">
       <div className="card-header">
         <div>
           <div className="card-title">Benchmark history</div>
-          <div className="card-subtitle">{history.length} runs · lưu trong browser + backend Redis</div>
+          <div className="card-subtitle">
+            {history.length} runs · lưu trong browser + backend Redis
+            {pages > 1 && ` · Page ${page + 1}/${pages}`}
+          </div>
         </div>
       </div>
       <div className="card-body" style={{ padding: 0, overflowX: "auto" }}>
@@ -409,7 +419,7 @@ function HistoryTable({ history }: { history: HistoryEntry[] }) {
             <tr><th>#</th><th>Mode</th><th>Score</th><th>Tier</th><th>Upload</th><th>Download</th><th>Latency</th><th>TX</th><th>Max blob</th><th>At</th></tr>
           </thead>
           <tbody>
-            {history.slice().reverse().map(h => {
+            {paged.map(h => {
               const c = TIER_COLOR[h.tier] ?? "#6b7280";
               return (
                 <tr key={h.id}>
@@ -429,6 +439,29 @@ function HistoryTable({ history }: { history: HistoryEntry[] }) {
           </tbody>
         </table>
       </div>
+ 
+      {/* Pagination */}
+      {pages > 1 && (
+        <div style={{ padding: "12px 20px", borderTop: "1px solid var(--gray-100)", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+          <button
+            onClick={() => setPage(p => Math.max(0, p - 1))}
+            disabled={page === 0}
+            style={{ padding: "5px 12px", borderRadius: 7, border: "1px solid var(--gray-200)", background: "#fff", color: "var(--gray-500)", cursor: page === 0 ? "not-allowed" : "pointer", opacity: page === 0 ? .4 : 1, fontSize: 13, fontFamily: "var(--font-mono)" }}
+          >←</button>
+          {Array.from({ length: pages }, (_, i) => i).map(i => (
+            <button
+              key={i}
+              onClick={() => setPage(i)}
+              style={{ padding: "5px 10px", borderRadius: 7, border: "1px solid var(--gray-200)", background: i === page ? "var(--net-color, #2563eb)" : "#fff", color: i === page ? "#fff" : "var(--gray-500)", cursor: "pointer", fontWeight: i === page ? 700 : 400, fontSize: 13, minWidth: 34, fontFamily: "var(--font-mono)" }}
+            >{i + 1}</button>
+          ))}
+          <button
+            onClick={() => setPage(p => Math.min(pages - 1, p + 1))}
+            disabled={page === pages - 1}
+            style={{ padding: "5px 12px", borderRadius: 7, border: "1px solid var(--gray-200)", background: "#fff", color: "var(--gray-500)", cursor: page === pages - 1 ? "not-allowed" : "pointer", opacity: page === pages - 1 ? .4 : 1, fontSize: 13, fontFamily: "var(--font-mono)" }}
+          >→</button>
+        </div>
+      )}
     </div>
   );
 }

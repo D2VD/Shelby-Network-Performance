@@ -1,13 +1,13 @@
 "use client";
-// components/provider-map.tsx — v9.0
-// Fix #1: Hover tooltip per-SP (không phải chỉ zone representative)
-//   - Hover vào zone cluster → show first SP tooltip
-//   - Hover row trong SP table → show tooltip cho SP đó
-// Fix #5: BLS key show đầy đủ trong tooltip (p.fullBlsKey || p.blsKey)
-// Fix theme: sync với global ThemeContext (dark/light)
-// Map: vẫn Pure SVG viewBox zoom (CF Pages safe)
+// components/provider-map.tsx — v10.0
+// Changes vs v9:
+// - Hover cluster → hiện TOÀN BỘ SP của cụm (không cần click)
+// - Click cluster → pin popup (để đọc kỹ)
+// - GeoShare panel lớn hơn (width 280)
+// - Pure SVG giữ nguyên (CF Pages safe)
+// - Theme sync với ThemeContext
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useCallback } from "react";
 import type { StorageProvider } from "@/lib/types";
 import { ZONE_META } from "@/lib/types";
 import { useTheme } from "./theme-context";
@@ -25,15 +25,13 @@ function proj(lng: number, lat: number): [number, number] {
 }
 
 const ZONES: Record<string,{lng:number;lat:number;label:string;short:string;flag:string}> = {
-  dc_us_west:   {lng:-121.89,lat:37.34, label:"US West (San Jose)", short:"US-W",flag:"🇺🇸"},
-  dc_us_east:   {lng:-77.44, lat:39.04, label:"US East (Virginia)", short:"US-E",flag:"🇺🇸"},
-  dc_europe:    {lng:8.68,   lat:50.11, label:"Europe (Frankfurt)", short:"EU",  flag:"🇩🇪"},
-  dc_asia:      {lng:103.82, lat:1.35,  label:"Asia (Singapore)",   short:"SG",  flag:"🇸🇬"},
-  dc_australia: {lng:151.21, lat:-33.87,label:"Australia (Sydney)", short:"AU",  flag:"🇦🇺"},
+  dc_us_west:   { lng:-121.89,lat:37.34,  label:"US West (San Jose)", short:"US-W",flag:"🇺🇸" },
+  dc_us_east:   { lng:-77.44, lat:39.04,  label:"US East (Virginia)", short:"US-E",flag:"🇺🇸" },
+  dc_europe:    { lng:8.68,   lat:50.11,  label:"Europe (Frankfurt)", short:"EU",  flag:"🇩🇪" },
+  dc_asia:      { lng:103.82, lat:1.35,   label:"Asia (Singapore)",   short:"SG",  flag:"🇸🇬" },
+  dc_australia: { lng:151.21, lat:-33.87, label:"Australia (Sydney)", short:"AU",  flag:"🇦🇺" },
 };
 
-// Theme palettes — sync logic calls applyTheme from theme-context
-// We read from CSS vars instead of hardcoding
 function useMapTheme(isDark: boolean) {
   return isDark ? {
     bg:"#0d1526",land:"#132038",border:"#1e3a5f",ocean:"#0d1526",
@@ -78,178 +76,118 @@ const ZONE_COLORS=["#3b82f6","#22c55e","#a855f7","#f59e0b","#ef4444"];
 const [HS_X,HS_Y]=proj(112.3,16.5);
 const [TS_X,TS_Y]=proj(114.1,10.4);
 
-// ── SP Hover Tooltip ─────────────────────────────────────────────────────────
-function HoverTip({p,x,y,t}:{p:StorageProvider;x:number;y:number;t:ReturnType<typeof useMapTheme>}) {
-  const [cp,setCp]=useState(false);
-  const bls = p.fullBlsKey || p.blsKey || "";
-  const isH = p.health==="Healthy";
-  const isA = p.state==="Active";
-  const copy = async () => {
-    if(!bls) return;
-    await navigator.clipboard.writeText(bls).catch(()=>{});
-    setCp(true);
-    setTimeout(()=>setCp(false),1500);
-  };
-
-  // Clamp position so tooltip doesn't go off-screen
-  const tipW = 268, tipH = bls ? 200 : 140;
-  const tipX = Math.min(x+16, window.innerWidth - tipW - 8);
-  const tipY = Math.max(8, Math.min(y - 40, window.innerHeight - tipH - 8));
-
-  return (
-    <div style={{
-      position:"fixed", left:tipX, top:tipY, zIndex:999,
-      pointerEvents:"none",
-      background:t.pb, border:`1px solid ${t.pBdr}`, borderRadius:12,
-      padding:"12px 14px", width:tipW,
-      backdropFilter:"blur(16px)", WebkitBackdropFilter:"blur(16px)",
-      boxShadow:"0 16px 40px rgba(0,0,0,0.35)",
-    }}>
-      {/* Header */}
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
-        <div>
-          <div style={{fontSize:12,fontWeight:700,color:t.pt,fontFamily:"monospace"}}>STORAGE PROVIDER</div>
-          <div style={{fontSize:13,fontWeight:700,color:"#3b82f6",fontFamily:"monospace",marginTop:1}}>{p.address.slice(0,10)}…{p.address.slice(-4)}</div>
-        </div>
-      </div>
-      {/* Badges */}
-      <div style={{display:"flex",gap:5,marginBottom:10}}>
-        <span style={{fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:4,
-          background:isA?"rgba(34,197,94,0.15)":"rgba(245,158,11,0.15)",
-          color:isA?"#22c55e":"#f59e0b",border:`1px solid ${isA?"rgba(34,197,94,0.3)":"rgba(245,158,11,0.3)"}`}}>
-          ● {p.state}
-        </span>
-        <span style={{fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:4,
-          background:isH?"rgba(34,197,94,0.12)":"rgba(239,68,68,0.12)",
-          color:isH?"#22c55e":"#ef4444",border:`1px solid ${isH?"rgba(34,197,94,0.25)":"rgba(239,68,68,0.25)"}`}}>
-          ● {p.health}
-        </span>
-        <span style={{fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:4,
-          background:"rgba(245,158,11,0.12)",color:"#f59e0b",
-          border:"1px solid rgba(245,158,11,0.25)"}}>
-          Zone {ZONES[p.availabilityZone]?.short ?? p.availabilityZone}
-        </span>
-      </div>
-      {/* Location */}
-      <div style={{background:"rgba(128,128,128,0.08)",borderRadius:7,padding:"8px 10px",marginBottom:8}}>
-        <div style={{fontSize:9,color:t.pm,textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:3}}>LOCATION</div>
-        <div style={{fontSize:13,fontWeight:700,color:t.pt}}>
-          {p.geo?.city ?? ZONES[p.availabilityZone]?.label ?? "Unknown"}{p.geo?.countryCode ? `, ${p.geo.countryCode}` : ""}
-        </div>
-        {p.geo && <div style={{fontSize:9,color:t.pm,fontFamily:"monospace",marginTop:2}}>{p.geo.lat?.toFixed(4)}°, {p.geo.lng?.toFixed(4)}°</div>}
-      </div>
-      {/* Grid info */}
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"4px 8px",marginBottom:bls?8:0}}>
-        <div>
-          <div style={{fontSize:8,color:t.pm,textTransform:"uppercase",letterSpacing:"0.06em"}}>ZONE</div>
-          <div style={{fontSize:10,color:t.pt,fontWeight:500}}>{ZONES[p.availabilityZone]?.label ?? p.availabilityZone}</div>
-        </div>
-        <div>
-          <div style={{fontSize:8,color:t.pm,textTransform:"uppercase",letterSpacing:"0.06em"}}>CAPACITY</div>
-          <div style={{fontSize:10,color:t.pt,fontWeight:500}}>{p.capacityTiB != null ? `${p.capacityTiB.toFixed(1)} TiB` : "—"}</div>
-        </div>
-        <div>
-          <div style={{fontSize:8,color:t.pm,textTransform:"uppercase",letterSpacing:"0.06em"}}>NET IP</div>
-          <div style={{fontSize:10,color:t.pt,fontWeight:500,fontFamily:"monospace"}}>{p.netAddress ?? "—"}</div>
-        </div>
-      </div>
-      {/* BLS Key */}
-      {bls && (
-        <div style={{borderTop:`1px solid ${t.pBdr}`,paddingTop:8}}>
-          <div style={{fontSize:8,color:t.pm,textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:3}}>BLS Public Key</div>
-          <div style={{display:"flex",alignItems:"center",gap:4,background:"rgba(128,128,128,0.08)",borderRadius:5,padding:"4px 6px"}}>
-            <span style={{fontSize:9,fontFamily:"monospace",color:t.pt,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-              {bls.length > 36 ? `${bls.slice(0,34)}…` : bls}
-            </span>
-            <button onClick={copy} style={{background:"none",border:"none",cursor:"pointer",fontSize:12,color:cp?"#22c55e":t.pm,flexShrink:0,pointerEvents:"auto"}}>
-              {cp?"✓":"⧉"}
-            </button>
-          </div>
-          <div style={{fontSize:8,color:t.pm,marginTop:3,opacity:.6}}>on-chain · storage_provider_registry</div>
-        </div>
-      )}
-      <div style={{fontSize:9,color:t.pm,marginTop:8,opacity:.5,textAlign:"center"}}>Click to open detail panel</div>
-    </div>
-  );
-}
-
-// ── Cluster popup ─────────────────────────────────────────────────────────────
-function ClusterPopup({zone,sps,t,onClose}:{zone:string;sps:StorageProvider[];t:ReturnType<typeof useMapTheme>;onClose:()=>void}) {
+// ── Cluster hover popup — hiện TẤT CẢ SP trong zone ─────────────────────────
+function ClusterHoverPopup({ zone, sps, t, x, y, pinned, onPin, onClose }: {
+  zone:string; sps:StorageProvider[];
+  t:ReturnType<typeof useMapTheme>;
+  x:number; y:number;
+  pinned:boolean; onPin:()=>void; onClose:()=>void;
+}) {
   const [cp,setCp]=useState<string|null>(null);
   const meta=ZONES[zone];
   const copy=async(bls:string,addr:string)=>{await navigator.clipboard.writeText(bls).catch(()=>{});setCp(addr);setTimeout(()=>setCp(null),1500);};
+
+  // Popup position: avoid overflow
+  const tipW=340, tipH=Math.min(500,80+sps.length*88);
+  const tipX=Math.min(x+18,W-tipW-10);
+  const tipY=Math.max(8,Math.min(y-20,H-tipH-8));
+
   return (
-    <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",zIndex:80,background:"rgba(0,0,0,0.45)",backdropFilter:"blur(4px)"}} onClick={onClose}>
-      <div style={{background:t.pb,border:`1px solid ${t.pBdr}`,borderRadius:16,padding:"18px 20px",width:360,maxHeight:500,boxShadow:"0 24px 60px rgba(0,0,0,0.5)",display:"flex",flexDirection:"column"}} onClick={e=>e.stopPropagation()}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-          <div>
-            <div style={{fontSize:15,fontWeight:700,color:t.pt}}>{meta?.flag} {meta?.label??zone}</div>
-            <div style={{fontSize:11,color:t.pm,marginTop:2}}>{sps.filter(p=>p.health==="Healthy").length}/{sps.length} healthy</div>
+    <div style={{
+      position:"absolute", left:tipX, top:tipY, zIndex:90,
+      background:t.pb, border:`1px solid ${t.pBdr}`, borderRadius:14,
+      padding:"15px 17px", width:tipW, maxHeight:480,
+      boxShadow:"0 20px 50px rgba(0,0,0,0.4)",
+      display:"flex", flexDirection:"column",
+      backdropFilter:"blur(16px)", WebkitBackdropFilter:"blur(16px)",
+      pointerEvents: pinned ? "auto" : "none",
+    }}>
+      {/* Header */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexShrink:0}}>
+        <div>
+          <div style={{fontSize:16,fontWeight:700,color:t.pt}}>{meta?.flag} {meta?.label??zone}</div>
+          <div style={{fontSize:11,color:t.pm,marginTop:2}}>
+            {sps.filter(p=>p.health==="Healthy").length}/{sps.length} healthy
+            {!pinned && <span style={{marginLeft:8,opacity:.6}}>· Click to pin</span>}
           </div>
-          <button onClick={onClose} style={{background:"none",border:"none",color:t.pm,cursor:"pointer",fontSize:20,lineHeight:1}}>×</button>
         </div>
-        <div style={{overflowY:"auto",display:"flex",flexDirection:"column",gap:8}}>
-          {sps.map((p,i)=>{
-            const isH=p.health==="Healthy", bls=p.fullBlsKey||p.blsKey||"";
-            return(
-              <div key={p.address||i} style={{background:isH?"rgba(34,197,94,0.07)":"rgba(239,68,68,0.07)",border:`1px solid ${isH?"rgba(34,197,94,0.2)":"rgba(239,68,68,0.2)"}`,borderRadius:9,padding:"10px 12px"}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-                  <span style={{fontSize:12,fontWeight:700,color:t.pt,fontFamily:"monospace"}}>{p.addressShort}</span>
-                  <div style={{display:"flex",gap:4}}>
-                    <span style={{fontSize:9,fontWeight:700,padding:"1px 6px",borderRadius:4,background:isH?"rgba(34,197,94,0.15)":"rgba(239,68,68,0.15)",color:isH?"#22c55e":"#ef4444"}}>{p.health}</span>
-                    <span style={{fontSize:9,fontWeight:700,padding:"1px 6px",borderRadius:4,background:"rgba(245,158,11,0.12)",color:"#f59e0b"}}>{p.state}</span>
-                  </div>
+        {pinned && (
+          <button onClick={onClose} style={{background:"none",border:"none",color:t.pm,cursor:"pointer",fontSize:20,lineHeight:1,pointerEvents:"auto"}}>×</button>
+        )}
+      </div>
+      {/* SP list */}
+      <div style={{overflowY:"auto",display:"flex",flexDirection:"column",gap:8}}>
+        {sps.map((p,i)=>{
+          const isH=p.health==="Healthy", bls=p.fullBlsKey||p.blsKey||"";
+          return (
+            <div key={p.address||i} style={{background:isH?"rgba(34,197,94,0.07)":"rgba(239,68,68,0.07)",border:`1px solid ${isH?"rgba(34,197,94,0.2)":"rgba(239,68,68,0.2)"}`,borderRadius:9,padding:"10px 12px"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5}}>
+                <span style={{fontSize:13,fontWeight:700,color:t.pt,fontFamily:"monospace"}}>{p.addressShort}</span>
+                <div style={{display:"flex",gap:4}}>
+                  <span style={{fontSize:10,fontWeight:700,padding:"1px 7px",borderRadius:4,background:isH?"rgba(34,197,94,0.15)":"rgba(239,68,68,0.15)",color:isH?"#22c55e":"#ef4444"}}>{p.health}</span>
+                  <span style={{fontSize:10,fontWeight:700,padding:"1px 7px",borderRadius:4,background:"rgba(245,158,11,0.12)",color:"#f59e0b"}}>{p.state}</span>
                 </div>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"2px 8px",marginBottom:bls?6:0}}>
-                  {p.capacityTiB!=null&&<div><div style={{fontSize:8,color:t.pm,textTransform:"uppercase"}}>Capacity</div><div style={{fontSize:10,color:t.pt,fontWeight:500}}>{p.capacityTiB.toFixed(1)} TiB</div></div>}
-                  {p.geo?.city&&<div><div style={{fontSize:8,color:t.pm,textTransform:"uppercase"}}>City</div><div style={{fontSize:10,color:t.pt,fontWeight:500}}>{p.geo.city}, {p.geo.countryCode}</div></div>}
-                </div>
-                {bls&&(
-                  <div style={{display:"flex",alignItems:"center",gap:4,background:"rgba(128,128,128,0.07)",borderRadius:4,padding:"3px 6px"}}>
-                    <span style={{fontSize:8,color:t.pm,flexShrink:0}}>BLS</span>
-                    <span style={{fontSize:9,fontFamily:"monospace",color:t.pt,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{bls.slice(0,30)}…</span>
-                    <button onClick={()=>copy(bls,p.address)} style={{background:"none",border:"none",cursor:"pointer",fontSize:11,color:cp===p.address?"#22c55e":t.pm}}>{cp===p.address?"✓":"⧉"}</button>
-                  </div>
-                )}
               </div>
-            );
-          })}
-        </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"2px 8px",marginBottom:bls?5:0}}>
+                {p.capacityTiB!=null&&<div><div style={{fontSize:9,color:t.pm,textTransform:"uppercase"}}>Capacity</div><div style={{fontSize:11,color:t.pt,fontWeight:500}}>{p.capacityTiB.toFixed(1)} TiB</div></div>}
+                {p.geo?.city&&<div><div style={{fontSize:9,color:t.pm,textTransform:"uppercase"}}>City</div><div style={{fontSize:11,color:t.pt,fontWeight:500}}>{p.geo.city}, {p.geo.countryCode}</div></div>}
+                {p.netAddress&&<div><div style={{fontSize:9,color:t.pm,textTransform:"uppercase"}}>Net IP</div><div style={{fontSize:10,color:t.pt,fontFamily:"monospace"}}>{p.netAddress}</div></div>}
+              </div>
+              {bls&&(
+                <div style={{display:"flex",alignItems:"center",gap:4,background:"rgba(128,128,128,0.07)",borderRadius:4,padding:"3px 6px"}}>
+                  <span style={{fontSize:9,color:t.pm,flexShrink:0}}>BLS</span>
+                  <span style={{fontSize:9,fontFamily:"monospace",color:t.pt,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{bls.slice(0,30)}…</span>
+                  {pinned && <button onClick={()=>copy(bls,p.address)} style={{background:"none",border:"none",cursor:"pointer",fontSize:11,color:cp===p.address?"#22c55e":t.pm,pointerEvents:"auto"}}>{cp===p.address?"✓":"⧉"}</button>}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
 }
 
-// ── Geographic share donut ────────────────────────────────────────────────────
-function GeoShare({byZone,t}:{byZone:Map<string,StorageProvider[]>;t:ReturnType<typeof useMapTheme>}) {
+// ── GeoShare — lớn hơn ───────────────────────────────────────────────────────
+function GeoShare({ byZone,t }:{ byZone:Map<string,StorageProvider[]>; t:ReturnType<typeof useMapTheme> }) {
   const total=Array.from(byZone.values()).reduce((s,a)=>s+a.length,0);
-  const entries=Array.from(byZone.entries()).map(([z,sps],i)=>({zone:z,label:ZONES[z]?.label??z,flag:ZONES[z]?.flag??"🌐",count:sps.length,healthy:sps.filter(p=>p.health==="Healthy").length,pct:total>0?sps.length/total*100:0,color:ZONE_COLORS[i%ZONE_COLORS.length]})).sort((a,b)=>b.count-a.count);
-  const R=38,cx=50,cy=50,stroke=15,circ=2*Math.PI*R;
+  const entries=Array.from(byZone.entries()).map(([z,sps],i)=>({
+    zone:z, label:ZONES[z]?.label??z, flag:ZONES[z]?.flag??"🌐",
+    count:sps.length, healthy:sps.filter(p=>p.health==="Healthy").length,
+    pct:total>0?sps.length/total*100:0, color:ZONE_COLORS[i%ZONE_COLORS.length],
+  })).sort((a,b)=>b.count-a.count);
+  const R=42,cx=54,cy=54,stroke=16,circ=2*Math.PI*R;
   let off=0;
   const allH=Array.from(byZone.values()).flat().filter(p=>p.health==="Healthy").length;
   return (
-    <div style={{background:t.pb,border:`1px solid ${t.pBdr}`,borderRadius:12,padding:"12px 14px",width:240,backdropFilter:"blur(12px)",WebkitBackdropFilter:"blur(12px)"}}>
-      <div style={{fontSize:10,fontWeight:700,color:t.pt,textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:1}}>Geographic & Provider Share</div>
-      <div style={{fontSize:9,color:t.pm,marginBottom:10}}>Compare zone distribution</div>
-      <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:10}}>
-        <svg width={100} height={100} viewBox="0 0 100 100" style={{flexShrink:0}}>
-          {entries.map(e=>{const pct=e.pct/100,dash=pct*circ,gap=circ-dash,seg=<circle key={e.zone} cx={cx} cy={cy} r={R} fill="none" stroke={e.color} strokeWidth={stroke} strokeDasharray={`${dash} ${gap}`} strokeDashoffset={-off} transform={`rotate(-90 ${cx} ${cy})`} opacity={0.88}/>;off+=dash;return seg;})}
-          <text x={cx} y={cy-3} textAnchor="middle" fontSize={13} fontWeight={800} fill={t.pt}>{total}</text>
-          <text x={cx} y={cy+9} textAnchor="middle" fontSize={8} fill={t.pm}>SPs</text>
+    <div style={{ background:t.pb,border:`1px solid ${t.pBdr}`,borderRadius:14,padding:"14px 16px",width:280, backdropFilter:"blur(12px)",WebkitBackdropFilter:"blur(12px)" }}>
+      <div style={{fontSize:11,fontWeight:700,color:t.pt,textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:1}}>Geographic & Provider Share</div>
+      <div style={{fontSize:10,color:t.pm,marginBottom:12}}>Compare zone distribution</div>
+      <div style={{display:"flex",gap:14,alignItems:"center",marginBottom:12}}>
+        <svg width={108} height={108} viewBox="0 0 108 108" style={{flexShrink:0}}>
+          {entries.map(e=>{
+            const pct=e.pct/100,dash=pct*circ,gap=circ-dash;
+            const seg=<circle key={e.zone} cx={cx} cy={cy} r={R} fill="none" stroke={e.color} strokeWidth={stroke} strokeDasharray={`${dash} ${gap}`} strokeDashoffset={-off} transform={`rotate(-90 ${cx} ${cy})`} opacity={0.88}/>;
+            off+=dash; return seg;
+          })}
+          <text x={cx} y={cy-4} textAnchor="middle" fontSize={15} fontWeight={800} fill={t.pt}>{total}</text>
+          <text x={cx} y={cy+10} textAnchor="middle" fontSize={9} fill={t.pm}>SPs</text>
         </svg>
-        <div style={{display:"flex",flexDirection:"column",gap:5,flex:1}}>
-          {entries.map(e=>(<div key={e.zone} style={{display:"flex",alignItems:"center",gap:5}}>
-            <div style={{width:7,height:7,borderRadius:2,background:e.color,flexShrink:0}}/>
-            <span style={{fontSize:9,color:t.pt,flex:1,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{e.flag} {e.label.split("(")[0].trim()}</span>
-            <span style={{fontSize:9,fontWeight:700,color:t.pt,fontFamily:"monospace",flexShrink:0}}>{e.count} <span style={{color:t.pm,fontWeight:400}}>· {e.pct.toFixed(0)}%</span></span>
-          </div>))}
+        <div style={{display:"flex",flexDirection:"column",gap:6,flex:1}}>
+          {entries.map(e=>(
+            <div key={e.zone} style={{display:"flex",alignItems:"center",gap:6}}>
+              <div style={{width:8,height:8,borderRadius:2,background:e.color,flexShrink:0}}/>
+              <span style={{fontSize:11,color:t.pt,flex:1,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{e.flag} {e.label.split("(")[0].trim()}</span>
+              <span style={{fontSize:10,fontWeight:700,color:t.pt,fontFamily:"monospace",flexShrink:0}}>{e.count} <span style={{color:t.pm,fontWeight:400}}>· {e.pct.toFixed(0)}%</span></span>
+            </div>
+          ))}
         </div>
       </div>
-      <div style={{display:"flex",paddingTop:8,borderTop:`1px solid ${t.pBdr}`}}>
+      <div style={{display:"flex",paddingTop:9,borderTop:`1px solid ${t.pBdr}`}}>
         {[{label:"ZONES",value:String(entries.length)},{label:"TOTAL",value:String(total)},{label:"HEALTHY",value:String(allH)}].map(({label,value},i)=>(
           <div key={label} style={{flex:1,textAlign:"center",borderRight:i<2?`1px solid ${t.pBdr}`:"none"}}>
-            <div style={{fontSize:15,fontWeight:800,color:t.pt,fontFamily:"monospace"}}>{value}</div>
-            <div style={{fontSize:8,color:t.pm,letterSpacing:"0.06em"}}>{label}</div>
+            <div style={{fontSize:17,fontWeight:800,color:t.pt,fontFamily:"monospace"}}>{value}</div>
+            <div style={{fontSize:9,color:t.pm,letterSpacing:"0.06em"}}>{label}</div>
           </div>
         ))}
       </div>
@@ -257,36 +195,70 @@ function GeoShare({byZone,t}:{byZone:Map<string,StorageProvider[]>;t:ReturnType<
   );
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-export function ProviderMap({providers,onProviderClick}:ProviderMapProps) {
+// ── Main ─────────────────────────────────────────────────────────────────────
+export function ProviderMap({ providers }: ProviderMapProps) {
   const { isDark } = useTheme();
   const t = useMapTheme(isDark);
-  const [activeZone, setActiveZone] = useState<string|null>(null);
-  const [hoverSP,    setHoverSP]    = useState<{p:StorageProvider;x:number;y:number}|null>(null);
+  // hoverZone: khi hover qua cluster → show popup (không cần click)
+  const [hoverZone,  setHoverZone]  = useState<string|null>(null);
+  const [pinnedZone, setPinnedZone] = useState<string|null>(null);
+  const [hoverPos,   setHoverPos]   = useState<{x:number;y:number}>({x:0,y:0});
   const [vb, setVb] = useState({x:0,y:0,w:W,h:H});
-  const svgRef   = useRef<SVGSVGElement>(null);
-  const dragRef  = useRef<{sx:number;sy:number;vbx:number;vby:number}|null>(null);
-  const hoverRef = useRef<ReturnType<typeof setTimeout>|null>(null);
+  const svgRef  = useRef<SVGSVGElement>(null);
+  const dragRef = useRef<{sx:number;sy:number;vbx:number;vby:number}|null>(null);
+  const leaveTimer = useRef<ReturnType<typeof setTimeout>|null>(null);
 
-  const byZone = new Map<string,StorageProvider[]>();
+  const byZone=new Map<string,StorageProvider[]>();
   providers.forEach(p=>{const z=p.availabilityZone??"unknown";if(!byZone.has(z))byZone.set(z,[]);byZone.get(z)!.push(p);});
-  const azones = Array.from(byZone.keys()).filter(z=>ZONES[z]);
-  const zXY = Object.fromEntries(Object.entries(ZONES).map(([k,v])=>[k,proj(v.lng,v.lat)]));
+  const azones=Array.from(byZone.keys()).filter(z=>ZONES[z]);
+  const zXY=Object.fromEntries(Object.entries(ZONES).map(([k,v])=>[k,proj(v.lng,v.lat)]));
 
-  const svgPt=(cx:number,cy:number):[number,number]=>{const r=svgRef.current?.getBoundingClientRect();if(!r)return[0,0];return[vb.x+(cx-r.left)/r.width*vb.w,vb.y+(cy-r.top)/r.height*vb.h];};
+  // Convert SVG coords → screen pixels for popup positioning
+  const svgToScreen=(svgX:number,svgY:number):[number,number]=>{
+    const r=svgRef.current?.getBoundingClientRect();
+    if(!r) return [svgX,svgY];
+    const sx=(svgX-vb.x)/vb.w*r.width;
+    const sy=(svgY-vb.y)/vb.h*r.height;
+    return [sx,sy];
+  };
 
-  const onWheel=(e:React.WheelEvent<SVGSVGElement>)=>{e.preventDefault();const zf=e.deltaY>0?1.15:0.87;const[mx,my]=svgPt(e.clientX,e.clientY);setVb(p=>{const nw=Math.max(150,Math.min(W,p.w*zf)),nh=Math.max(80,Math.min(H,p.h*zf));return{x:Math.max(0,Math.min(W-nw,mx-(mx-p.x)*(nw/p.w))),y:Math.max(0,Math.min(H-nh,my-(my-p.y)*(nh/p.h))),w:nw,h:nh};});};
-  const onMD=(e:React.MouseEvent<SVGSVGElement>)=>{if((e.target as SVGElement).closest("g[data-zone]"))return;dragRef.current={sx:e.clientX,sy:e.clientY,vbx:vb.x,vby:vb.y};e.preventDefault();};
-  const onMM=(e:React.MouseEvent<SVGSVGElement>)=>{if(!dragRef.current)return;const r=svgRef.current?.getBoundingClientRect();if(!r)return;const dx=(e.clientX-dragRef.current.sx)/r.width*vb.w,dy=(e.clientY-dragRef.current.sy)/r.height*vb.h;setVb(p=>({...p,x:Math.max(0,Math.min(W-p.w,dragRef.current!.vbx-dx)),y:Math.max(0,Math.min(H-p.h,dragRef.current!.vby-dy))}));};
+  const onWheel=(e:React.WheelEvent<SVGSVGElement>)=>{
+    e.preventDefault();
+    const zf=e.deltaY>0?1.15:0.87;
+    const r=svgRef.current?.getBoundingClientRect();if(!r)return;
+    const mx=vb.x+(e.clientX-r.left)/r.width*vb.w;
+    const my=vb.y+(e.clientY-r.top)/r.height*vb.h;
+    setVb(p=>{
+      const nw=Math.max(150,Math.min(W,p.w*zf)),nh=Math.max(80,Math.min(H,p.h*zf));
+      return{x:Math.max(0,Math.min(W-nw,mx-(mx-p.x)*(nw/p.w))),y:Math.max(0,Math.min(H-nh,my-(my-p.y)*(nh/p.h))),w:nw,h:nh};
+    });
+  };
+  const onMD=(e:React.MouseEvent<SVGSVGElement>)=>{
+    if((e.target as SVGElement).closest("g[data-zone]"))return;
+    dragRef.current={sx:e.clientX,sy:e.clientY,vbx:vb.x,vby:vb.y};e.preventDefault();
+  };
+  const onMM=(e:React.MouseEvent<SVGSVGElement>)=>{
+    if(!dragRef.current)return;
+    const r=svgRef.current?.getBoundingClientRect();if(!r)return;
+    const dx=(e.clientX-dragRef.current.sx)/r.width*vb.w;
+    const dy=(e.clientY-dragRef.current.sy)/r.height*vb.h;
+    setVb(p=>({...p,x:Math.max(0,Math.min(W-p.w,dragRef.current!.vbx-dx)),y:Math.max(0,Math.min(H-p.h,dragRef.current!.vby-dy))}));
+  };
   const onMU=()=>{dragRef.current=null;};
 
-  const showHover=(sp:StorageProvider,clientX:number,clientY:number)=>{
-    if(hoverRef.current)clearTimeout(hoverRef.current);
-    setHoverSP({p:sp,x:clientX,y:clientY});
+  const handleZoneEnter=(zone:string,svgX:number,svgY:number)=>{
+    if(leaveTimer.current){clearTimeout(leaveTimer.current);leaveTimer.current=null;}
+    const[sx,sy]=svgToScreen(svgX,svgY);
+    setHoverPos({x:sx,y:sy});
+    setHoverZone(zone);
   };
-  const hideHover=()=>{
-    hoverRef.current=setTimeout(()=>setHoverSP(null),120);
+  const handleZoneLeave=()=>{
+    leaveTimer.current=setTimeout(()=>{
+      if(!pinnedZone) setHoverZone(null);
+    },200);
   };
+
+  const activeZone=pinnedZone??hoverZone;
 
   return (
     <div style={{position:"relative",width:"100%",height:"100%",background:t.bg,overflow:"hidden",userSelect:"none"}}>
@@ -301,35 +273,26 @@ export function ProviderMap({providers,onProviderClick}:ProviderMapProps) {
         <button onClick={()=>setVb({x:0,y:0,w:W,h:H})} style={{padding:"4px 10px",borderRadius:14,fontSize:10,cursor:"pointer",background:"rgba(128,128,128,0.2)",border:"none",color:t.pm}}>⊕ Reset</button>
       </div>
 
-      {/* Bottom left hints */}
-      <div style={{position:"absolute",bottom:10,left:providers.length>0&&!activeZone?264:12,zIndex:30,fontSize:9,color:t.dim,fontFamily:"monospace",display:"flex",alignItems:"center",gap:5}}>
+      <div style={{position:"absolute",bottom:10,left:providers.length>0?294:12,zIndex:30,fontSize:9,color:t.dim,fontFamily:"monospace",display:"flex",alignItems:"center",gap:5}}>
         <span style={{width:5,height:5,borderRadius:"50%",background:"#22c55e",display:"inline-block"}}/>
-        {providers.filter(p=>p.health==="Healthy").length}/{providers.length} · Scroll=zoom · Drag=pan · Click=inspect
+        {providers.filter(p=>p.health==="Healthy").length}/{providers.length} · Scroll=zoom · Drag=pan · Hover=inspect · Click=pin
       </div>
       <div style={{position:"absolute",bottom:10,right:12,zIndex:30,fontSize:9,color:"rgba(217,119,6,0.85)",fontFamily:"monospace"}}>🇻🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam</div>
 
-      {/* SVG Map */}
       <svg
         ref={svgRef}
         viewBox={`${vb.x} ${vb.y} ${vb.w} ${vb.h}`}
         style={{width:"100%",height:"100%",display:"block",cursor:dragRef.current?"grabbing":"grab"}}
-        onWheel={onWheel}
-        onMouseDown={onMD}
-        onMouseMove={onMM}
-        onMouseUp={onMU}
-        onMouseLeave={onMU}
-        onClick={()=>{setActiveZone(null);setHoverSP(null);}}
+        onWheel={onWheel} onMouseDown={onMD} onMouseMove={onMM} onMouseUp={onMU} onMouseLeave={onMU}
+        onClick={()=>{if(!dragRef.current){setPinnedZone(null);setHoverZone(null);}}}
       >
         <rect width={W} height={H} fill={t.ocean}/>
         <g fill={t.land} stroke={t.border} strokeWidth={0.5}>
           {LAND.map((d,i)=><path key={i} d={d}/>)}
         </g>
-        {/* Equator */}
         {(()=>{const[,y]=proj(0,0);return<line x1={0} y1={y} x2={W} y2={y} stroke={t.dim} strokeWidth={0.5} strokeDasharray="4 5"/>;})()}
-        {/* Hoàng Sa, Trường Sa */}
         <circle cx={HS_X} cy={HS_Y} r={4} fill="none" stroke={t.island} strokeWidth={0.7} opacity={0.9}/>
         <circle cx={TS_X} cy={TS_Y} r={4} fill="none" stroke={t.island} strokeWidth={0.7} opacity={0.9}/>
-        {/* Arcs between zones */}
         {azones.flatMap((z1,i)=>azones.slice(i+1).map(z2=>{
           const[x1,y1]=zXY[z1]??[0,0],[x2,y2]=zXY[z2]??[0,0];
           return(<g key={`${z1}-${z2}`}>
@@ -337,7 +300,6 @@ export function ProviderMap({providers,onProviderClick}:ProviderMapProps) {
             <path d={arcD(x1,y1,x2,y2)} fill="none" stroke={t.arcC} strokeWidth={1} opacity={.4} strokeDasharray="8 22" style={{animation:"arc-flow 3s linear infinite"}}/>
           </g>);
         }))}
-        {/* Zone clusters */}
         {azones.map(zone=>{
           const xy=zXY[zone];if(!xy)return null;
           const[x,y]=xy,sps=byZone.get(zone)??[];
@@ -345,17 +307,20 @@ export function ProviderMap({providers,onProviderClick}:ProviderMapProps) {
           const isMain=allOk&&sps.length>=5;
           const mColor=isMain?t.node:t.nodeSub;
           const rw=Math.max(24,20+sps.length*1.5),rh=20;
+          const isActive=activeZone===zone;
           return(
             <g key={zone} data-zone={zone} style={{cursor:"pointer"}}
-              onClick={e=>{e.stopPropagation();setActiveZone(z=>z===zone?null:zone);setHoverSP(null);}}
-              onMouseEnter={e=>{
-                const sp=sps.find(p=>p.health==="Healthy")??sps[0];
-                if(sp) showHover(sp,e.clientX,e.clientY);
-              }}
-              onMouseLeave={hideHover}
+              onMouseEnter={e=>{e.stopPropagation();handleZoneEnter(zone,x,y);}}
+              onMouseLeave={e=>{e.stopPropagation();handleZoneLeave();}}
+              onClick={e=>{e.stopPropagation();setPinnedZone(z=>z===zone?null:zone);setHoverZone(zone);}}
             >
               {isMain&&<rect x={x-rw/2-6} y={y-rh/2-6} width={rw+12} height={rh+12} rx={10} fill={mColor} fillOpacity={0.15} className="sp-ping"/>}
-              <rect x={x-rw/2} y={y-rh/2} width={rw} height={rh} rx={6} fill={mColor} stroke={allOk?"rgba(34,197,94,0.4)":"#ef4444"} strokeWidth={1} style={{filter:"drop-shadow(0 3px 6px rgba(0,0,0,0.3))"}}/>
+              <rect x={x-rw/2} y={y-rh/2} width={rw} height={rh} rx={6}
+                fill={isActive?mColor:mColor}
+                stroke={isActive?"#22c55e":(allOk?"rgba(34,197,94,0.4)":"#ef4444")}
+                strokeWidth={isActive?2:1}
+                style={{filter:"drop-shadow(0 3px 6px rgba(0,0,0,0.3))"}}
+              />
               <text textAnchor="middle" x={x} y={y+5} style={{fontSize:sps.length>=10?"10px":"12px",fontWeight:800,fill:t.nodeText,fontFamily:"monospace",pointerEvents:"none"}}>{sps.length}</text>
               <text textAnchor="middle" x={x} y={y+rh/2+11} style={{fontSize:"7px",fill:t.dim,fontFamily:"monospace",pointerEvents:"none"}}>{ZONE_META[zone]?.shortLabel??zone.replace("dc_","").toUpperCase()}</text>
               {!allOk&&<circle cx={x+rw/2-2} cy={y-rh/2+2} r={4} fill="#ef4444" stroke={t.bg} strokeWidth={0.8}/>}
@@ -364,20 +329,21 @@ export function ProviderMap({providers,onProviderClick}:ProviderMapProps) {
         })}
       </svg>
 
-      {/* Hover tooltip */}
-      {hoverSP && !activeZone && (
-        <div onMouseEnter={()=>{if(hoverRef.current)clearTimeout(hoverRef.current);}} onMouseLeave={hideHover} style={{pointerEvents:"auto"}}>
-          <HoverTip p={hoverSP.p} x={hoverSP.x} y={hoverSP.y} t={t}/>
-        </div>
-      )}
-
-      {/* Cluster popup */}
+      {/* Cluster hover/pin popup — absolute positioned */}
       {activeZone && byZone.has(activeZone) && (
-        <ClusterPopup zone={activeZone} sps={byZone.get(activeZone)!} t={t} onClose={()=>setActiveZone(null)}/>
+        <ClusterHoverPopup
+          zone={activeZone}
+          sps={byZone.get(activeZone)!}
+          t={t}
+          x={hoverPos.x} y={hoverPos.y}
+          pinned={pinnedZone===activeZone}
+          onPin={()=>setPinnedZone(activeZone)}
+          onClose={()=>{setPinnedZone(null);setHoverZone(null);}}
+        />
       )}
 
-      {/* Geo share panel */}
-      {providers.length > 0 && !activeZone && (
+      {/* GeoShare panel */}
+      {providers.length>0 && (
         <div style={{position:"absolute",top:10,left:12,zIndex:25}}>
           <GeoShare byZone={byZone} t={t}/>
         </div>

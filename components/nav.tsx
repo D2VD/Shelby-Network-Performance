@@ -1,13 +1,13 @@
 "use client";
-// components/nav.tsx — v7.3
+// components/nav.tsx — v8.0
+// + ThemeToggle button trong nav-right
 // Thứ tự: Map | Analytics | Charts | Benchmark
-// Bỏ Monitor (truy cập trực tiếp qua api.shelbyanalytics.site/grafana)
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useNetwork, type NetworkId } from "./network-context";
+import { ThemeToggle } from "./theme-context";
 
-// exact=true: chỉ active khi pathname === href (tránh 2 tab active)
 const NAV_TABS = [
   { href: "/dashboard/providers", label: "Map",       exact: false },
   { href: "/dashboard",           label: "Analytics", exact: true  },
@@ -52,6 +52,7 @@ export function Nav() {
 
       {/* Right */}
       <div className="nav-right">
+        {/* Network switcher */}
         <div className="net-switch">
           {(["shelbynet", "testnet"] as NetworkId[]).map(id => (
             <button
@@ -61,13 +62,17 @@ export function Nav() {
             >
               <span style={{
                 display: "inline-block", width: 6, height: 6, borderRadius: "50%",
-                background: network === id ? (id === "shelbynet" ? "#22c55e" : "#9333ea") : "#d1d5db",
+                background: network === id ? (id === "shelbynet" ? "#22c55e" : "#9333ea") : "var(--text-dim)",
                 marginRight: 5, verticalAlign: "middle",
               }} />
               {id === "shelbynet" ? "Shelbynet" : "Testnet"}
             </button>
           ))}
         </div>
+
+        {/* Theme toggle */}
+        <ThemeToggle />
+
         <a href="https://docs.shelby.xyz" target="_blank" rel="noreferrer" className="nav-docs">
           Docs ↗
         </a>

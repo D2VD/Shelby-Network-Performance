@@ -1,9 +1,9 @@
 "use client";
-// components/map-wrapper.tsx — v2.0
-// ─ Drop-in replacement cho Mapbox version cũ
-// ─ Dùng GlobeEngine (Canvas + dot-matrix) thay vì Mapbox
-// ─ Giữ nguyên interface props để không cần đổi code ở providers page
-// ─ Network color từ CSS variable (tự động cyan/purple khi switch)
+// components/map-wrapper.tsx — v3.0
+// Strategy: dùng GlobeEngine (globe-gl CDN) cho providers page
+// ProviderMap (pure SVG) vẫn được dùng ở providers page với full feature set
+// NOTE: react-simple-maps không tương thích CF Pages edge runtime → keep pure SVG
+// Nếu muốn thử react-simple-maps trong tương lai: dynamic import + ssr:false đây
 
 import { useNetwork } from "./network-context";
 import GlobeEngine from "./globe-engine";
@@ -11,7 +11,6 @@ import type { StorageProvider } from "@/lib/types";
 
 interface MapWrapperProps {
   providers: StorageProvider[];
-  /** Kept for API compat — không dùng nữa (không có hexagon layer) */
   showArcs?: boolean;
   hexagonOpacity?: number;
   pitch?: number;

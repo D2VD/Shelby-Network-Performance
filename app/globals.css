@@ -522,3 +522,111 @@ button { font-family: inherit; }
 }
 
 .fade-in { animation: fade-in 0.3s ease; }
+
+/* ══════════════════════════════════════════════════════════════
+   RESPONSIVE — Mobile/Tablet first
+   Breakpoints: 480 (sm), 768 (md), 1024 (lg)
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── Viewport meta must be in layout.tsx <head>:
+   <meta name="viewport" content="width=device-width, initial-scale=1" />
+   ── */
+
+/* ── Page main padding ── */
+.page-main {
+  flex: 1;
+  min-width: 0;
+  padding: 24px 20px 48px;
+}
+@media (max-width: 768px)  { .page-main { padding: 16px 14px 40px; } }
+@media (max-width: 480px)  { .page-main { padding: 12px 10px 32px; } }
+
+/* ── NAV responsive ── */
+@media (max-width: 900px) {
+  .nav { grid-template-columns: auto 1fr; gap: 10px; padding: 0 16px; }
+  .nav-tabs { margin: 0; justify-content: flex-start; overflow-x: auto; }
+  .nav-tab { padding: 6px 14px; font-size: 13px; }
+  .nav-right { grid-column: 1 / -1; justify-content: space-between; width: 100%; padding: 0 0 8px; }
+}
+@media (max-width: 600px) {
+  .nav { height: auto; padding: 10px 14px; gap: 8px; }
+  .nav-logo-text { font-size: 15px; }
+  .nav-tab { padding: 5px 10px; font-size: 12px; }
+  .nav-docs { display: none; }
+  .net-switch-btn { padding: 4px 10px; font-size: 12px; }
+}
+
+/* ── STAT GRID responsive ── */
+@media (max-width: 900px) {
+  .stat-grid { grid-template-columns: repeat(2, 1fr) !important; }
+}
+@media (max-width: 480px) {
+  .stat-grid { grid-template-columns: 1fr !important; }
+  .stat-value { font-size: 22px; }
+}
+
+/* ── CARD responsive ── */
+@media (max-width: 480px) {
+  .card-header { padding: 14px 16px; }
+  .card-body   { padding: 14px 16px; }
+  .card-title  { font-size: 14px; }
+}
+
+/* ── DATA TABLE responsive ── */
+@media (max-width: 768px) {
+  .data-table { font-size: 12px; }
+  .data-table th { padding: 8px 10px; font-size: 10px; }
+  .data-table td { padding: 8px 10px; }
+}
+
+/* ── BUTTON responsive ── */
+@media (max-width: 480px) {
+  .btn { padding: 7px 14px; font-size: 13px; }
+}
+
+/* ── Charts page ── */
+@media (max-width: 900px) {
+  .charts-grid-2 { grid-template-columns: 1fr !important; }
+  .charts-grid-3 { grid-template-columns: 1fr 1fr !important; }
+  .charts-storage-grid { grid-template-columns: 1fr !important; }
+}
+@media (max-width: 600px) {
+  .charts-grid-3 { grid-template-columns: 1fr !important; }
+}
+
+/* ── Providers page ── */
+@media (max-width: 768px) {
+  .providers-map { height: 42vh !important; min-height: 260px !important; }
+  .providers-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .providers-filter-row { flex-wrap: wrap; gap: 8px; }
+  .summary-bar { grid-template-columns: repeat(3, 1fr) !important; }
+}
+@media (max-width: 480px) {
+  .summary-bar { grid-template-columns: repeat(2, 1fr) !important; }
+}
+
+/* ── Benchmark page ── */
+@media (max-width: 768px) {
+  .bench-result-grid { grid-template-columns: 1fr !important; }
+  .bench-score-row { flex-direction: column; align-items: flex-start; gap: 12px; }
+}
+
+/* ── Utility: hide on mobile ── */
+@media (max-width: 600px) {
+  .hide-mobile { display: none !important; }
+}
+@media (min-width: 601px) {
+  .show-mobile { display: none !important; }
+}
+
+/* ── Touch targets ── */
+@media (hover: none) and (pointer: coarse) {
+  .btn     { min-height: 44px; min-width: 44px; }
+  .nav-tab { min-height: 40px; }
+  .net-switch-btn { min-height: 38px; }
+}
+
+/* ── Safe area for notched phones ── */
+@supports (padding: env(safe-area-inset-bottom)) {
+  .app-shell main { padding-bottom: calc(20px + env(safe-area-inset-bottom)); }
+}

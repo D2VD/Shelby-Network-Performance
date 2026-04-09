@@ -1,9 +1,8 @@
 "use client";
-// components/world-map-inner.tsx — v4.0
-// FIX: Loại bỏ ZoomableGroup hoàn toàn → không còn d3-zoom dependency → không crash CF Pages
-// Zoom thay thế: tăng/giảm projectionConfig.scale + dịch center
-// Hiệu ứng Halo/Pulse/Glow giữ nguyên
-// react-simple-maps chỉ dùng: ComposableMap, Geographies, Geography, Marker
+// components/world-map-inner.tsx — v5.0
+// FIX: Added mouse drag pan + touch pan/pinch-zoom
+// NO ZoomableGroup → CF Pages safe
+// react-simple-maps: ComposableMap, Geographies, Geography, Marker only
 
 import { useState, useCallback, useRef } from "react";
 import {
@@ -27,11 +26,13 @@ const ZONES: Record<string,{lng:number;lat:number;label:string;short:string;flag
 };
 const ZONE_COLORS = ["#3b82f6","#22c55e","#a855f7","#f59e0b","#ef4444"];
 
-// Default zoom config
+// Default zoom/pan config
 const DEFAULT_SCALE  = 185;
 const DEFAULT_CENTER: [number,number] = [15, 5];
 const MIN_SCALE      = 100;
 const MAX_SCALE      = 900;
+// Pan sensitivity: higher = faster pan per pixel drag
+const PAN_SENSITIVITY = 0.25;
 
 // GeoShare panel
 function GeoShare({byZone,isDark}:{byZone:Map<string,StorageProvider[]>;isDark:boolean}) {
@@ -136,11 +137,18 @@ function ClusterPopup({zone,sps,pinned,onClose,isDark}:{zone:string;sps:StorageP
 export default function WorldMapInner({providers}:{providers:StorageProvider[]}) {
   const {isDark} = useTheme();
 
-  // ZOOM: thay ZoomableGroup bằng state scale + center
-  // Tăng/giảm projectionConfig.scale trực tiếp → re-render ComposableMap
-  // Không dùng d3-zoom → không crash
+  // Zoom state
   const [scale,  setScale]  = useState(DEFAULT_SCALE);
   const [center, setCenter] = useState<[number,number]>(DEFAULT_CENTER);
+
+  // Pan state (mouse drag)
+  const isDragging   = useRef(false);
+  const dragStart    = useRef<{x:number;y:number;center:[number,number]}>({x:0,y:0,center:DEFAULT_CENTER});
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Touch state (pinch-zoom)
+  const lastTouchDist = useRef<number|null>(null);
+  const lastTouchMid  = useRef<{x:number;y:number}|null>(null);
 
   const [hoverZone,  setHoverZone]  = useState<string|null>(null);
   const [pinnedZone, setPinnedZone] = useState<string|null>(null);
@@ -151,8 +159,8 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
   const azones = Array.from(byZone.keys()).filter(z=>ZONES[z]);
   const ZONE_LIST = azones.map((z,i)=>({key:z,...ZONES[z],color:ZONE_COLORS[i%ZONE_COLORS.length],sps:byZone.get(z)??[]}));
 
-  const oceanColor = isDark?"#0d1526":"#c5d8f0";
-  const landColor  = isDark?"#1e3a5f":"#d4a574";
+  const oceanColor  = isDark?"#0d1526":"#c5d8f0";
+  const landColor   = isDark?"#1e3a5f":"#d4a574";
   const borderColor = isDark?"#0d1526":"#c5d8f0";
 
   const handleEnter = useCallback((zone:string)=>{
@@ -163,24 +171,122 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
     leaveTimer.current = setTimeout(()=>{if(!pinnedZone)setHoverZone(null);},220);
   },[pinnedZone]);
 
-  // Zoom via scale manipulation (no d3-zoom)
+  // ── Zoom controls ──────────────────────────────────────────────────────────
   const zoomIn  = ()=>setScale(s=>Math.min(MAX_SCALE,Math.round(s*1.6)));
   const zoomOut = ()=>setScale(s=>Math.max(MIN_SCALE,Math.round(s/1.6)));
   const reset   = ()=>{setScale(DEFAULT_SCALE);setCenter(DEFAULT_CENTER);};
 
-  // Scroll wheel zoom on container
+  // Scroll wheel zoom
   const onWheel = useCallback((e:React.WheelEvent<HTMLDivElement>)=>{
     e.preventDefault();
-    if(e.deltaY<0) setScale(s=>Math.min(MAX_SCALE,Math.round(s*1.25)));
-    else           setScale(s=>Math.max(MIN_SCALE,Math.round(s/1.25)));
+    if(e.deltaY<0) setScale(s=>Math.min(MAX_SCALE,Math.round(s*1.18)));
+    else           setScale(s=>Math.max(MIN_SCALE,Math.round(s/1.18)));
+  },[]);
+
+  // ── Mouse Pan handlers ─────────────────────────────────────────────────────
+  const onMouseDown = useCallback((e:React.MouseEvent<HTMLDivElement>)=>{
+    // Only pan on left-click, not on SVG elements (markers)
+    const target = e.target as HTMLElement;
+    if(target.closest("g[style*='cursor:pointer']")) return; // skip marker clicks
+    isDragging.current = true;
+    dragStart.current = {x:e.clientX, y:e.clientY, center:[...center] as [number,number]};
+    if(containerRef.current) containerRef.current.style.cursor = "grabbing";
+  },[center]);
+
+  const onMouseMove = useCallback((e:React.MouseEvent<HTMLDivElement>)=>{
+    if(!isDragging.current) return;
+    const dx = e.clientX - dragStart.current.x;
+    const dy = e.clientY - dragStart.current.y;
+    // Convert pixel delta to lng/lat delta
+    // Scale factor: higher scale = smaller movement per pixel
+    const lngFactor = (360 / scale) * PAN_SENSITIVITY * 100;
+    const latFactor = (180 / scale) * PAN_SENSITIVITY * 100;
+    const newLng = dragStart.current.center[0] - dx * lngFactor;
+    const newLat = Math.max(-80, Math.min(80, dragStart.current.center[1] + dy * latFactor));
+    setCenter([newLng, newLat]);
+  },[scale]);
+
+  const onMouseUp = useCallback(()=>{
+    isDragging.current = false;
+    if(containerRef.current) containerRef.current.style.cursor = "grab";
+  },[]);
+
+  const onMouseLeaveContainer = useCallback(()=>{
+    if(isDragging.current){
+      isDragging.current = false;
+      if(containerRef.current) containerRef.current.style.cursor = "grab";
+    }
+  },[]);
+
+  // ── Touch handlers (mobile) ────────────────────────────────────────────────
+  const getTouchDist = (t1:React.Touch, t2:React.Touch)=>
+    Math.hypot(t2.clientX-t1.clientX, t2.clientY-t1.clientY);
+  const getTouchMid = (t1:React.Touch, t2:React.Touch)=>({
+    x:(t1.clientX+t2.clientX)/2,
+    y:(t1.clientY+t2.clientY)/2,
+  });
+
+  const onTouchStart = useCallback((e:React.TouchEvent<HTMLDivElement>)=>{
+    if(e.touches.length===1){
+      // Single finger: start pan
+      isDragging.current = true;
+      dragStart.current = {x:e.touches[0].clientX, y:e.touches[0].clientY, center:[...center] as [number,number]};
+      lastTouchDist.current = null;
+      lastTouchMid.current  = null;
+    } else if(e.touches.length===2){
+      // Two fingers: start pinch-zoom
+      isDragging.current = false;
+      lastTouchDist.current = getTouchDist(e.touches[0], e.touches[1]);
+      lastTouchMid.current  = getTouchMid(e.touches[0], e.touches[1]);
+    }
+  },[center]);
+
+  const onTouchMove = useCallback((e:React.TouchEvent<HTMLDivElement>)=>{
+    e.preventDefault(); // prevent page scroll
+    if(e.touches.length===1 && isDragging.current){
+      const dx = e.touches[0].clientX - dragStart.current.x;
+      const dy = e.touches[0].clientY - dragStart.current.y;
+      const lngFactor = (360 / scale) * PAN_SENSITIVITY * 100;
+      const latFactor = (180 / scale) * PAN_SENSITIVITY * 100;
+      const newLng = dragStart.current.center[0] - dx * lngFactor;
+      const newLat = Math.max(-80, Math.min(80, dragStart.current.center[1] + dy * latFactor));
+      setCenter([newLng, newLat]);
+    } else if(e.touches.length===2){
+      const newDist = getTouchDist(e.touches[0], e.touches[1]);
+      if(lastTouchDist.current !== null){
+        const ratio = newDist / lastTouchDist.current;
+        setScale(s=>Math.max(MIN_SCALE, Math.min(MAX_SCALE, Math.round(s*ratio))));
+      }
+      lastTouchDist.current = newDist;
+      lastTouchMid.current  = getTouchMid(e.touches[0], e.touches[1]);
+    }
+  },[scale]);
+
+  const onTouchEnd = useCallback(()=>{
+    isDragging.current = false;
+    lastTouchDist.current = null;
+    lastTouchMid.current  = null;
   },[]);
 
   const activeZone = pinnedZone??hoverZone;
 
   return(
     <div
-      style={{position:"relative",width:"100%",height:"100%",background:oceanColor,overflow:"hidden",userSelect:"none"}}
+      ref={containerRef}
+      style={{
+        position:"relative",width:"100%",height:"100%",
+        background:oceanColor,overflow:"hidden",userSelect:"none",
+        cursor:"grab",
+        touchAction:"none", // prevent browser scroll/zoom interference
+      }}
       onWheel={onWheel}
+      onMouseDown={onMouseDown}
+      onMouseMove={onMouseMove}
+      onMouseUp={onMouseUp}
+      onMouseLeave={onMouseLeaveContainer}
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={onTouchEnd}
     >
       <style>{`
         @keyframes halo-ring1 {
@@ -200,10 +306,14 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
         .pulse { animation: pulse-breath 2.1s ease-in-out infinite; }
       `}</style>
 
-      {/* Zoom buttons — top right, clear of GeoShare */}
+      {/* Zoom buttons */}
       <div style={{position:"absolute",top:12,right:12,zIndex:30,display:"flex",flexDirection:"column",gap:4}}>
-        {[{label:"+",fn:zoomIn,title:"Zoom in"},{label:"−",fn:zoomOut,title:"Zoom out"},{label:"⊙",fn:reset,title:"Reset"}].map(({label,fn,title})=>(
-          <button key={label} onClick={fn} title={title} style={{
+        {[
+          {label:"+",fn:zoomIn,title:"Zoom in"},
+          {label:"−",fn:zoomOut,title:"Zoom out"},
+          {label:"⊙",fn:reset,title:"Reset view"}
+        ].map(({label,fn,title})=>(
+          <button key={label} onClick={fn} title={title} onMouseDown={e=>e.stopPropagation()} style={{
             width:30,height:30,borderRadius:7,border:"1px solid var(--border,#e5e7eb)",
             background:isDark?"rgba(13,21,38,0.92)":"rgba(255,255,255,0.92)",
             color:isDark?"#e2e8f0":"#374151",fontSize:label==="⊙"?12:18,
@@ -213,17 +323,16 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
             {label}
           </button>
         ))}
-        {/* Zoom level indicator */}
         <div style={{fontSize:9,color:isDark?"rgba(255,255,255,0.3)":"rgba(0,0,0,0.3)",textAlign:"center",fontFamily:"monospace",marginTop:2}}>
           {Math.round(scale/DEFAULT_SCALE*100)}%
         </div>
       </div>
 
-      {/* Map — NO ZoomableGroup, projection scale controlled by state */}
+      {/* Map */}
       <ComposableMap
         projection="geoNaturalEarth1"
         projectionConfig={{ scale, center }}
-        style={{width:"100%",height:"100%"}}
+        style={{width:"100%",height:"100%",pointerEvents:"none"}}
       >
         <Geographies geography={GEO_URL}>
           {({geographies})=>geographies.map(geo=>(
@@ -234,7 +343,7 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
           ))}
         </Geographies>
 
-        {/* Zone markers with Halo + Pulse + Glow — NO arcs */}
+        {/* Zone markers */}
         {ZONE_LIST.map((zd,zi)=>{
           const sps    = zd.sps;
           const healthy = sps.filter(p=>p.health==="Healthy").length;
@@ -245,17 +354,22 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
 
           return(
             <Marker key={zd.key} coordinates={[zd.lng,zd.lat]}>
-              <g style={{cursor:"pointer"}}
-                onMouseEnter={()=>handleEnter(zd.key)}
-                onMouseLeave={handleLeave}
-                onClick={e=>{e.stopPropagation();setPinnedZone(z=>z===zd.key?null:zd.key);setHoverZone(zd.key);}}
+              <g
+                style={{cursor:"pointer",pointerEvents:"all"}}
+                onMouseEnter={e=>{e.stopPropagation();handleEnter(zd.key);}}
+                onMouseLeave={e=>{e.stopPropagation();handleLeave();}}
+                onClick={e=>{
+                  e.stopPropagation();
+                  // Prevent triggering pan on marker click
+                  isDragging.current = false;
+                  setPinnedZone(z=>z===zd.key?null:zd.key);
+                  setHoverZone(zd.key);
+                }}
+                onMouseDown={e=>e.stopPropagation()} // prevent pan start on marker
               >
-                {/* Halo ring 1 */}
                 <circle className="halo1" cx={0} cy={0} r={18} fill="none" stroke={glowC} strokeWidth={2.5} opacity={0}/>
-                {/* Halo ring 2 — delayed */}
                 <circle className="halo2" cx={0} cy={0} r={18} fill="none" stroke={glowC} strokeWidth={1.5} opacity={0}/>
 
-                {/* SVG glow filter — drop-shadow */}
                 <defs>
                   <filter id={`gf${zi}`} x="-100%" y="-100%" width="300%" height="300%">
                     <feGaussianBlur stdDeviation={isActive?"7":"3.5"} result="blur"/>
@@ -265,23 +379,18 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
                   </filter>
                 </defs>
 
-                {/* Main bubble: Pulse + Glow */}
                 <circle className={allOk?"pulse":undefined} cx={0} cy={0} r={16}
                   fill={allOk?(isDark?"#1e3a5f":"#1e40af"):"#7f1d1d"}
                   stroke={glowC} strokeWidth={isActive?2.8:2}
                   filter={`url(#gf${zi})`}
                   fillOpacity={0.93}
                 />
-
-                {/* Count */}
                 <text textAnchor="middle" dy="0.35em" fontSize={12} fontWeight={800} fill="#fff" fontFamily="monospace" style={{pointerEvents:"none"}}>
                   {sps.length}
                 </text>
-                {/* Label */}
                 <text textAnchor="middle" dy={26} fontSize={9} fill={isDark?"#94a3b8":"#374151"} fontFamily="monospace" style={{pointerEvents:"none"}}>
                   {zd.short}
                 </text>
-                {/* Unhealthy dot */}
                 {!allOk&&<circle cx={12} cy={-12} r={5} fill="#ef4444" stroke={isDark?"#0d1526":"#fff"} strokeWidth={1.5}/>}
               </g>
             </Marker>
@@ -292,7 +401,7 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
       {/* Bottom hints */}
       <div style={{position:"absolute",bottom:10,left:285,zIndex:10,fontSize:9,color:isDark?"rgba(255,255,255,0.25)":"rgba(0,0,0,0.3)",fontFamily:"monospace",display:"flex",alignItems:"center",gap:5}}>
         <span style={{width:5,height:5,borderRadius:"50%",background:"#22c55e",display:"inline-block"}}/>
-        {providers.filter(p=>p.health==="Healthy").length}/{providers.length} · Scroll=zoom · Hover=inspect · Click=pin
+        {providers.filter(p=>p.health==="Healthy").length}/{providers.length} · Scroll=zoom · Drag=pan · Click=pin
       </div>
       <div style={{position:"absolute",bottom:10,right:50,zIndex:10,fontSize:9,color:"rgba(217,119,6,0.85)",fontFamily:"monospace"}}>
         🇻🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
@@ -309,7 +418,7 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
 
       {/* GeoShare — top left */}
       {providers.length>0&&(
-        <div style={{position:"absolute",top:12,left:12,zIndex:25}}>
+        <div style={{position:"absolute",top:12,left:12,zIndex:25}} onMouseDown={e=>e.stopPropagation()}>
           <GeoShare byZone={byZone} isDark={isDark}/>
         </div>
       )}

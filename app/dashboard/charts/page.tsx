@@ -1,11 +1,11 @@
 "use client";
 /**
- * app/dashboard/charts/page.tsx — v13.0
- * ROOT CAUSE FIX cho React error #310:
- * - Rebuild với simple useEffect pattern (không chain useCallback phức tạp)
- * - Tất cả JSX values đều qua str() / num() helper trước khi render
- * - str() luôn trả string, không bao giờ trả object/undefined/null
- * - num() luôn trả finite number hoặc 0
+ * app/dashboard/charts/page.tsx — v14.0
+ * FIXES:
+ * 1. Network Snapshot: correct 24h delta (current 24h vs previous 24h window)
+ * 2. Benchmark Analytics: fetch from VPS via /api/benchmark/results (not empty)
+ * 3. English only — no Vietnamese text in UI
+ * 4. str()/num() safety guards preserved
  */
 
 import { useEffect, useState, useRef } from "react";
@@ -31,20 +31,17 @@ type TimeRange = "1h"|"24h"|"7d"|"30d";
 const POLL   = 30_000;
 const PG     = 10;
 
-// ─── SAFE VALUE HELPERS — the key fix ────────────────────────────────────────
-// str(): ALWAYS returns a string. Never returns object/undefined/null.
+// ─── SAFE VALUE HELPERS ───────────────────────────────────────────────────────
 function str(v: unknown): string {
   if (v === null || v === undefined) return "—";
   if (typeof v === "string") return v.trim() || "—";
   if (typeof v === "number") return isFinite(v) ? String(v) : "—";
   return String(v);
 }
-// num(): ALWAYS returns a finite number.
 function num(v: unknown, fallback = 0): number {
   const n = Number(v);
   return isFinite(n) ? n : fallback;
 }
-// fmtN: format number with locale commas
 function fmtN(v: unknown): string {
   const n = num(v);
   return n === 0 ? "—" : Math.round(n).toLocaleString("en-US");
@@ -243,14 +240,17 @@ function RangeSel({range,onChange}:{range:TimeRange;onChange:(r:TimeRange)=>void
   );
 }
 
-// ── SnapCard: 24h delta with safe rendering ───────────────────────────────────
+// ── SnapCard: delta vs previous 24h window ───────────────────────────────────
+// delta = value(now) - value(24h ago)
+// pct   = delta / value(24h ago) * 100
+// This is the CORRECT logic: current 24h vs previous 24h
 function SnapCard({label,value,delta,from,color}:{label:string;value:string;delta:number|null;from:number|null;color?:string}) {
-  // ALL values safety-checked before render
   const safeLabel = str(label);
   const safeValue = str(value);
   const safeColor = str(color) || "var(--text-primary)";
   const safeDelta = (delta!==null&&isFinite(delta))?delta:null;
-  const pct = safeDelta!==null&&from!==null&&isFinite(from)&&from!==0 ? safeDelta/Math.abs(from)*100 : null;
+  const pct = safeDelta!==null&&from!==null&&isFinite(from)&&Math.abs(from)>0
+    ? (safeDelta/Math.abs(from))*100 : null;
   const safePct = pct!==null&&isFinite(pct)?pct:null;
   const pos = safeDelta!==null?safeDelta>0:null;
   return(
@@ -262,11 +262,14 @@ function SnapCard({label,value,delta,from,color}:{label:string;value:string;delt
           <span style={{fontSize:11,fontWeight:600,padding:"1px 7px",borderRadius:4,
             color:pos?"#22c55e":safeDelta<0?"#ef4444":"var(--text-muted)",
             background:pos?"rgba(34,197,94,0.1)":safeDelta<0?"rgba(239,68,68,0.1)":"rgba(0,0,0,0.04)"}}>
-            {/* str() ensures we never render a raw number as React child */}
             {str(safeDelta>0?`+${Math.round(safeDelta).toLocaleString("en-US")}`:Math.round(safeDelta).toLocaleString("en-US"))}
           </span>
-          {safePct!==null&&<span style={{fontSize:10,color:pos?"#22c55e":safeDelta<0?"#ef4444":"var(--text-muted)",fontWeight:600}}>{str(`(${safePct>=0?"+":""}${safePct.toFixed(1)}%)`)}</span>}
-          <span style={{fontSize:10,color:"var(--text-dim)"}}>vs 24h ago</span>
+          {safePct!==null&&(
+            <span style={{fontSize:10,color:pos?"#22c55e":safeDelta<0?"#ef4444":"var(--text-muted)",fontWeight:600}}>
+              {str(`(${safePct>=0?"+":""}${safePct.toFixed(1)}%)`)}
+            </span>
+          )}
+          <span style={{fontSize:10,color:"var(--text-dim)"}}>vs previous 24h</span>
         </div>
       )}
     </div>
@@ -291,14 +294,15 @@ export default function ChartsPage() {
   const { network, config } = useNetwork();
   const [range,  setRange]  = useState<TimeRange>("24h");
   const [ts,     setTs]     = useState<TsPoint[]>([]);
-  const [ts24,   setTs24]   = useState<TsPoint[]>([]);
+  // ts48h: last 48 hours at 1h resolution → split in half for 24h delta
+  const [ts48h,  setTs48h]  = useState<TsPoint[]>([]);
   const [live,   setLive]   = useState<LivePt[]>([]);
   const [bench,  setBench]  = useState<ServerBench[]>([]);
   const [pg,     setPg]     = useState(0);
   const [last,   setLast]   = useState("");
+  const [benchLoading, setBenchLoading] = useState(true);
   const timerRef = useRef<ReturnType<typeof setInterval>|null>(null);
 
-  // Simple fetch functions — no useCallback chain
   const fetchLive = async (net: string) => {
     try {
       const r = await fetch(`/api/network/stats/live?network=${net}`);
@@ -335,11 +339,17 @@ export default function ChartsPage() {
     } catch {}
   };
 
-  const fetchTs24 = async (net: string) => {
+  // FIXED: Fetch 48h of hourly data to compute correct 24h delta
+  // Split the 48h array in half:
+  //   prev24 = first half  (48h ago → 24h ago)
+  //   curr24 = second half (24h ago → now)
+  // delta = last(curr24) - last(prev24)  [current end vs previous end]
+  const fetchTs48h = async (net: string) => {
     try {
-      const j = await fetch(`/api/network/stats/timeseries?network=${net}&resolution=5m&range=24h`).then(x=>x.json()) as any;
-      const series = (j?.data?.series ?? []) as any[];
-      setTs24(series.map(s=>({
+      // Use 7d range at 1h resolution → gives us up to 168 points
+      // We only need the last 48 (=48h of data)
+      const j = await fetch(`/api/network/stats/timeseries?network=${net}&resolution=1h&range=7d`).then(x=>x.json()) as any;
+      const series = ((j?.data?.series ?? []) as any[]).map(s=>({
         tsMs:           num(s.tsMs),
         activeBlobs:    num(s.activeBlobs),
         totalStorageGB: num(s.totalStorageGB),
@@ -347,25 +357,40 @@ export default function ChartsPage() {
         pendingOrFailed:num(s.pendingOrFailed),
         deletedBlobs:   num(s.deletedBlobs),
         blockHeight:    num(s.blockHeight),
-      })));
+      }));
+      // Take last 48 entries (48 hours)
+      setTs48h(series.slice(-48));
     } catch {}
   };
 
   const fetchBench = async () => {
+    setBenchLoading(true);
     try {
       const j = await fetch("/api/benchmark/results?limit=200").then(x=>x.json()) as any;
-      if (Array.isArray(j?.results)) setBench(j.results);
-    } catch {}
+      if (Array.isArray(j?.results)) {
+        setBench(j.results);
+      } else {
+        setBench([]);
+      }
+    } catch {
+      setBench([]);
+    } finally {
+      setBenchLoading(false);
+    }
   };
 
   useEffect(()=>{
     setLive([]);
     fetchLive(network);
     fetchTs(network, range);
-    fetchTs24(network);
+    fetchTs48h(network);
     fetchBench();
     if (timerRef.current) clearInterval(timerRef.current);
-    timerRef.current = setInterval(()=>{fetchLive(network);fetchTs24(network);fetchBench();}, POLL);
+    timerRef.current = setInterval(()=>{
+      fetchLive(network);
+      fetchTs48h(network);
+      fetchBench();
+    }, POLL);
     return ()=>{ if(timerRef.current) clearInterval(timerRef.current); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [network]);
@@ -384,14 +409,26 @@ export default function ChartsPage() {
   const latest = live[live.length-1];
   const latestTs = cd[cd.length-1];
 
-  // 24h deltas — all safely computed
-  const t24Last  = ts24[ts24.length-1];
-  const t24First = ts24[0];
-  const d24 = (key: keyof TsPoint): number|null => {
-    const a=num(t24Last?.[key]), b=num(t24First?.[key]);
-    if (!t24Last||!t24First) return null;
-    const d=a-b; return isFinite(d)?d:null;
-  };
+  // FIXED: Correct 24h delta computation
+  // ts48h is sorted oldest→newest, 48 entries max
+  // Split: prev24 = first 24 entries, curr24 = last 24 entries
+  const mid48 = Math.floor(ts48h.length / 2);
+  const prev24 = ts48h.slice(0, mid48);   // 48h ago → 24h ago
+  const curr24 = ts48h.slice(mid48);      // 24h ago → now
+
+  // Use the LAST point of each window for delta (end of window value)
+  const prevLast = prev24[prev24.length - 1];  // value ~24h ago
+  const currLast = curr24[curr24.length - 1];  // value ~now
+
+  // delta(metric) = curr_now - prev_24h_ago
+  // pct = delta / prev_24h_ago * 100
+  function d48(key: keyof TsPoint): { delta: number|null; from: number|null } {
+    if (!prevLast || !currLast) return { delta: null, from: null };
+    const curr = num(currLast[key]);
+    const prev = num(prevLast[key]);
+    if (prev === 0 && curr === 0) return { delta: null, from: null };
+    return { delta: curr - prev, from: prev };
+  }
 
   const pagedBench = bench.slice(pg*PG,(pg+1)*PG);
 
@@ -401,20 +438,38 @@ export default function ChartsPage() {
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12,marginBottom:28}}>
         <div>
           <h1 style={{fontSize:26,fontWeight:800,color:"var(--text-primary)",margin:0,letterSpacing:-0.5}}>Network Analytics</h1>
-          <p style={{fontSize:13,color:"var(--text-muted)",margin:"4px 0 0"}}>{str(config.label)} · {POLL/1000}s poll · {str(last)||"—"}</p>
+          <p style={{fontSize:13,color:"var(--text-muted)",margin:"4px 0 0"}}>{str(config.label)} · Refresh every {POLL/1000}s · Last: {str(last)||"—"}</p>
         </div>
-        <button onClick={()=>{fetchLive(network);fetchTs24(network);}} style={{padding:"7px 14px",borderRadius:8,fontSize:12,fontWeight:600,background:"var(--bg-card)",border:"1px solid var(--border)",color:"var(--text-muted)",cursor:"pointer"}}>⟳ Refresh</button>
+        <button onClick={()=>{fetchLive(network);fetchTs48h(network);fetchBench();}} style={{padding:"7px 14px",borderRadius:8,fontSize:12,fontWeight:600,background:"var(--bg-card)",border:"1px solid var(--border)",color:"var(--text-muted)",cursor:"pointer"}}>⟳ Refresh</button>
       </div>
 
-      {/* Network Snapshot — fixed 24h */}
-      <Sec title="Network Snapshot" sub="Current state · Δ so với 24 giờ trước (không bị ảnh hưởng bộ lọc)">
+      {/* Network Snapshot — FIXED: current 24h vs previous 24h */}
+      <Sec
+        title="Network Snapshot"
+        sub="Current values · % change vs the previous 24-hour window (24h ago → 48h ago)"
+      >
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:12}}>
-          <SnapCard label="Block Height"   value={str(latest?`#${num(latest.blockHeight).toLocaleString("en-US")}`:undefined)}  color="var(--accent)"  delta={null} from={null}/>
-          <SnapCard label="Active Blobs"   value={fmtN(latestTs?.activeBlobs)}    color="#22c55e" delta={d24("activeBlobs")}    from={num(t24First?.activeBlobs)}/>
-          <SnapCard label="Storage Used"   value={fmtGB(latestTs?.totalStorageGB)} color="#a78bfa" delta={d24("totalStorageGB")} from={num(t24First?.totalStorageGB)}/>
-          <SnapCard label="Blob Events"    value={fmtN(latestTs?.totalBlobEvents)} color="#fb923c" delta={d24("totalBlobEvents")} from={num(t24First?.totalBlobEvents)}/>
-          <SnapCard label="Pending Blobs"  value={fmtN(latestTs?.pendingOrFailed)} color="#fbbf24" delta={d24("pendingOrFailed")} from={num(t24First?.pendingOrFailed)}/>
-          <SnapCard label="Deleted Blobs"  value={fmtN(latestTs?.deletedBlobs)}    color="#f87171" delta={d24("deletedBlobs")}   from={num(t24First?.deletedBlobs)}/>
+          <SnapCard
+            label="Block Height"
+            value={str(latest?`#${num(latest.blockHeight).toLocaleString("en-US")}`:undefined)}
+            color="var(--accent)"
+            delta={null} from={null}
+          />
+          {(()=>{const {delta,from}=d48("activeBlobs");return(
+            <SnapCard label="Active Blobs"  value={fmtN(latestTs?.activeBlobs)}    color="#22c55e" delta={delta} from={from}/>
+          );})()}
+          {(()=>{const {delta,from}=d48("totalStorageGB");return(
+            <SnapCard label="Storage Used"  value={fmtGB(latestTs?.totalStorageGB)} color="#a78bfa" delta={delta} from={from}/>
+          );})()}
+          {(()=>{const {delta,from}=d48("totalBlobEvents");return(
+            <SnapCard label="Blob Events"   value={fmtN(latestTs?.totalBlobEvents)} color="#fb923c" delta={delta} from={from}/>
+          );})()}
+          {(()=>{const {delta,from}=d48("pendingOrFailed");return(
+            <SnapCard label="Pending Blobs" value={fmtN(latestTs?.pendingOrFailed)} color="#fbbf24" delta={delta} from={from}/>
+          );})()}
+          {(()=>{const {delta,from}=d48("deletedBlobs");return(
+            <SnapCard label="Deleted Blobs" value={fmtN(latestTs?.deletedBlobs)}   color="#f87171" delta={delta} from={from}/>
+          );})()}
         </div>
       </Sec>
 
@@ -444,9 +499,9 @@ export default function ChartsPage() {
           </Card>
           <div style={{display:"flex",flexDirection:"column",gap:10}}>
             {[
-              {label:"Total Storage", val:fmtGB(latestTs?.totalStorageGB),      c:"#a78bfa"},
-              {label:"Active Blobs",  val:fmtN(latestTs?.activeBlobs),          c:"#22c55e"},
-              {label:"Avg Blob Size", val:(()=>{const a=num(latestTs?.activeBlobs),g=num(latestTs?.totalStorageGB);return a>0?`${((g*1e9)/a/1024).toFixed(0)} KB`:"—";})(), c:"var(--accent)"},
+              {label:"Total Storage",  val:fmtGB(latestTs?.totalStorageGB),      c:"#a78bfa"},
+              {label:"Active Blobs",   val:fmtN(latestTs?.activeBlobs),          c:"#22c55e"},
+              {label:"Avg Blob Size",  val:(()=>{const a=num(latestTs?.activeBlobs),g=num(latestTs?.totalStorageGB);return a>0?`${((g*1e9)/a/1024).toFixed(0)} KB`:"—";})(), c:"var(--accent)"},
             ].map(({label,val,c})=>(
               <div key={label} style={{background:"var(--bg-card)",border:"1px solid var(--border)",borderRadius:10,padding:"12px 16px",flex:1}}>
                 <div style={{fontSize:11,color:"var(--text-muted)",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:4}}>{str(label)}</div>
@@ -464,11 +519,19 @@ export default function ChartsPage() {
         </Card>
       </Sec>
 
-      {/* Benchmark — all users from server */}
+      {/* Benchmark Analytics — all users from server */}
       <Sec title="Benchmark Analytics" sub={str(`${bench.length} total runs across all users`)}>
-        {bench.length===0?(
+        {benchLoading ? (
+          <div style={{background:"var(--bg-card)",border:"1px solid var(--border)",borderRadius:12,padding:"36px 20px",textAlign:"center"}}>
+            <div style={{width:24,height:24,borderRadius:"50%",border:"2px solid var(--border)",borderTopColor:"var(--accent)",animation:"spin 1s linear infinite",margin:"0 auto 12px"}}/>
+            <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+            <div style={{color:"var(--text-muted)",fontSize:13}}>Loading benchmark data…</div>
+          </div>
+        ) : bench.length===0 ? (
           <div style={{background:"var(--bg-card)",border:"1px solid var(--border)",borderRadius:12,padding:"36px 20px",textAlign:"center",color:"var(--text-muted)"}}>
-            No benchmark data yet — run a benchmark to populate
+            <div style={{fontSize:28,marginBottom:10}}>📊</div>
+            <div style={{fontSize:14}}>No benchmark data yet — run a benchmark to populate</div>
+            <div style={{fontSize:12,marginTop:6,color:"var(--text-dim)"}}>Data is shared across all users globally</div>
           </div>
         ):(
           <>
@@ -496,7 +559,7 @@ export default function ChartsPage() {
                 <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
                   <thead>
                     <tr style={{background:"var(--bg-card2)"}}>
-                      {["User","Time","Score","Tier","Upload","Latency","TX","Mode"].map(h=>(
+                      {["User","Time","Score","Tier","Upload","Latency","TX Confirm","Mode"].map(h=>(
                         <th key={h} style={{padding:"9px 13px",textAlign:"left",fontSize:10,fontWeight:600,color:"var(--text-dim)",textTransform:"uppercase",letterSpacing:"0.06em",whiteSpace:"nowrap",borderBottom:"1px solid var(--border)"}}>{h}</th>
                       ))}
                     </tr>
@@ -509,12 +572,12 @@ export default function ChartsPage() {
                         <tr key={str(h.id)||i} style={{borderTop:"1px solid var(--border-soft)"}}>
                           <td style={{padding:"8px 13px",fontFamily:"monospace",fontSize:12,color:"var(--text-dim)"}}>{str(h.ip)}</td>
                           <td style={{padding:"8px 13px",fontSize:11,color:"var(--text-dim)",fontFamily:"monospace"}}>{str(h.ts?new Date(h.ts).toLocaleString([],{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}):"—")}</td>
-                          <td><span style={{fontFamily:"monospace",fontWeight:800,color:c,fontSize:14}}>{str(sc>0?sc:undefined)}</span></td>
-                          <td><span style={{fontSize:11,color:c,fontWeight:600}}>{str(h.tier)}</span></td>
-                          <td style={{fontFamily:"monospace",color:"var(--accent)"}}>{fmtKbs(h.avgUploadKbs)}</td>
-                          <td style={{fontFamily:"monospace",color:"#c084fc"}}>{fmtMs(h.latencyAvg)}</td>
-                          <td style={{fontFamily:"monospace",color:"#fb923c"}}>{fmtMs(h.txConfirmMs)}</td>
-                          <td><span style={{fontSize:10,fontWeight:700,color:"#818cf8",textTransform:"uppercase"}}>{str(h.mode)}</span></td>
+                          <td style={{padding:"8px 13px"}}><span style={{fontFamily:"monospace",fontWeight:800,color:c,fontSize:14}}>{str(sc>0?sc:undefined)}</span></td>
+                          <td style={{padding:"8px 13px"}}><span style={{fontSize:11,color:c,fontWeight:600}}>{str(h.tier)}</span></td>
+                          <td style={{padding:"8px 13px",fontFamily:"monospace",color:"var(--accent)"}}>{fmtKbs(h.avgUploadKbs)}</td>
+                          <td style={{padding:"8px 13px",fontFamily:"monospace",color:"#c084fc"}}>{fmtMs(h.latencyAvg)}</td>
+                          <td style={{padding:"8px 13px",fontFamily:"monospace",color:"#fb923c"}}>{fmtMs(h.txConfirmMs)}</td>
+                          <td style={{padding:"8px 13px"}}><span style={{fontSize:10,fontWeight:700,color:"#818cf8",textTransform:"uppercase"}}>{str(h.mode)}</span></td>
                         </tr>
                       );
                     })}

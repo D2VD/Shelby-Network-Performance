@@ -1,9 +1,7 @@
-// app/api/benchmark/faucet/route.ts — v3
-// Proxy sang Benchmark Worker (như các routes khác).
-// Worker có SHELBY_WALLET_ADDRESS trong secrets → không cần env var trên Pages.
-
+// app/api/benchmark/faucet/route.ts — v2.0
+// FIX: Use VPS proxy
 import { type NextRequest } from "next/server";
-import { proxyToBenchmarkWorker, parseBody } from "../_proxy";
+import { proxyToBenchmarkWorker, parseBody } from "@/app/api/_proxy";
 
 export const runtime = "edge";
 

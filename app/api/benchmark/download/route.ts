@@ -1,6 +1,7 @@
-// app/api/benchmark/download/route.ts — proxy to Benchmark Worker
+// app/api/benchmark/download/route.ts — v2.0
+// FIX: Use VPS proxy
 import { type NextRequest } from "next/server";
-import { proxyToBenchmarkWorker, parseBody } from "../_proxy";
+import { proxyToBenchmarkWorker, parseBody } from "@/app/api/_proxy";
 
 export const runtime = "edge";
 

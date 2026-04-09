@@ -1,32 +1,26 @@
 /**
- * app/api/_proxy.ts — VPS Proxy Helper v2.0
+ * app/api/_proxy.ts — VPS Proxy Helper v3.0
  *
- * Kiến trúc mới (VPS + Cloudflare Tunnel):
- *   Trước: CF Pages → CF Worker (benchmark) + CF Worker (geo-sync)
- *   Nay:   CF Pages → VPS/Caddy qua Cloudflare Tunnel
+ * Single source of truth: SHELBY_API_URL env var → VPS via Cloudflare Tunnel
  *
- * 1 env var duy nhất: SHELBY_API_URL = https://api.yourdomain.com
- * Caddy routing trên VPS:
- *   /api/benchmark/* → shelby-api:3000
- *   /api/geo-sync/*  → shelby-api:3000
+ * Routes:
+ *   /api/benchmark/* → VPS shelby-api:3000/api/benchmark/*
+ *   /api/geo-sync/*  → VPS shelby-api:3000/api/geo-sync/*
  *
- * KHÔNG dùng SHELBY_WORKER_URL hay SHELBY_BENCHMARK_WORKER_URL nữa.
+ * IMPORTANT: DO NOT use benchmark/_proxy.ts anymore.
+ * All benchmark routes must import from @/app/api/_proxy
  */
 
 import { NextRequest, NextResponse } from "next/server";
 
 // ── Single source of truth ────────────────────────────────────────────────────
-// Set trong CF Pages environment variables:
-//   SHELBY_API_URL = https://api.shelbyanalytics.site  (domain thực của bạn)
-//
-// Fallback chỉ dùng cho development local (không có tunnel)
 export const VPS_API_URL =
   process.env.SHELBY_API_URL ??
-  process.env.SHELBY_WORKER_URL ??          // backward compat nếu chưa đổi env
-  process.env.SHELBY_BENCHMARK_WORKER_URL ?? // backward compat
-  "http://localhost:3000";                    // local dev fallback
+  process.env.SHELBY_WORKER_URL ??
+  process.env.SHELBY_BENCHMARK_WORKER_URL ??
+  "http://localhost:3000";
 
-// ─── Generic proxy helper ─────────────────────────────────────────────────────
+// ── Generic VPS proxy helper ──────────────────────────────────────────────────
 export async function proxyToVPS(
   _req: NextRequest,
   vpsPath: string,
@@ -52,8 +46,8 @@ export async function proxyToVPS(
         ok:    false,
         error: `VPS unreachable: ${err.message}`,
         hint:  isTimeout
-          ? "Request timed out — VPS hoặc Cloudflare Tunnel có thể đang bị tắt"
-          : "Kiểm tra SHELBY_API_URL env var và Cloudflare Tunnel status",
+          ? "Request timed out — VPS or Cloudflare Tunnel may be down"
+          : "Check SHELBY_API_URL env var and Cloudflare Tunnel status",
         vpsUrl: url,
       },
       { status: 503 }
@@ -61,7 +55,8 @@ export async function proxyToVPS(
   }
 }
 
-// ─── Backward-compat aliases (giữ để không phải đổi import ở mọi route) ────────
+// ── Benchmark proxy → VPS /api/benchmark/* ───────────────────────────────────
+// Previously routed to a separate CF Worker — now all goes to VPS
 export const proxyToBenchmarkWorker = (
   req: NextRequest,
   path: string,
@@ -69,6 +64,7 @@ export const proxyToBenchmarkWorker = (
   body?: object
 ) => proxyToVPS(req, `/api/benchmark${path}`, method, body, 60_000);
 
+// ── Geo-sync proxy → VPS /api/geo-sync/* ─────────────────────────────────────
 export const proxyToGeoSync = (
   req: NextRequest,
   path: string,
@@ -76,7 +72,7 @@ export const proxyToGeoSync = (
   body?: object
 ) => proxyToVPS(req, `/api/geo-sync${path}`, method, body, 15_000);
 
-// ─── Parse body helper ────────────────────────────────────────────────────────
+// ── Parse body helper ─────────────────────────────────────────────────────────
 export async function parseBody(req: NextRequest): Promise<Record<string, any>> {
   try { return await req.json(); }
   catch { return {}; }

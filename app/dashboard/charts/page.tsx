@@ -1,10 +1,10 @@
 "use client";
 /**
- * app/dashboard/charts/page.tsx — v14.0
+ * app/dashboard/charts/page.tsx — v15.0
  * FIXES:
- * 1. Network Snapshot: correct 24h delta (current 24h vs previous 24h window)
- * 2. Benchmark Analytics: fetch from VPS via /api/benchmark/results (not empty)
- * 3. English only — no Vietnamese text in UI
+ * 1. Benchmark Analytics: add charts for avg latency, tx confirm, upload speed
+ * 2. Global Run History: only show runs since last server deploy (deployedAtMs filter)
+ * 3. "since last deploy" badge on Global Run History header
  * 4. str()/num() safety guards preserved
  */
 
@@ -23,15 +23,18 @@ interface LivePt {
   totalStorageGB: number; totalBlobEvents: number; pendingOrFailed: number; deletedBlobs: number;
 }
 interface ServerBench {
-  id: string; ip: string; ts: string; score: number; tier: string;
-  avgUploadKbs: number; avgDownloadKbs: number; latencyAvg: number; txConfirmMs: number; mode: string;
+  id: string; ip: string; deviceId?: string; ts: string; tsMs?: number;
+  score: number; tier: string;
+  avgUploadKbs: number; avgDownloadKbs: number;
+  latencyAvg: number; txConfirmMs: number;
+  mode: string; maxBytes?: number;
 }
 type TimeRange = "1h"|"24h"|"7d"|"30d";
 
-const POLL   = 30_000;
-const PG     = 10;
+const POLL = 30_000;
+const PG   = 15;
 
-// ─── SAFE VALUE HELPERS ───────────────────────────────────────────────────────
+// ─── Safe value helpers ───────────────────────────────────────────────────────
 function str(v: unknown): string {
   if (v === null || v === undefined) return "—";
   if (typeof v === "string") return v.trim() || "—";
@@ -43,21 +46,17 @@ function num(v: unknown, fallback = 0): number {
   return isFinite(n) ? n : fallback;
 }
 function fmtN(v: unknown): string {
-  const n = num(v);
-  return n === 0 ? "—" : Math.round(n).toLocaleString("en-US");
+  const n = num(v); return n === 0 ? "—" : Math.round(n).toLocaleString("en-US");
 }
 function fmtGB(v: unknown): string {
-  const n = num(v);
-  return n === 0 ? "—" : `${n.toFixed(2)} GB`;
+  const n = num(v); return n === 0 ? "—" : `${n.toFixed(2)} GB`;
 }
 function fmtKbs(v: unknown): string {
-  const n = num(v);
-  if (n === 0) return "—";
+  const n = num(v); if (n === 0) return "—";
   return n >= 1024 ? `${(n/1024).toFixed(2)} MB/s` : `${n.toFixed(1)} KB/s`;
 }
 function fmtMs(v: unknown): string {
-  const n = num(v);
-  if (n === 0) return "—";
+  const n = num(v); if (n === 0) return "—";
   return n >= 1000 ? `${(n/1000).toFixed(2)}s` : `${n.toFixed(0)}ms`;
 }
 function tLbl(tsMs: number, range: TimeRange): string {
@@ -78,14 +77,14 @@ function Chart({ series, labels, height=150, perScale=false }: {
   const { isDark } = useTheme();
   const svgRef = useRef<SVGSVGElement>(null);
   const [hIdx, setHIdx] = useState<number|null>(null);
-  const [pin,  setPin]  = useState<number|null>(null);
-  const [in_,  setIn]   = useState(false);
+  const [pin, setPin]   = useState<number|null>(null);
+  const [in_, setIn]    = useState(false);
 
   const VW=600, PL=60, PR=12, PT=16, PB=24;
   const iW=VW-PL-PR, iH=height-PT-PB;
   const n = Math.max(...series.map(s=>s.data.length), 2);
-
   const allV = series.flatMap(s => s.data.filter(v => isFinite(v) && v > 0));
+
   if (allV.length < 2) return (
     <div style={{height,display:"flex",alignItems:"center",justifyContent:"center",color:"var(--text-dim)",fontSize:12}}>
       Collecting data…
@@ -100,7 +99,6 @@ function Chart({ series, labels, height=150, perScale=false }: {
   });
   const gMn = perScale ? 0 : Math.min(...allV)*0.97;
   const gMx = perScale ? 0 : Math.max(...allV)*1.03;
-
   const xp = (i:number) => PL+(i/Math.max(n-1,1))*iW;
   const yp = (v:number,si=0) => {
     if (!isFinite(v)) return PT+iH/2;
@@ -114,22 +112,17 @@ function Chart({ series, labels, height=150, perScale=false }: {
     if (v>=1e3) return `${(v/1e3).toFixed(0)}K`;
     return String(Math.round(v));
   };
-
-  const toIdx = (clientX:number):number => {
+  const toIdx = (clientX:number) => {
     const el=svgRef.current; if(!el) return 0;
     const rect=el.getBoundingClientRect();
     const frac=(clientX-rect.left)/rect.width;
     const raw=(frac*VW-PL)/iW*(n-1);
     return Math.max(0,Math.min(n-1,Math.round(raw)));
   };
-
   const active = pin ?? hIdx;
   const gc = isDark?"#1e3a5f":"#e5e7eb";
   const tc = "var(--text-dim)";
-  const ticks = [0,0.25,0.5,0.75,1].map(f=>{
-    const v = perScale ? doms[0].mn+f*(doms[0].mx-doms[0].mn) : gMn+f*(gMx-gMn);
-    return {f,v};
-  });
+  const ticks = [0,0.25,0.5,0.75,1].map(f=>({f,v:perScale?doms[0].mn+f*(doms[0].mx-doms[0].mn):gMn+f*(gMx-gMn)}));
   const tipR = active!==null ? active<n*0.55 : true;
   const tipX = active!==null ? (xp(active)/VW*100) : 50;
 
@@ -161,6 +154,8 @@ function Chart({ series, labels, height=150, perScale=false }: {
           return(<g key={si}>
             <polygon points={area} fill={`url(#g${si}${s.color.replace(/[^a-z0-9]/gi,"")})`}/>
             <polyline points={pts} fill="none" stroke={s.color} strokeWidth={2} strokeLinejoin="round"/>
+            {/* Last point dot */}
+            <circle cx={xp(s.data.length-1)} cy={yp(s.data[s.data.length-1],si)} r={4} fill={s.color} stroke={isDark?"#0f172a":"#fff"} strokeWidth={2}/>
           </g>);
         })}
         {active!==null&&in_&&(()=>{const cx=xp(active);return(
@@ -240,22 +235,16 @@ function RangeSel({range,onChange}:{range:TimeRange;onChange:(r:TimeRange)=>void
   );
 }
 
-// ── SnapCard: delta vs previous 24h window ───────────────────────────────────
-// delta = value(now) - value(24h ago)
-// pct   = delta / value(24h ago) * 100
-// This is the CORRECT logic: current 24h vs previous 24h
 function SnapCard({label,value,delta,from,color}:{label:string;value:string;delta:number|null;from:number|null;color?:string}) {
-  const safeLabel = str(label);
   const safeValue = str(value);
   const safeColor = str(color) || "var(--text-primary)";
   const safeDelta = (delta!==null&&isFinite(delta))?delta:null;
-  const pct = safeDelta!==null&&from!==null&&isFinite(from)&&Math.abs(from)>0
-    ? (safeDelta/Math.abs(from))*100 : null;
+  const pct = safeDelta!==null&&from!==null&&isFinite(from)&&Math.abs(from)>0 ? (safeDelta/Math.abs(from))*100 : null;
   const safePct = pct!==null&&isFinite(pct)?pct:null;
   const pos = safeDelta!==null?safeDelta>0:null;
   return(
     <div style={{background:"var(--bg-card)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 18px",display:"flex",flexDirection:"column",gap:4}}>
-      <div style={{fontSize:11,fontWeight:600,letterSpacing:"0.08em",color:"var(--text-muted)",textTransform:"uppercase"}}>{safeLabel}</div>
+      <div style={{fontSize:11,fontWeight:600,letterSpacing:"0.08em",color:"var(--text-muted)",textTransform:"uppercase"}}>{label}</div>
       <div style={{fontSize:21,fontWeight:800,color:safeColor,fontFamily:"monospace",lineHeight:1.1}}>{safeValue}</div>
       {safeDelta!==null&&(
         <div style={{display:"flex",alignItems:"center",gap:5,flexWrap:"wrap"}}>
@@ -264,11 +253,7 @@ function SnapCard({label,value,delta,from,color}:{label:string;value:string;delt
             background:pos?"rgba(34,197,94,0.1)":safeDelta<0?"rgba(239,68,68,0.1)":"rgba(0,0,0,0.04)"}}>
             {str(safeDelta>0?`+${Math.round(safeDelta).toLocaleString("en-US")}`:Math.round(safeDelta).toLocaleString("en-US"))}
           </span>
-          {safePct!==null&&(
-            <span style={{fontSize:10,color:pos?"#22c55e":safeDelta<0?"#ef4444":"var(--text-muted)",fontWeight:600}}>
-              {str(`(${safePct>=0?"+":""}${safePct.toFixed(1)}%)`)}
-            </span>
-          )}
+          {safePct!==null&&<span style={{fontSize:10,color:pos?"#22c55e":safeDelta<0?"#ef4444":"var(--text-muted)",fontWeight:600}}>{str(`(${safePct>=0?"+":""}${safePct.toFixed(1)}%)`)}</span>}
           <span style={{fontSize:10,color:"var(--text-dim)"}}>vs previous 24h</span>
         </div>
       )}
@@ -281,9 +266,10 @@ function Pager({total,page,per,set}:{total:number;page:number;per:number;set:(p:
   return(
     <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:5,marginTop:12}}>
       <button onClick={()=>set(page-1)} disabled={page===0} style={{padding:"4px 11px",borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-card)",color:"var(--text-muted)",cursor:page===0?"not-allowed":"pointer",opacity:page===0?.4:1,fontSize:13}}>←</button>
-      {Array.from({length:pages},(_,i)=>i).map(i=>(
+      {Array.from({length:Math.min(pages,8)},(_,i)=>i).map(i=>(
         <button key={i} onClick={()=>set(i)} style={{padding:"4px 9px",borderRadius:6,border:"1px solid var(--border)",background:i===page?"var(--accent)":"var(--bg-card)",color:i===page?"#fff":"var(--text-muted)",cursor:"pointer",fontWeight:i===page?700:400,fontSize:13,minWidth:32}}>{i+1}</button>
       ))}
+      {pages>8&&<span style={{fontSize:12,color:"var(--text-dim)"}}>…{pages}</span>}
       <button onClick={()=>set(page+1)} disabled={page===pages-1} style={{padding:"4px 11px",borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-card)",color:"var(--text-muted)",cursor:page===pages-1?"not-allowed":"pointer",opacity:page===pages-1?.4:1,fontSize:13}}>→</button>
     </div>
   );
@@ -294,10 +280,10 @@ export default function ChartsPage() {
   const { network, config } = useNetwork();
   const [range,  setRange]  = useState<TimeRange>("24h");
   const [ts,     setTs]     = useState<TsPoint[]>([]);
-  // ts48h: last 48 hours at 1h resolution → split in half for 24h delta
   const [ts48h,  setTs48h]  = useState<TsPoint[]>([]);
   const [live,   setLive]   = useState<LivePt[]>([]);
   const [bench,  setBench]  = useState<ServerBench[]>([]);
+  const [deployedAtMs, setDeployedAtMs] = useState<number>(0);
   const [pg,     setPg]     = useState(0);
   const [last,   setLast]   = useState("");
   const [benchLoading, setBenchLoading] = useState(true);
@@ -310,13 +296,10 @@ export default function ChartsPage() {
       const j = await r.json() as any;
       const d = j?.data ?? j ?? {};
       setLive(prev => [...prev, {
-        ts: Date.now(),
-        blockHeight:      num(d.blockHeight),
-        activeBlobs:      num(d.activeBlobs),
-        totalStorageGB:   num(d.totalStorageBytes) / 1e9,
-        totalBlobEvents:  num(d.totalBlobEvents),
-        pendingOrFailed:  num(d.pendingOrFailed),
-        deletedBlobs:     num(d.deletedBlobs),
+        ts: Date.now(), blockHeight: num(d.blockHeight),
+        activeBlobs: num(d.activeBlobs), totalStorageGB: num(d.totalStorageBytes) / 1e9,
+        totalBlobEvents: num(d.totalBlobEvents), pendingOrFailed: num(d.pendingOrFailed),
+        deletedBlobs: num(d.deletedBlobs),
       }].slice(-120));
       setLast(new Date().toLocaleTimeString());
     } catch {}
@@ -328,37 +311,21 @@ export default function ChartsPage() {
       const j = await fetch(`/api/network/stats/timeseries?network=${net}&resolution=${res_}&range=${r}`).then(x=>x.json()) as any;
       const series = (j?.data?.series ?? []) as any[];
       setTs(series.map(s=>({
-        tsMs:           num(s.tsMs),
-        activeBlobs:    num(s.activeBlobs),
-        totalStorageGB: num(s.totalStorageGB),
-        totalBlobEvents:num(s.totalBlobEvents),
-        pendingOrFailed:num(s.pendingOrFailed),
-        deletedBlobs:   num(s.deletedBlobs),
-        blockHeight:    num(s.blockHeight),
+        tsMs: num(s.tsMs), activeBlobs: num(s.activeBlobs), totalStorageGB: num(s.totalStorageGB),
+        totalBlobEvents: num(s.totalBlobEvents), pendingOrFailed: num(s.pendingOrFailed),
+        deletedBlobs: num(s.deletedBlobs), blockHeight: num(s.blockHeight),
       })));
     } catch {}
   };
 
-  // FIXED: Fetch 48h of hourly data to compute correct 24h delta
-  // Split the 48h array in half:
-  //   prev24 = first half  (48h ago → 24h ago)
-  //   curr24 = second half (24h ago → now)
-  // delta = last(curr24) - last(prev24)  [current end vs previous end]
   const fetchTs48h = async (net: string) => {
     try {
-      // Use 7d range at 1h resolution → gives us up to 168 points
-      // We only need the last 48 (=48h of data)
       const j = await fetch(`/api/network/stats/timeseries?network=${net}&resolution=1h&range=7d`).then(x=>x.json()) as any;
       const series = ((j?.data?.series ?? []) as any[]).map(s=>({
-        tsMs:           num(s.tsMs),
-        activeBlobs:    num(s.activeBlobs),
-        totalStorageGB: num(s.totalStorageGB),
-        totalBlobEvents:num(s.totalBlobEvents),
-        pendingOrFailed:num(s.pendingOrFailed),
-        deletedBlobs:   num(s.deletedBlobs),
-        blockHeight:    num(s.blockHeight),
+        tsMs: num(s.tsMs), activeBlobs: num(s.activeBlobs), totalStorageGB: num(s.totalStorageGB),
+        totalBlobEvents: num(s.totalBlobEvents), pendingOrFailed: num(s.pendingOrFailed),
+        deletedBlobs: num(s.deletedBlobs), blockHeight: num(s.blockHeight),
       }));
-      // Take last 48 entries (48 hours)
       setTs48h(series.slice(-48));
     } catch {}
   };
@@ -366,12 +333,9 @@ export default function ChartsPage() {
   const fetchBench = async () => {
     setBenchLoading(true);
     try {
-      const j = await fetch("/api/benchmark/results?limit=200").then(x=>x.json()) as any;
-      if (Array.isArray(j?.results)) {
-        setBench(j.results);
-      } else {
-        setBench([]);
-      }
+      const j = await fetch("/api/benchmark/results?limit=500").then(x=>x.json()) as any;
+      if (Array.isArray(j?.results)) setBench(j.results);
+      if (j?.deployedAtMs) setDeployedAtMs(num(j.deployedAtMs));
     } catch {
       setBench([]);
     } finally {
@@ -381,16 +345,9 @@ export default function ChartsPage() {
 
   useEffect(()=>{
     setLive([]);
-    fetchLive(network);
-    fetchTs(network, range);
-    fetchTs48h(network);
-    fetchBench();
+    fetchLive(network); fetchTs(network, range); fetchTs48h(network); fetchBench();
     if (timerRef.current) clearInterval(timerRef.current);
-    timerRef.current = setInterval(()=>{
-      fetchLive(network);
-      fetchTs48h(network);
-      fetchBench();
-    }, POLL);
+    timerRef.current = setInterval(()=>{ fetchLive(network); fetchTs48h(network); fetchBench(); }, POLL);
     return ()=>{ if(timerRef.current) clearInterval(timerRef.current); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [network]);
@@ -399,38 +356,46 @@ export default function ChartsPage() {
 
   if (network === "testnet") return <TestnetBanner />;
 
-  // Chart data
   const cd = ts.length > 0 ? ts : live.map(p=>({
     tsMs:p.ts, activeBlobs:p.activeBlobs, totalStorageGB:p.totalStorageGB,
     totalBlobEvents:p.totalBlobEvents, pendingOrFailed:p.pendingOrFailed,
     deletedBlobs:p.deletedBlobs, blockHeight:p.blockHeight,
   }));
-  const labels = cd.map(p=>tLbl(p.tsMs,range));
-  const latest = live[live.length-1];
+  const labels  = cd.map(p=>tLbl(p.tsMs,range));
+  const latest  = live[live.length-1];
   const latestTs = cd[cd.length-1];
 
-  // FIXED: Correct 24h delta computation
-  // ts48h is sorted oldest→newest, 48 entries max
-  // Split: prev24 = first 24 entries, curr24 = last 24 entries
+  // 24h delta
   const mid48 = Math.floor(ts48h.length / 2);
-  const prev24 = ts48h.slice(0, mid48);   // 48h ago → 24h ago
-  const curr24 = ts48h.slice(mid48);      // 24h ago → now
-
-  // Use the LAST point of each window for delta (end of window value)
-  const prevLast = prev24[prev24.length - 1];  // value ~24h ago
-  const currLast = curr24[curr24.length - 1];  // value ~now
-
-  // delta(metric) = curr_now - prev_24h_ago
-  // pct = delta / prev_24h_ago * 100
+  const prev24 = ts48h.slice(0, mid48);
+  const curr24 = ts48h.slice(mid48);
+  const prevLast = prev24[prev24.length - 1];
+  const currLast = curr24[curr24.length - 1];
   function d48(key: keyof TsPoint): { delta: number|null; from: number|null } {
     if (!prevLast || !currLast) return { delta: null, from: null };
-    const curr = num(currLast[key]);
-    const prev = num(prevLast[key]);
+    const curr = num(currLast[key]), prev = num(prevLast[key]);
     if (prev === 0 && curr === 0) return { delta: null, from: null };
     return { delta: curr - prev, from: prev };
   }
 
-  const pagedBench = bench.slice(pg*PG,(pg+1)*PG);
+  // ── Benchmark: filter runs since last deploy ────────────────────────────────
+  // deployedAtMs comes from server → only show runs AFTER that timestamp
+  const recentBench = deployedAtMs > 0
+    ? bench.filter(h => num(h.tsMs || (h.ts ? new Date(h.ts).getTime() : 0)) >= deployedAtMs)
+    : bench;
+  const pagedBench = recentBench.slice(pg * PG, (pg + 1) * PG);
+
+  // Benchmark chart data (reversed = chronological order)
+  const benchChronological = [...recentBench].reverse();
+  const benchLabels = benchChronological.map(h =>
+    h.ts ? new Date(h.ts).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}) : ""
+  );
+
+  // Stats from recent bench
+  const avgScore    = recentBench.length ? recentBench.reduce((s,h)=>s+num(h.score),0)/recentBench.length : 0;
+  const avgUpload   = recentBench.length ? recentBench.reduce((s,h)=>s+num(h.avgUploadKbs),0)/recentBench.length : 0;
+  const avgLatency  = recentBench.length ? recentBench.reduce((s,h)=>s+num(h.latencyAvg),0)/recentBench.length : 0;
+  const avgTxConfirm = recentBench.length ? recentBench.reduce((s,h)=>s+num(h.txConfirmMs),0)/recentBench.length : 0;
 
   return(
     <div style={{background:"var(--bg-primary)",minHeight:"100vh",padding:"28px 36px 48px"}}>
@@ -438,38 +403,20 @@ export default function ChartsPage() {
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12,marginBottom:28}}>
         <div>
           <h1 style={{fontSize:26,fontWeight:800,color:"var(--text-primary)",margin:0,letterSpacing:-0.5}}>Network Analytics</h1>
-          <p style={{fontSize:13,color:"var(--text-muted)",margin:"4px 0 0"}}>{str(config.label)} · Refresh every {POLL/1000}s · Last: {str(last)||"—"}</p>
+          <p style={{fontSize:13,color:"var(--text-muted)",margin:"4px 0 0"}}>{str(config.label)} · Refresh every {POLL/1000}s · {str(last)||"—"}</p>
         </div>
         <button onClick={()=>{fetchLive(network);fetchTs48h(network);fetchBench();}} style={{padding:"7px 14px",borderRadius:8,fontSize:12,fontWeight:600,background:"var(--bg-card)",border:"1px solid var(--border)",color:"var(--text-muted)",cursor:"pointer"}}>⟳ Refresh</button>
       </div>
 
-      {/* Network Snapshot — FIXED: current 24h vs previous 24h */}
-      <Sec
-        title="Network Snapshot"
-        sub="Current values · % change vs the previous 24-hour window (24h ago → 48h ago)"
-      >
+      {/* Network Snapshot */}
+      <Sec title="Network Snapshot" sub="Current values · % change vs the previous 24-hour window">
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:12}}>
-          <SnapCard
-            label="Block Height"
-            value={str(latest?`#${num(latest.blockHeight).toLocaleString("en-US")}`:undefined)}
-            color="var(--accent)"
-            delta={null} from={null}
-          />
-          {(()=>{const {delta,from}=d48("activeBlobs");return(
-            <SnapCard label="Active Blobs"  value={fmtN(latestTs?.activeBlobs)}    color="#22c55e" delta={delta} from={from}/>
-          );})()}
-          {(()=>{const {delta,from}=d48("totalStorageGB");return(
-            <SnapCard label="Storage Used"  value={fmtGB(latestTs?.totalStorageGB)} color="#a78bfa" delta={delta} from={from}/>
-          );})()}
-          {(()=>{const {delta,from}=d48("totalBlobEvents");return(
-            <SnapCard label="Blob Events"   value={fmtN(latestTs?.totalBlobEvents)} color="#fb923c" delta={delta} from={from}/>
-          );})()}
-          {(()=>{const {delta,from}=d48("pendingOrFailed");return(
-            <SnapCard label="Pending Blobs" value={fmtN(latestTs?.pendingOrFailed)} color="#fbbf24" delta={delta} from={from}/>
-          );})()}
-          {(()=>{const {delta,from}=d48("deletedBlobs");return(
-            <SnapCard label="Deleted Blobs" value={fmtN(latestTs?.deletedBlobs)}   color="#f87171" delta={delta} from={from}/>
-          );})()}
+          <SnapCard label="Block Height" value={str(latest?`#${num(latest.blockHeight).toLocaleString("en-US")}`:undefined)} color="var(--accent)" delta={null} from={null}/>
+          {(()=>{const {delta,from}=d48("activeBlobs");return(<SnapCard label="Active Blobs" value={fmtN(latestTs?.activeBlobs)} color="#22c55e" delta={delta} from={from}/>);})()}
+          {(()=>{const {delta,from}=d48("totalStorageGB");return(<SnapCard label="Storage Used" value={fmtGB(latestTs?.totalStorageGB)} color="#a78bfa" delta={delta} from={from}/>);})()}
+          {(()=>{const {delta,from}=d48("totalBlobEvents");return(<SnapCard label="Blob Events" value={fmtN(latestTs?.totalBlobEvents)} color="#fb923c" delta={delta} from={from}/>);})()}
+          {(()=>{const {delta,from}=d48("pendingOrFailed");return(<SnapCard label="Pending Blobs" value={fmtN(latestTs?.pendingOrFailed)} color="#fbbf24" delta={delta} from={from}/>);})()}
+          {(()=>{const {delta,from}=d48("deletedBlobs");return(<SnapCard label="Deleted Blobs" value={fmtN(latestTs?.deletedBlobs)} color="#f87171" delta={delta} from={from}/>);})()}
         </div>
       </Sec>
 
@@ -499,9 +446,9 @@ export default function ChartsPage() {
           </Card>
           <div style={{display:"flex",flexDirection:"column",gap:10}}>
             {[
-              {label:"Total Storage",  val:fmtGB(latestTs?.totalStorageGB),      c:"#a78bfa"},
-              {label:"Active Blobs",   val:fmtN(latestTs?.activeBlobs),          c:"#22c55e"},
-              {label:"Avg Blob Size",  val:(()=>{const a=num(latestTs?.activeBlobs),g=num(latestTs?.totalStorageGB);return a>0?`${((g*1e9)/a/1024).toFixed(0)} KB`:"—";})(), c:"var(--accent)"},
+              {label:"Total Storage", val:fmtGB(latestTs?.totalStorageGB), c:"#a78bfa"},
+              {label:"Active Blobs",  val:fmtN(latestTs?.activeBlobs),     c:"#22c55e"},
+              {label:"Avg Blob Size", val:(()=>{const a=num(latestTs?.activeBlobs),g=num(latestTs?.totalStorageGB);return a>0?`${((g*1e9)/a/1024).toFixed(0)} KB`:"—";})(), c:"var(--accent)"},
             ].map(({label,val,c})=>(
               <div key={label} style={{background:"var(--bg-card)",border:"1px solid var(--border)",borderRadius:10,padding:"12px 16px",flex:1}}>
                 <div style={{fontSize:11,color:"var(--text-muted)",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:4}}>{str(label)}</div>
@@ -519,39 +466,74 @@ export default function ChartsPage() {
         </Card>
       </Sec>
 
-      {/* Benchmark Analytics — all users from server */}
-      <Sec title="Benchmark Analytics" sub={str(`${bench.length} total runs across all users`)}>
+      {/* Benchmark Analytics */}
+      <Sec
+        title="Benchmark Analytics"
+        sub={`${recentBench.length} runs since last deploy${deployedAtMs > 0 ? ` (${new Date(deployedAtMs).toLocaleDateString()})` : ""} · ${bench.length} total`}
+      >
         {benchLoading ? (
           <div style={{background:"var(--bg-card)",border:"1px solid var(--border)",borderRadius:12,padding:"36px 20px",textAlign:"center"}}>
             <div style={{width:24,height:24,borderRadius:"50%",border:"2px solid var(--border)",borderTopColor:"var(--accent)",animation:"spin 1s linear infinite",margin:"0 auto 12px"}}/>
             <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
             <div style={{color:"var(--text-muted)",fontSize:13}}>Loading benchmark data…</div>
           </div>
-        ) : bench.length===0 ? (
+        ) : recentBench.length === 0 ? (
           <div style={{background:"var(--bg-card)",border:"1px solid var(--border)",borderRadius:12,padding:"36px 20px",textAlign:"center",color:"var(--text-muted)"}}>
             <div style={{fontSize:28,marginBottom:10}}>📊</div>
-            <div style={{fontSize:14}}>No benchmark data yet — run a benchmark to populate</div>
-            <div style={{fontSize:12,marginTop:6,color:"var(--text-dim)"}}>Data is shared across all users globally</div>
+            <div style={{fontSize:14}}>No benchmark runs since last deploy</div>
+            <div style={{fontSize:12,marginTop:6,color:"var(--text-dim)"}}>Run a benchmark on the Benchmark page to populate</div>
           </div>
-        ):(
+        ) : (
           <>
+            {/* Stat summary row */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:18}}>
+              {[
+                {label:"Avg Score",      value:str(Math.round(avgScore)),         color:"#818cf8"},
+                {label:"Avg Upload",     value:fmtKbs(avgUpload),                 color:"var(--accent)"},
+                {label:"Avg Latency",    value:fmtMs(avgLatency),                 color:"#c084fc"},
+                {label:"Avg TX Confirm", value:fmtMs(avgTxConfirm),               color:"#fb923c"},
+              ].map(({label,value,color})=>(
+                <div key={label} style={{background:"var(--bg-card)",border:"1px solid var(--border)",borderRadius:10,padding:"12px 16px",textAlign:"center"}}>
+                  <div style={{fontSize:11,color:"var(--text-muted)",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:4}}>{label}</div>
+                  <div style={{fontSize:20,fontWeight:800,color,fontFamily:"monospace"}}>{value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Charts 2×2 */}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:14}}>
-              <Card title="Score History (all users)" latest={str(bench[0]?.score)} color="#818cf8">
-                <Chart series={[{data:[...bench].reverse().map(h=>num(h.score)),color:"#818cf8",name:"Score",fmt:v=>str(`${Math.round(v)}/1000`)}]}
-                  labels={[...bench].reverse().map(h=>str(h.ts?new Date(h.ts).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):""))} height={130}/>
+              <Card title="Score History" sub="All users since last deploy" latest={str(recentBench[0]?.score)} color="#818cf8">
+                <Chart series={[{data:benchChronological.map(h=>num(h.score)),color:"#818cf8",name:"Score",fmt:v=>str(`${Math.round(v)}/1000`)}]}
+                  labels={benchLabels} height={130}/>
               </Card>
-              <Card title="Upload Speed (all users)">
-                <Chart series={[{data:[...bench].reverse().map(h=>num(h.avgUploadKbs)),color:"var(--accent)",name:"Upload",fmt:v=>fmtKbs(v)}]}
-                  labels={[...bench].reverse().map(h=>str(h.ts?new Date(h.ts).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):""))} height={130}/>
+              <Card title="Avg Upload Speed" latest={fmtKbs(avgUpload)} color="var(--accent)">
+                <Chart series={[{data:benchChronological.map(h=>num(h.avgUploadKbs)),color:"var(--accent)",name:"Upload",fmt:v=>fmtKbs(v)}]}
+                  labels={benchLabels} height={130}/>
+              </Card>
+              <Card title="Avg Latency" sub="Node ping latency" latest={fmtMs(avgLatency)} color="#c084fc">
+                <Chart series={[{data:benchChronological.map(h=>num(h.latencyAvg)),color:"#c084fc",name:"Latency",fmt:v=>fmtMs(v)}]}
+                  labels={benchLabels} height={130}/>
+              </Card>
+              <Card title="TX Confirm Time" sub="Aptos transaction confirmation" latest={fmtMs(avgTxConfirm)} color="#fb923c">
+                <Chart series={[{data:benchChronological.map(h=>num(h.txConfirmMs)),color:"#fb923c",name:"TX Confirm",fmt:v=>fmtMs(v)}]}
+                  labels={benchLabels} height={130}/>
               </Card>
             </div>
 
-            {/* Global table */}
+            {/* Global table — only runs since last deploy */}
             <div style={{background:"var(--bg-card)",border:"1px solid var(--border)",borderRadius:12,overflow:"hidden"}}>
-              <div style={{padding:"13px 18px",borderBottom:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{padding:"13px 18px",borderBottom:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
                 <div>
                   <div style={{fontSize:14,fontWeight:700,color:"var(--text-primary)"}}>Global Run History</div>
-                  <div style={{fontSize:12,color:"var(--text-muted)"}}>{bench.length} runs · Page {pg+1}/{Math.max(1,Math.ceil(bench.length/PG))}</div>
+                  <div style={{fontSize:12,color:"var(--text-muted)",display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                    <span>{recentBench.length} runs</span>
+                    {deployedAtMs > 0 && (
+                      <span style={{fontSize:10,fontWeight:600,padding:"1px 7px",borderRadius:4,background:"rgba(6,182,212,0.1)",color:"var(--accent)"}}>
+                        since deploy {new Date(deployedAtMs).toLocaleString([],{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"})}
+                      </span>
+                    )}
+                    <span>· Page {pg+1}/{Math.max(1,Math.ceil(recentBench.length/PG))}</span>
+                  </div>
                 </div>
                 <button onClick={fetchBench} style={{padding:"4px 11px",borderRadius:7,border:"1px solid var(--border)",background:"var(--bg-card)",color:"var(--text-muted)",cursor:"pointer",fontSize:12}}>⟳</button>
               </div>
@@ -559,7 +541,7 @@ export default function ChartsPage() {
                 <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
                   <thead>
                     <tr style={{background:"var(--bg-card2)"}}>
-                      {["User","Time","Score","Tier","Upload","Latency","TX Confirm","Mode"].map(h=>(
+                      {["Device","Time","Score","Tier","Upload","Download","Latency","TX Confirm","Mode"].map(h=>(
                         <th key={h} style={{padding:"9px 13px",textAlign:"left",fontSize:10,fontWeight:600,color:"var(--text-dim)",textTransform:"uppercase",letterSpacing:"0.06em",whiteSpace:"nowrap",borderBottom:"1px solid var(--border)"}}>{h}</th>
                       ))}
                     </tr>
@@ -570,11 +552,12 @@ export default function ChartsPage() {
                       const c=sc>=900?"#22c55e":sc>=600?"#fbbf24":"#f87171";
                       return(
                         <tr key={str(h.id)||i} style={{borderTop:"1px solid var(--border-soft)"}}>
-                          <td style={{padding:"8px 13px",fontFamily:"monospace",fontSize:12,color:"var(--text-dim)"}}>{str(h.ip)}</td>
+                          <td style={{padding:"8px 13px",fontFamily:"monospace",fontSize:11,color:"var(--text-dim)"}}>{str(h.deviceId||h.ip)}</td>
                           <td style={{padding:"8px 13px",fontSize:11,color:"var(--text-dim)",fontFamily:"monospace"}}>{str(h.ts?new Date(h.ts).toLocaleString([],{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}):"—")}</td>
                           <td style={{padding:"8px 13px"}}><span style={{fontFamily:"monospace",fontWeight:800,color:c,fontSize:14}}>{str(sc>0?sc:undefined)}</span></td>
                           <td style={{padding:"8px 13px"}}><span style={{fontSize:11,color:c,fontWeight:600}}>{str(h.tier)}</span></td>
                           <td style={{padding:"8px 13px",fontFamily:"monospace",color:"var(--accent)"}}>{fmtKbs(h.avgUploadKbs)}</td>
+                          <td style={{padding:"8px 13px",fontFamily:"monospace",color:"#22c55e"}}>{fmtKbs(h.avgDownloadKbs)}</td>
                           <td style={{padding:"8px 13px",fontFamily:"monospace",color:"#c084fc"}}>{fmtMs(h.latencyAvg)}</td>
                           <td style={{padding:"8px 13px",fontFamily:"monospace",color:"#fb923c"}}>{fmtMs(h.txConfirmMs)}</td>
                           <td style={{padding:"8px 13px"}}><span style={{fontSize:10,fontWeight:700,color:"#818cf8",textTransform:"uppercase"}}>{str(h.mode)}</span></td>
@@ -585,7 +568,7 @@ export default function ChartsPage() {
                 </table>
               </div>
               <div style={{padding:"8px 18px",borderTop:"1px solid var(--border-soft)"}}>
-                <Pager total={bench.length} page={pg} per={PG} set={setPg}/>
+                <Pager total={recentBench.length} page={pg} per={PG} set={setPg}/>
               </div>
             </div>
           </>

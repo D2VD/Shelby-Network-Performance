@@ -1,17 +1,21 @@
 "use client";
 /**
- * app/page.tsx — Benchmark Page v5.5
+ * app/page.tsx — Benchmark Page v5.6
  * FIXES:
- * 1. Custom upload → POST /api/benchmark/upload/custom (no rate limit)
- * 2. Save results  → POST /api/benchmark/results (not geo-sync)
- * 3. After run done → POST /api/benchmark/upload/end (start cooldown)
- * 4. Custom upload history tracked locally
- * 5. English only
+ * 1. Adaptive: download ALL uploaded blobs (not just last 3)
+ * 2. Quick mode: correct sizes 1KB/10KB/100KB using sizeBytes param
+ * 3. History: proper pagination, shows all local runs (not capped at 10)
+ * 4. History count matches display count
+ * 5. Device ID sent with requests for proper user identification
+ * 6. Results saved to server with device ID header
+ * 7. History tab shows local browser history (honest per-browser count)
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useNetwork } from "@/components/network-context";
 import { TestnetBanner } from "@/components/testnet-banner";
+import { getDeviceId, useDeviceId } from "@/lib/use-device-id";
+import { useBenchHistory } from "@/lib/use-bench-history";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -32,15 +36,15 @@ interface BenchResult {
   avgUploadKbs: number; avgDownloadKbs: number; score: number; tier: string;
   runAt: string; maxSuccessfulBytes?: number; mode: "adaptive" | "standard";
 }
-interface HistoryEntry extends BenchResult { id: number }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
+// ADAPTIVE: test progressively larger blobs
 const ADAPTIVE_SIZES = [1_024, 65_536, 524_288, 2_097_152, 5_242_880, 10_485_760];
+// STANDARD (Quick): 1KB / 10KB / 100KB
 const STANDARD_SIZES = [1_024, 10_240, 102_400];
 const MAX_CUSTOM_BYTES = 10 * 1024 * 1024;
-const LOCAL_KEY = "shelby_bench_history_v3";
-const MAX_HISTORY = 10;
+const HISTORY_PER_PAGE = 20;
 
 const STEPS = [
   { phase: "checking", label: "Wallet",   icon: "◎", pct: 5  },
@@ -81,11 +85,17 @@ function calcScore(r: { avgUploadKbs: number; avgDownloadKbs: number; latency: L
   return { score, tier };
 }
 
-const call = async <T,>(url: string, body?: object): Promise<T> => {
-  const r = await fetch(url, body
-    ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
-    : { method: "GET" }
-  );
+// Fetch helper — sends device ID header for proper identification
+const callWithDevice = async <T,>(url: string, body?: object): Promise<T> => {
+  const deviceId = getDeviceId();
+  const r = await fetch(url, {
+    method: body ? "POST" : "GET",
+    headers: {
+      ...(body ? { "Content-Type": "application/json" } : {}),
+      "x-device-id": deviceId,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
   if (!r.ok) {
     const err: any = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
     throw new Error(err.error || `HTTP ${r.status}`);
@@ -93,17 +103,22 @@ const call = async <T,>(url: string, body?: object): Promise<T> => {
   return r.json();
 };
 
-// Signal end of benchmark run to server (starts 10s cooldown)
 const signalRunEnd = async () => {
-  try { await fetch("/api/benchmark/upload/end", { method: "POST" }); } catch { /* silent */ }
+  try {
+    const deviceId = getDeviceId();
+    await fetch("/api/benchmark/upload/end", {
+      method: "POST",
+      headers: { "x-device-id": deviceId },
+    });
+  } catch { /* silent */ }
 };
 
-// Save benchmark result to server Redis
 const saveResultToServer = async (res: BenchResult) => {
   try {
+    const deviceId = getDeviceId();
     await fetch("/api/benchmark/results", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-device-id": deviceId },
       body: JSON.stringify(res),
     });
   } catch (e) {
@@ -229,17 +244,14 @@ function DiagnosePanel({ result, loading, onRecheck }: {
 }) {
   const [expanded, setExpanded] = useState(false);
   const allPassed = result?.ready && !loading;
-
   const icon:  Record<string, string> = { pass: "✓", fail: "✗", warn: "⚠" };
   const color: Record<string, string> = { pass: "#16a34a", fail: "#ef4444", warn: "#f59e0b" };
   const bg:    Record<string, string> = { pass: "#f0fdf4", fail: "#fef2f2", warn: "#fffbeb" };
   const bd:    Record<string, string> = { pass: "#e5e7eb", fail: "#fecaca", warn: "#fde68a" };
-
   useEffect(() => {
     if (result?.ready) setExpanded(false);
     if (!result?.ready && result !== null) setExpanded(true);
   }, [result?.ready]);
-
   return (
     <div className="card" style={{ marginBottom: 16 }}>
       <div className="card-header" style={{ gap: 10 }}>
@@ -271,26 +283,17 @@ function DiagnosePanel({ result, loading, onRecheck }: {
           </button>
         </div>
       </div>
-
       {loading && !result && (
         <div className="card-body" style={{ paddingTop: 0 }}>
           <div className="skeleton" style={{ height: 100, borderRadius: 6 }} />
         </div>
       )}
-
       {result?.checks && (expanded || !allPassed) && (
         <div className="card-body" style={{ padding: "4px 20px 16px" }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
             {result.checks.map((c, i) => (
-              <div key={i} style={{
-                display: "flex", alignItems: "flex-start", gap: 8,
-                padding: "7px 10px", borderRadius: 8,
-                background: bg[c.status] ?? "#f9fafb",
-                border: `1px solid ${bd[c.status] ?? "#e5e7eb"}`,
-              }}>
-                <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, fontWeight: 700, color: color[c.status], flexShrink: 0, paddingTop: 2 }}>
-                  {icon[c.status]}
-                </span>
+              <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "7px 10px", borderRadius: 8, background: bg[c.status] ?? "#f9fafb", border: `1px solid ${bd[c.status] ?? "#e5e7eb"}` }}>
+                <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, fontWeight: 700, color: color[c.status], flexShrink: 0, paddingTop: 2 }}>{icon[c.status]}</span>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 6, flexWrap: "wrap" }}>
                     <span style={{ fontSize: 13, fontWeight: 500, color: "var(--gray-800)" }}>{c.name}</span>
@@ -307,12 +310,11 @@ function DiagnosePanel({ result, loading, onRecheck }: {
   );
 }
 
-// Custom upload — uses /upload/custom (no rate limit)
 function CustomUploadCard({ running, network }: { running: boolean; network: string }) {
-  const [file,       setFile]       = useState<File | null>(null);
-  const [uploading,  setUploading]  = useState(false);
+  const [file, setFile]             = useState<File | null>(null);
+  const [uploading, setUploading]   = useState(false);
   const [lastResult, setLastResult] = useState<UpResult | null>(null);
-  const [err,        setErr]        = useState<string | null>(null);
+  const [err, setErr]               = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -328,8 +330,7 @@ function CustomUploadCard({ running, network }: { running: boolean; network: str
     setUploading(true); setErr(null);
     try {
       const buf = await file.arrayBuffer();
-      // Use /upload/custom — no rate limiting
-      const r = await call<UpResult>("/api/benchmark/upload/custom", {
+      const r = await callWithDevice<UpResult>("/api/benchmark/upload/custom", {
         customData: Array.from(new Uint8Array(buf)),
         blobName:   `custom/${file.name.replace(/[^a-zA-Z0-9._-]/g, "_")}/${Date.now()}`,
       });
@@ -343,7 +344,7 @@ function CustomUploadCard({ running, network }: { running: boolean; network: str
       <div className="card-header">
         <div>
           <div className="card-title">Custom upload</div>
-          <div className="card-subtitle">Upload your own file — max {fmtBytes(MAX_CUSTOM_BYTES)} · not rate limited</div>
+          <div className="card-subtitle">Upload your own file · max {fmtBytes(MAX_CUSTOM_BYTES)} · not rate limited</div>
         </div>
       </div>
       <div className="card-body" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -394,38 +395,41 @@ function CustomUploadCard({ running, network }: { running: boolean; network: str
   );
 }
 
-function HistoryTable({ history }: { history: HistoryEntry[] }) {
+// History table with full pagination
+function HistoryTable({ displayHistory, totalCount }: {
+  displayHistory: any[];
+  totalCount: number;
+}) {
   const [page, setPage] = useState(0);
-  const PER_PAGE = 10;
-  const pages = Math.ceil(history.length / PER_PAGE);
-  const reversed = [...history].reverse();
-  const paged = reversed.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
- 
-  if (!history.length) return (
+  const pages = Math.ceil(displayHistory.length / HISTORY_PER_PAGE);
+  const paged = displayHistory.slice(page * HISTORY_PER_PAGE, (page + 1) * HISTORY_PER_PAGE);
+
+  if (totalCount === 0) return (
     <div className="card" style={{ padding: "40px 24px", textAlign: "center" }}>
       <div style={{ fontSize: 28, marginBottom: 10 }}>📊</div>
-      <div style={{ fontSize: 14, color: "var(--gray-400)" }}>No data yet — run a benchmark to start collecting</div>
+      <div style={{ fontSize: 14, color: "var(--gray-400)" }}>No benchmark history in this browser yet</div>
+      <div style={{ fontSize: 12, color: "var(--gray-300)", marginTop: 6 }}>History is stored per browser. Other browsers on the same device will start fresh.</div>
     </div>
   );
- 
+
   return (
     <div className="card">
       <div className="card-header">
         <div>
           <div className="card-title">Benchmark history</div>
           <div className="card-subtitle">
-            {history.length} runs · stored in browser
+            {totalCount} runs · stored in this browser
             {pages > 1 && ` · Page ${page + 1}/${pages}`}
           </div>
         </div>
       </div>
       <div className="card-body" style={{ padding: 0, overflowX: "auto" }}>
-        <table className="data-table" style={{ width: "100%", minWidth: 560 }}>
+        <table className="data-table" style={{ width: "100%", minWidth: 600 }}>
           <thead>
             <tr><th>#</th><th>Mode</th><th>Score</th><th>Tier</th><th>Upload</th><th>Download</th><th>Latency</th><th>TX</th><th>Max blob</th><th>At</th></tr>
           </thead>
           <tbody>
-            {paged.map(h => {
+            {paged.map((h: any) => {
               const c = TIER_COLOR[h.tier] ?? "#6b7280";
               return (
                 <tr key={h.id}>
@@ -435,8 +439,8 @@ function HistoryTable({ history }: { history: HistoryEntry[] }) {
                   <td><span style={{ fontSize: 11, color: c, fontWeight: 600 }}>{h.tier}</span></td>
                   <td><span className="mono" style={{ fontSize: 12 }}>{fmtKbs(h.avgUploadKbs)}</span></td>
                   <td><span className="mono" style={{ fontSize: 12 }}>{fmtKbs(h.avgDownloadKbs)}</span></td>
-                  <td><span className="mono" style={{ fontSize: 12 }}>{fmtMs(h.latency.avg)}</span></td>
-                  <td><span className="mono" style={{ fontSize: 12 }}>{fmtMs(h.tx.confirmTime)}</span></td>
+                  <td><span className="mono" style={{ fontSize: 12 }}>{fmtMs(h.latency?.avg ?? 0)}</span></td>
+                  <td><span className="mono" style={{ fontSize: 12 }}>{fmtMs(h.tx?.confirmTime ?? 0)}</span></td>
                   <td><span className="mono" style={{ fontSize: 11, color: "var(--gray-500)" }}>{h.maxSuccessfulBytes ? fmtBytes(h.maxSuccessfulBytes) : "—"}</span></td>
                   <td><span style={{ fontSize: 10, color: "var(--gray-400)", fontFamily: "var(--font-mono)" }}>{h.runAt}</span></td>
                 </tr>
@@ -445,17 +449,17 @@ function HistoryTable({ history }: { history: HistoryEntry[] }) {
           </tbody>
         </table>
       </div>
- 
       {pages > 1 && (
         <div style={{ padding: "12px 20px", borderTop: "1px solid var(--gray-100)", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
           <button onClick={() => setPage(p => Math.max(0, p - 1))} disabled={page === 0}
-            style={{ padding: "5px 12px", borderRadius: 7, border: "1px solid var(--gray-200)", background: "#fff", color: "var(--gray-500)", cursor: page === 0 ? "not-allowed" : "pointer", opacity: page === 0 ? .4 : 1, fontSize: 13, fontFamily: "var(--font-mono)" }}>←</button>
-          {Array.from({ length: pages }, (_, i) => i).map(i => (
+            style={{ padding: "5px 12px", borderRadius: 7, border: "1px solid var(--gray-200)", background: "#fff", color: "var(--gray-500)", cursor: page === 0 ? "not-allowed" : "pointer", opacity: page === 0 ? .4 : 1, fontSize: 13 }}>←</button>
+          {Array.from({ length: Math.min(pages, 10) }, (_, i) => i).map(i => (
             <button key={i} onClick={() => setPage(i)}
-              style={{ padding: "5px 10px", borderRadius: 7, border: "1px solid var(--gray-200)", background: i === page ? "var(--net-color, #2563eb)" : "#fff", color: i === page ? "#fff" : "var(--gray-500)", cursor: "pointer", fontWeight: i === page ? 700 : 400, fontSize: 13, minWidth: 34, fontFamily: "var(--font-mono)" }}>{i + 1}</button>
+              style={{ padding: "5px 10px", borderRadius: 7, border: "1px solid var(--gray-200)", background: i === page ? "var(--net-color, #2563eb)" : "#fff", color: i === page ? "#fff" : "var(--gray-500)", cursor: "pointer", fontWeight: i === page ? 700 : 400, fontSize: 13, minWidth: 34 }}>{i + 1}</button>
           ))}
+          {pages > 10 && <span style={{ fontSize: 12, color: "var(--gray-400)" }}>…{pages}</span>}
           <button onClick={() => setPage(p => Math.min(pages - 1, p + 1))} disabled={page === pages - 1}
-            style={{ padding: "5px 12px", borderRadius: 7, border: "1px solid var(--gray-200)", background: "#fff", color: "var(--gray-500)", cursor: page === pages - 1 ? "not-allowed" : "pointer", opacity: page === pages - 1 ? .4 : 1, fontSize: 13, fontFamily: "var(--font-mono)" }}>→</button>
+            style={{ padding: "5px 12px", borderRadius: 7, border: "1px solid var(--gray-200)", background: "#fff", color: "var(--gray-500)", cursor: page === pages - 1 ? "not-allowed" : "pointer", opacity: page === pages - 1 ? .4 : 1, fontSize: 13 }}>→</button>
         </div>
       )}
     </div>
@@ -466,6 +470,8 @@ function HistoryTable({ history }: { history: HistoryEntry[] }) {
 
 export default function BenchmarkPage() {
   const { config, network } = useNetwork();
+  const deviceId = useDeviceId();
+  const { history, saveRun, displayHistory } = useBenchHistory();
 
   const [phase,      setPhase]     = useState<Phase>("idle");
   const [log,        setLog]       = useState<string[]>([]);
@@ -473,7 +479,6 @@ export default function BenchmarkPage() {
   const [balance,    setBalance]   = useState<Balance | null>(null);
   const [diagnose,   setDiagnose]  = useState<DiagnoseResult | null>(null);
   const [diagLoad,   setDiagLoad]  = useState(true);
-  const [history,    setHistory]   = useState<HistoryEntry[]>([]);
   const [showCustom, setShowCustom] = useState(false);
   const [activeTab,  setActiveTab]  = useState<"run" | "history">("run");
   const [benchMode,  setBenchMode]  = useState<"adaptive" | "standard">("adaptive");
@@ -481,31 +486,13 @@ export default function BenchmarkPage() {
   const logRef   = useRef<HTMLDivElement>(null);
   const runIdRef = useRef(0);
 
-  const addLog = useCallback((t: string) => setLog(p => [...p.slice(-80), t]), []);
+  const addLog = useCallback((t: string) => setLog(p => [...p.slice(-100), t]), []);
   useEffect(() => { logRef.current?.scrollTo(0, logRef.current.scrollHeight); }, [log]);
-
-  useEffect(() => {
-    try { const s = localStorage.getItem(LOCAL_KEY); if (s) setHistory(JSON.parse(s)); } catch { /**/ }
-  }, []);
-
-  const saveHistory = useCallback(async (res: BenchResult) => {
-    // 1. localStorage
-    setHistory(prev => {
-      const id   = (prev[prev.length - 1]?.id ?? 0) + 1;
-      const next = [...prev, { ...res, id }].slice(-MAX_HISTORY);
-      try { localStorage.setItem(LOCAL_KEY, JSON.stringify(next)); } catch { /**/ }
-      return next;
-    });
-    // 2. Server Redis (global analytics)
-    await saveResultToServer(res);
-    // 3. Signal run end → start 10s cooldown
-    await signalRunEnd();
-  }, []);
 
   const runDiagnose = useCallback(async () => {
     setDiagLoad(true);
     try {
-      const d = await call<DiagnoseResult>("/api/benchmark/diagnose");
+      const d = await callWithDevice<DiagnoseResult>("/api/benchmark/diagnose");
       setDiagnose(d);
     } catch (e: any) {
       setDiagnose({ ready: false, passCount: 0, failCount: 1, warnCount: 0, checks: [{ name: "Backend API", status: "fail", hint: e.message }], summary: "Cannot connect" });
@@ -513,7 +500,7 @@ export default function BenchmarkPage() {
   }, []);
 
   const refreshBalance = useCallback(() => {
-    call<Balance>("/api/benchmark/balance").then(setBalance).catch(() => {});
+    callWithDevice<Balance>("/api/benchmark/balance").then(setBalance).catch(() => {});
   }, []);
 
   useEffect(() => { runDiagnose(); refreshBalance(); }, [runDiagnose, refreshBalance]);
@@ -525,7 +512,7 @@ export default function BenchmarkPage() {
 
     try {
       addLog("— [1/5] Wallet balance…");
-      const bal = await call<Balance>("/api/benchmark/balance");
+      const bal = await callWithDevice<Balance>("/api/benchmark/balance");
       setBalance(bal);
       if (myRun !== runIdRef.current) return;
       if (!bal.ready) throw new Error("Insufficient balance — click Faucet");
@@ -533,7 +520,7 @@ export default function BenchmarkPage() {
 
       setPhase("latency");
       addLog("— [2/5] Latency (5 ping)…");
-      const latency = await call<LatResult>("/api/benchmark/latency");
+      const latency = await callWithDevice<LatResult>("/api/benchmark/latency");
       if (myRun !== runIdRef.current) return;
       addLog(`✓ avg ${fmtMs(latency.avg)} · min ${fmtMs(latency.min)} · max ${fmtMs(latency.max)}`);
 
@@ -542,13 +529,13 @@ export default function BenchmarkPage() {
       let maxSuccessfulBytes = 0;
 
       if (benchMode === "adaptive") {
-        addLog(`— [3/5] Adaptive stress test (${ADAPTIVE_SIZES.length} sizes: 1KB→10MB)…`);
+        addLog(`— [3/5] Adaptive stress test (${ADAPTIVE_SIZES.length} sizes: 1KB → 10MB)…`);
         for (let i = 0; i < ADAPTIVE_SIZES.length; i++) {
           if (myRun !== runIdRef.current) return;
           const bytes = ADAPTIVE_SIZES[i];
           addLog(`  ↑ [${i+1}/${ADAPTIVE_SIZES.length}] ${fmtBytes(bytes)}…`);
           try {
-            const u = await call<UpResult>("/api/benchmark/upload", { adaptiveBytes: bytes });
+            const u = await callWithDevice<UpResult>("/api/benchmark/upload", { adaptiveBytes: bytes });
             if (myRun !== runIdRef.current) return;
             uploads.push(u);
             maxSuccessfulBytes = bytes;
@@ -559,26 +546,31 @@ export default function BenchmarkPage() {
           }
         }
         if (uploads.length === 0) throw new Error("All uploads failed");
-        addLog(`✓ Max successful: ${fmtBytes(maxSuccessfulBytes)}`);
+        addLog(`✓ Uploaded ${uploads.length} files · Max: ${fmtBytes(maxSuccessfulBytes)}`);
       } else {
-        addLog("— [3/5] Standard upload (1KB / 10KB / 100KB)…");
-        for (let i = 0; i < 3; i++) {
+        // Quick mode: 1KB / 10KB / 100KB using explicit sizeBytes
+        addLog("— [3/5] Quick upload (1KB / 10KB / 100KB)…");
+        for (let i = 0; i < STANDARD_SIZES.length; i++) {
           if (myRun !== runIdRef.current) return;
-          const u = await call<UpResult>("/api/benchmark/upload", { sizeIndex: i });
+          const sz = STANDARD_SIZES[i];
+          addLog(`  ↑ [${i+1}/3] ${fmtBytes(sz)}…`);
+          const u = await callWithDevice<UpResult>("/api/benchmark/upload", { sizeBytes: sz });
           if (myRun !== runIdRef.current) return;
           uploads.push(u);
-          maxSuccessfulBytes = STANDARD_SIZES[i];
-          addLog(`  ✓ ${fmtBytes(STANDARD_SIZES[i])}: ${fmtKbs(u.speedKbs)} · ${fmtMs(u.elapsed)}`);
+          maxSuccessfulBytes = sz;
+          addLog(`  ✓ ${fmtBytes(sz)}: ${fmtKbs(u.speedKbs)} · ${fmtMs(u.elapsed)}`);
         }
       }
 
       setPhase("download");
-      addLog("— [4/5] Download…");
+      // FIXED: Download ALL uploaded blobs (not just last 3)
+      const blobsToDownload = uploads.filter(u => u.blobName);
+      addLog(`— [4/5] Download (${blobsToDownload.length} blobs)…`);
       const downloads: DlResult[] = [];
-      for (const up of uploads.slice(-3).filter(u => u.blobName)) {
+      for (const up of blobsToDownload) {
         if (myRun !== runIdRef.current) return;
         try {
-          const d = await call<DlResult>("/api/benchmark/download", { blobName: up.blobName });
+          const d = await callWithDevice<DlResult>("/api/benchmark/download", { blobName: up.blobName });
           if (myRun !== runIdRef.current) return;
           downloads.push(d);
           addLog(`  ✓ ${fmtBytes(d.bytes)}: ${fmtKbs(d.speedKbs)} · ${fmtMs(d.elapsed)}`);
@@ -587,7 +579,7 @@ export default function BenchmarkPage() {
 
       setPhase("txtime");
       addLog("— [5/5] Aptos TX timing…");
-      const tx = await call<TxResult>("/api/benchmark/txtime");
+      const tx = await callWithDevice<TxResult>("/api/benchmark/txtime");
       if (myRun !== runIdRef.current) return;
       addLog(`✓ Submit: ${fmtMs(tx.submitTime)} · Confirm: ${fmtMs(tx.confirmTime)}${tx.txHash ? ` · tx ${tx.txHash.slice(0,10)}…` : ""}`);
 
@@ -602,22 +594,27 @@ export default function BenchmarkPage() {
       };
       setResult(res);
       setPhase("done");
-      await saveHistory(res);
+
+      // Save to local history
+      saveRun(res);
+      // Save to server
+      await saveResultToServer(res);
+      await signalRunEnd();
+
       addLog(`— Done · Score: ${score}/1000 (${tier}) · Max blob: ${fmtBytes(maxSuccessfulBytes)}`);
 
     } catch (e: any) {
       if (myRun !== runIdRef.current) return;
       setPhase("error");
       addLog(`✗ ${e.message}`);
-      // Signal run end even on error so cooldown starts
       await signalRunEnd();
     }
-  }, [diagnose, runDiagnose, addLog, saveHistory, benchMode]);
+  }, [diagnose, runDiagnose, addLog, saveRun, benchMode]);
 
   const requestFaucet = useCallback(async () => {
     addLog("— Requesting faucet…");
     try {
-      await call("/api/benchmark/faucet", {});
+      await callWithDevice("/api/benchmark/faucet", {});
       addLog("✓ Requested — balance updates in ~5s");
       setTimeout(refreshBalance, 5000);
     } catch (e: any) { addLog(`✗ ${e.message}`); }
@@ -625,6 +622,8 @@ export default function BenchmarkPage() {
 
   const running = !["idle", "done", "error"].includes(phase);
   if (network === "testnet") return <TestnetBanner />;
+
+  const totalHistoryCount = history.length;
 
   return (
     <div>
@@ -645,18 +644,27 @@ export default function BenchmarkPage() {
             Upload · download · latency · TX speed on <strong>{config.label}</strong>
           </p>
         </div>
-        <div style={{ display: "flex", background: "#f4f4f4", borderRadius: 10, padding: 3, gap: 2 }}>
-          {(["run", "history"] as const).map(tab => (
-            <button key={tab} onClick={() => setActiveTab(tab)} style={{
-              padding: "6px 14px", borderRadius: 8, fontSize: 13,
-              fontWeight: activeTab === tab ? 600 : 400, color: activeTab === tab ? "#0a0a0a" : "#999",
-              background: activeTab === tab ? "#fff" : "transparent",
-              boxShadow: activeTab === tab ? "0 1px 4px rgba(0,0,0,0.08)" : "none",
-              border: "none", cursor: "pointer",
-            }}>
-              {tab === "run" ? "▶ Run" : `📊 History${history.length ? ` (${history.length})` : ""}`}
-            </button>
-          ))}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          {/* Device ID badge */}
+          {deviceId && (
+            <div style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--text-dim)", background: "var(--bg-card2)", border: "1px solid var(--border)", borderRadius: 6, padding: "3px 8px" }}>
+              Device: {`dev_${deviceId.replace(/-/g,"").slice(0,8)}`}
+            </div>
+          )}
+          <div style={{ display: "flex", background: "#f4f4f4", borderRadius: 10, padding: 3, gap: 2 }}>
+            {(["run", "history"] as const).map(tab => (
+              <button key={tab} onClick={() => setActiveTab(tab)} style={{
+                padding: "6px 14px", borderRadius: 8, fontSize: 13,
+                fontWeight: activeTab === tab ? 600 : 400,
+                color: activeTab === tab ? "#0a0a0a" : "#999",
+                background: activeTab === tab ? "#fff" : "transparent",
+                boxShadow: activeTab === tab ? "0 1px 4px rgba(0,0,0,0.08)" : "none",
+                border: "none", cursor: "pointer",
+              }}>
+                {tab === "run" ? "▶ Run" : `📊 History${totalHistoryCount > 0 ? ` (${totalHistoryCount})` : ""}`}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -687,7 +695,6 @@ export default function BenchmarkPage() {
 
       {activeTab === "run" && (
         <>
-          {/* Mode + Run button */}
           <div className="card" style={{ marginBottom: 16, padding: "18px 20px" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
               <span style={{ fontSize: 12, color: "var(--gray-500)", fontWeight: 500 }}>Mode:</span>
@@ -702,7 +709,7 @@ export default function BenchmarkPage() {
                 </button>
               ))}
               <span style={{ fontSize: 11, color: "var(--gray-400)" }}>
-                {benchMode === "adaptive" ? "1KB→64KB→512KB→2MB→5MB→10MB" : "1KB / 10KB / 100KB"}
+                {benchMode === "adaptive" ? "1KB → 64KB → 512KB → 2MB → 5MB → 10MB" : "1KB / 10KB / 100KB"}
               </span>
             </div>
 
@@ -718,7 +725,6 @@ export default function BenchmarkPage() {
             {(running || phase === "done" || phase === "error") && <ProgressBar phase={phase} running={running} />}
           </div>
 
-          {/* Custom upload */}
           <div style={{ marginBottom: 12 }}>
             <button onClick={() => setShowCustom(v => !v)} className="btn btn-secondary" style={{ fontSize: 12 }}>
               {showCustom ? "▲ Hide" : "▼"} Custom upload (max {fmtBytes(MAX_CUSTOM_BYTES)})
@@ -726,7 +732,6 @@ export default function BenchmarkPage() {
           </div>
           {showCustom && <CustomUploadCard running={running} network={network} />}
 
-          {/* Log */}
           {log.length > 0 && (
             <div className="card" style={{ marginBottom: 16 }}>
               <div className="card-header">
@@ -739,7 +744,6 @@ export default function BenchmarkPage() {
             </div>
           )}
 
-          {/* Results */}
           {result && phase === "done" && (
             <div className="card" style={{ marginBottom: 16 }}>
               <div className="card-header">
@@ -762,9 +766,9 @@ export default function BenchmarkPage() {
                     <SpeedBar value={result.avgDownloadKbs} max={5000} label="Avg download" color="#16a34a" />
                     <div style={{ display: "flex", gap: 18, marginTop: 14, flexWrap: "wrap" }}>
                       {[
-                        { label: "Avg latency",  value: fmtMs(result.latency.avg)    },
-                        { label: "TX submit",    value: fmtMs(result.tx.submitTime)  },
-                        { label: "TX confirm",   value: fmtMs(result.tx.confirmTime) },
+                        { label: "Avg latency", value: fmtMs(result.latency.avg)    },
+                        { label: "TX submit",   value: fmtMs(result.tx.submitTime)  },
+                        { label: "TX confirm",  value: fmtMs(result.tx.confirmTime) },
                       ].map(({ label, value }) => (
                         <div key={label}>
                           <div style={{ fontSize: 10, color: "var(--gray-400)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>{label}</div>
@@ -772,23 +776,16 @@ export default function BenchmarkPage() {
                         </div>
                       ))}
                     </div>
-                    {result.tx.txHash && (
-                      <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center" }}>
-                        <span style={{ fontSize: 10, color: "var(--gray-400)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Timing TX</span>
-                        <TxHashCell hash={result.tx.txHash} network={network} />
-                      </div>
-                    )}
                   </div>
                 </div>
 
-                {/* Score breakdown */}
                 <div style={{ padding: "12px 14px", borderRadius: 8, background: "#f9fafb", border: "1px solid #f0f0f0", marginBottom: 18 }}>
                   <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--gray-400)", marginBottom: 8 }}>Score breakdown</div>
                   <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
                     {[
-                      { label: "Upload 40%",   pts: Math.min(400, result.avgUploadKbs   * 1.0),                                    max: 400, color: "#2563eb" },
-                      { label: "Download 25%", pts: Math.min(250, result.avgDownloadKbs * 0.05),                                   max: 250, color: "#16a34a" },
-                      { label: "Latency 20%",  pts: Math.round(200 * Math.max(0, 1 - result.latency.avg    / 5000)), max: 200, color: "#9333ea" },
+                      { label: "Upload 40%",   pts: Math.min(400, result.avgUploadKbs * 1.0),                                     max: 400, color: "#2563eb" },
+                      { label: "Download 25%", pts: Math.min(250, result.avgDownloadKbs * 0.05),                                  max: 250, color: "#16a34a" },
+                      { label: "Latency 20%",  pts: Math.round(200 * Math.max(0, 1 - result.latency.avg / 5000)),    max: 200, color: "#9333ea" },
                       { label: "TX 15%",       pts: Math.round(150 * Math.max(0, 1 - result.tx.confirmTime / 8000)), max: 150, color: "#f59e0b" },
                     ].map(({ label, pts, max, color }) => (
                       <div key={label} style={{ flex: 1, minWidth: 100 }}>
@@ -804,7 +801,6 @@ export default function BenchmarkPage() {
                   </div>
                 </div>
 
-                {/* Upload table */}
                 <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--gray-400)", marginBottom: 8 }}>Upload details</div>
                 <div style={{ overflowX: "auto" }}>
                   <table className="data-table" style={{ width: "100%", minWidth: 400 }}>
@@ -848,7 +844,9 @@ export default function BenchmarkPage() {
         </>
       )}
 
-      {activeTab === "history" && <HistoryTable history={history} />}
+      {activeTab === "history" && (
+        <HistoryTable displayHistory={displayHistory} totalCount={totalHistoryCount} />
+      )}
     </div>
   );
 }

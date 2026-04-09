@@ -1,12 +1,12 @@
 "use client";
 /**
- * app/page.tsx — Benchmark Page v5.4
- *
- * Changes vs v5.3:
- *  - Pre-flight: auto-collapse khi passed, chỉ hiện lỗi + expand button
- *  - Benchmark results lưu cả localStorage (offline) VÀ backend Redis (analytics)
- *  - Adaptive stress test: adaptiveBytes parameter lên backend
- *  - Mobile responsive
+ * app/page.tsx — Benchmark Page v5.5
+ * FIXES:
+ * 1. Custom upload → POST /api/benchmark/upload/custom (no rate limit)
+ * 2. Save results  → POST /api/benchmark/results (not geo-sync)
+ * 3. After run done → POST /api/benchmark/upload/end (start cooldown)
+ * 4. Custom upload history tracked locally
+ * 5. English only
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -66,7 +66,6 @@ const fmtBytes = (b: number) => {
   if (b >= 1024)      return `${(b / 1024).toFixed(1)} KB`;
   return `${b} B`;
 };
-const nb = (v: any, fb = 0) => { const x = Number(v ?? fb); return isNaN(x) ? fb : x; };
 
 function calcScore(r: { avgUploadKbs: number; avgDownloadKbs: number; latency: LatResult; tx: TxResult }) {
   const up  = Math.min(400, r.avgUploadKbs   * 1.0);
@@ -92,6 +91,24 @@ const call = async <T,>(url: string, body?: object): Promise<T> => {
     throw new Error(err.error || `HTTP ${r.status}`);
   }
   return r.json();
+};
+
+// Signal end of benchmark run to server (starts 10s cooldown)
+const signalRunEnd = async () => {
+  try { await fetch("/api/benchmark/upload/end", { method: "POST" }); } catch { /* silent */ }
+};
+
+// Save benchmark result to server Redis
+const saveResultToServer = async (res: BenchResult) => {
+  try {
+    await fetch("/api/benchmark/results", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(res),
+    });
+  } catch (e) {
+    console.warn("[bench] Failed to save result to server:", e);
+  }
 };
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
@@ -207,11 +224,6 @@ function TxHashCell({ hash, network }: { hash: string | null; network: string })
   );
 }
 
-/**
- * Pre-flight checks — v5.4
- * Khi tất cả passed: chỉ hiện 1 dòng summary compact + nút expand.
- * Khi có lỗi: hiện đầy đủ danh sách checks.
- */
 function DiagnosePanel({ result, loading, onRecheck }: {
   result: DiagnoseResult | null; loading: boolean; onRecheck: () => void;
 }) {
@@ -223,7 +235,6 @@ function DiagnosePanel({ result, loading, onRecheck }: {
   const bg:    Record<string, string> = { pass: "#f0fdf4", fail: "#fef2f2", warn: "#fffbeb" };
   const bd:    Record<string, string> = { pass: "#e5e7eb", fail: "#fecaca", warn: "#fde68a" };
 
-  // Auto-collapse khi passed lần đầu
   useEffect(() => {
     if (result?.ready) setExpanded(false);
     if (!result?.ready && result !== null) setExpanded(true);
@@ -233,12 +244,8 @@ function DiagnosePanel({ result, loading, onRecheck }: {
     <div className="card" style={{ marginBottom: 16 }}>
       <div className="card-header" style={{ gap: 10 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 0, flexWrap: "wrap" }}>
-          {/* Status icon */}
           {!loading && result && (
-            <span style={{
-              fontSize: 14, fontWeight: 700,
-              color: result.ready ? "#16a34a" : "#ef4444",
-            }}>
+            <span style={{ fontSize: 14, fontWeight: 700, color: result.ready ? "#16a34a" : "#ef4444" }}>
               {result.ready ? "✓" : "✗"}
             </span>
           )}
@@ -254,7 +261,6 @@ function DiagnosePanel({ result, loading, onRecheck }: {
           </div>
         </div>
         <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
-          {/* Show/hide toggle — luôn có */}
           {result && !loading && (
             <button onClick={() => setExpanded(v => !v)} className="btn btn-secondary" style={{ fontSize: 11 }}>
               {expanded ? "▲ Hide" : "▼ Details"}
@@ -266,14 +272,12 @@ function DiagnosePanel({ result, loading, onRecheck }: {
         </div>
       </div>
 
-      {/* Loading skeleton */}
       {loading && !result && (
         <div className="card-body" style={{ paddingTop: 0 }}>
           <div className="skeleton" style={{ height: 100, borderRadius: 6 }} />
         </div>
       )}
 
-      {/* Check list — chỉ hiện khi expanded HOẶC có lỗi */}
       {result?.checks && (expanded || !allPassed) && (
         <div className="card-body" style={{ padding: "4px 20px 16px" }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
@@ -303,6 +307,7 @@ function DiagnosePanel({ result, loading, onRecheck }: {
   );
 }
 
+// Custom upload — uses /upload/custom (no rate limit)
 function CustomUploadCard({ running, network }: { running: boolean; network: string }) {
   const [file,       setFile]       = useState<File | null>(null);
   const [uploading,  setUploading]  = useState(false);
@@ -313,8 +318,8 @@ function CustomUploadCard({ running, network }: { running: boolean; network: str
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0] ?? null;
     if (!f) return;
-    if (f.size > MAX_CUSTOM_BYTES) { setErr(`Quá ${fmtBytes(MAX_CUSTOM_BYTES)} — 1 Shelby chunkset`); return; }
-    if (f.size === 0) { setErr("File trống"); return; }
+    if (f.size > MAX_CUSTOM_BYTES) { setErr(`File exceeds ${fmtBytes(MAX_CUSTOM_BYTES)} limit`); return; }
+    if (f.size === 0) { setErr("File is empty"); return; }
     setErr(null); setFile(f); setLastResult(null);
   };
 
@@ -323,7 +328,8 @@ function CustomUploadCard({ running, network }: { running: boolean; network: str
     setUploading(true); setErr(null);
     try {
       const buf = await file.arrayBuffer();
-      const r = await call<UpResult>("/api/benchmark/upload", {
+      // Use /upload/custom — no rate limiting
+      const r = await call<UpResult>("/api/benchmark/upload/custom", {
         customData: Array.from(new Uint8Array(buf)),
         blobName:   `custom/${file.name.replace(/[^a-zA-Z0-9._-]/g, "_")}/${Date.now()}`,
       });
@@ -337,7 +343,7 @@ function CustomUploadCard({ running, network }: { running: boolean; network: str
       <div className="card-header">
         <div>
           <div className="card-title">Custom upload</div>
-          <div className="card-subtitle">File thực của bạn — tối đa {fmtBytes(MAX_CUSTOM_BYTES)} (1 Shelby chunkset)</div>
+          <div className="card-subtitle">Upload your own file — max {fmtBytes(MAX_CUSTOM_BYTES)} · not rate limited</div>
         </div>
       </div>
       <div className="card-body" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -354,7 +360,7 @@ function CustomUploadCard({ running, network }: { running: boolean; network: str
               {file
                 ? <><div style={{ fontSize: 13, fontWeight: 600, color: "var(--gray-800)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{file.name}</div>
                     <div style={{ fontSize: 11, color: "var(--gray-400)", fontFamily: "var(--font-mono)" }}>{fmtBytes(file.size)}</div></>
-                : <div style={{ fontSize: 13, color: "var(--gray-400)" }}>Click để chọn file</div>}
+                : <div style={{ fontSize: 13, color: "var(--gray-400)" }}>Click to select a file</div>}
             </div>
             <input ref={inputRef} type="file" onChange={handleFile} style={{ display: "none" }} />
           </div>
@@ -398,7 +404,7 @@ function HistoryTable({ history }: { history: HistoryEntry[] }) {
   if (!history.length) return (
     <div className="card" style={{ padding: "40px 24px", textAlign: "center" }}>
       <div style={{ fontSize: 28, marginBottom: 10 }}>📊</div>
-      <div style={{ fontSize: 14, color: "var(--gray-400)" }}>Chưa có data — chạy benchmark để thu thập</div>
+      <div style={{ fontSize: 14, color: "var(--gray-400)" }}>No data yet — run a benchmark to start collecting</div>
     </div>
   );
  
@@ -408,7 +414,7 @@ function HistoryTable({ history }: { history: HistoryEntry[] }) {
         <div>
           <div className="card-title">Benchmark history</div>
           <div className="card-subtitle">
-            {history.length} runs · lưu trong browser + backend Redis
+            {history.length} runs · stored in browser
             {pages > 1 && ` · Page ${page + 1}/${pages}`}
           </div>
         </div>
@@ -440,26 +446,16 @@ function HistoryTable({ history }: { history: HistoryEntry[] }) {
         </table>
       </div>
  
-      {/* Pagination */}
       {pages > 1 && (
         <div style={{ padding: "12px 20px", borderTop: "1px solid var(--gray-100)", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-          <button
-            onClick={() => setPage(p => Math.max(0, p - 1))}
-            disabled={page === 0}
-            style={{ padding: "5px 12px", borderRadius: 7, border: "1px solid var(--gray-200)", background: "#fff", color: "var(--gray-500)", cursor: page === 0 ? "not-allowed" : "pointer", opacity: page === 0 ? .4 : 1, fontSize: 13, fontFamily: "var(--font-mono)" }}
-          >←</button>
+          <button onClick={() => setPage(p => Math.max(0, p - 1))} disabled={page === 0}
+            style={{ padding: "5px 12px", borderRadius: 7, border: "1px solid var(--gray-200)", background: "#fff", color: "var(--gray-500)", cursor: page === 0 ? "not-allowed" : "pointer", opacity: page === 0 ? .4 : 1, fontSize: 13, fontFamily: "var(--font-mono)" }}>←</button>
           {Array.from({ length: pages }, (_, i) => i).map(i => (
-            <button
-              key={i}
-              onClick={() => setPage(i)}
-              style={{ padding: "5px 10px", borderRadius: 7, border: "1px solid var(--gray-200)", background: i === page ? "var(--net-color, #2563eb)" : "#fff", color: i === page ? "#fff" : "var(--gray-500)", cursor: "pointer", fontWeight: i === page ? 700 : 400, fontSize: 13, minWidth: 34, fontFamily: "var(--font-mono)" }}
-            >{i + 1}</button>
+            <button key={i} onClick={() => setPage(i)}
+              style={{ padding: "5px 10px", borderRadius: 7, border: "1px solid var(--gray-200)", background: i === page ? "var(--net-color, #2563eb)" : "#fff", color: i === page ? "#fff" : "var(--gray-500)", cursor: "pointer", fontWeight: i === page ? 700 : 400, fontSize: 13, minWidth: 34, fontFamily: "var(--font-mono)" }}>{i + 1}</button>
           ))}
-          <button
-            onClick={() => setPage(p => Math.min(pages - 1, p + 1))}
-            disabled={page === pages - 1}
-            style={{ padding: "5px 12px", borderRadius: 7, border: "1px solid var(--gray-200)", background: "#fff", color: "var(--gray-500)", cursor: page === pages - 1 ? "not-allowed" : "pointer", opacity: page === pages - 1 ? .4 : 1, fontSize: 13, fontFamily: "var(--font-mono)" }}
-          >→</button>
+          <button onClick={() => setPage(p => Math.min(pages - 1, p + 1))} disabled={page === pages - 1}
+            style={{ padding: "5px 12px", borderRadius: 7, border: "1px solid var(--gray-200)", background: "#fff", color: "var(--gray-500)", cursor: page === pages - 1 ? "not-allowed" : "pointer", opacity: page === pages - 1 ? .4 : 1, fontSize: 13, fontFamily: "var(--font-mono)" }}>→</button>
         </div>
       )}
     </div>
@@ -493,23 +489,17 @@ export default function BenchmarkPage() {
   }, []);
 
   const saveHistory = useCallback(async (res: BenchResult) => {
-    // 1. localStorage (offline cache)
+    // 1. localStorage
     setHistory(prev => {
       const id   = (prev[prev.length - 1]?.id ?? 0) + 1;
       const next = [...prev, { ...res, id }].slice(-MAX_HISTORY);
       try { localStorage.setItem(LOCAL_KEY, JSON.stringify(next)); } catch { /**/ }
       return next;
     });
-    // 2. Backend Redis (analytics persistence)
-    try {
-      await fetch("/api/geo-sync/benchmark-results", {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify(res),
-      });
-    } catch (e) {
-      console.warn("[bench] Failed to save to backend:", e);
-    }
+    // 2. Server Redis (global analytics)
+    await saveResultToServer(res);
+    // 3. Signal run end → start 10s cooldown
+    await signalRunEnd();
   }, []);
 
   const runDiagnose = useCallback(async () => {
@@ -538,7 +528,7 @@ export default function BenchmarkPage() {
       const bal = await call<Balance>("/api/benchmark/balance");
       setBalance(bal);
       if (myRun !== runIdRef.current) return;
-      if (!bal.ready) throw new Error("Số dư không đủ — nhấn Faucet");
+      if (!bal.ready) throw new Error("Insufficient balance — click Faucet");
       addLog(`✓ ${bal.apt.toFixed(4)} APT · ${bal.shelbyusd.toFixed(6)} ShelbyUSD`);
 
       setPhase("latency");
@@ -554,6 +544,7 @@ export default function BenchmarkPage() {
       if (benchMode === "adaptive") {
         addLog(`— [3/5] Adaptive stress test (${ADAPTIVE_SIZES.length} sizes: 1KB→10MB)…`);
         for (let i = 0; i < ADAPTIVE_SIZES.length; i++) {
+          if (myRun !== runIdRef.current) return;
           const bytes = ADAPTIVE_SIZES[i];
           addLog(`  ↑ [${i+1}/${ADAPTIVE_SIZES.length}] ${fmtBytes(bytes)}…`);
           try {
@@ -567,11 +558,12 @@ export default function BenchmarkPage() {
             break;
           }
         }
-        if (uploads.length === 0) throw new Error("Tất cả upload thất bại");
+        if (uploads.length === 0) throw new Error("All uploads failed");
         addLog(`✓ Max successful: ${fmtBytes(maxSuccessfulBytes)}`);
       } else {
         addLog("— [3/5] Standard upload (1KB / 10KB / 100KB)…");
         for (let i = 0; i < 3; i++) {
+          if (myRun !== runIdRef.current) return;
           const u = await call<UpResult>("/api/benchmark/upload", { sizeIndex: i });
           if (myRun !== runIdRef.current) return;
           uploads.push(u);
@@ -584,6 +576,7 @@ export default function BenchmarkPage() {
       addLog("— [4/5] Download…");
       const downloads: DlResult[] = [];
       for (const up of uploads.slice(-3).filter(u => u.blobName)) {
+        if (myRun !== runIdRef.current) return;
         try {
           const d = await call<DlResult>("/api/benchmark/download", { blobName: up.blobName });
           if (myRun !== runIdRef.current) return;
@@ -616,6 +609,8 @@ export default function BenchmarkPage() {
       if (myRun !== runIdRef.current) return;
       setPhase("error");
       addLog(`✗ ${e.message}`);
+      // Signal run end even on error so cooldown starts
+      await signalRunEnd();
     }
   }, [diagnose, runDiagnose, addLog, saveHistory, benchMode]);
 
@@ -623,7 +618,7 @@ export default function BenchmarkPage() {
     addLog("— Requesting faucet…");
     try {
       await call("/api/benchmark/faucet", {});
-      addLog("✓ Requested — cập nhật sau ~5s");
+      addLog("✓ Requested — balance updates in ~5s");
       setTimeout(refreshBalance, 5000);
     } catch (e: any) { addLog(`✗ ${e.message}`); }
   }, [refreshBalance, addLog]);
@@ -639,13 +634,16 @@ export default function BenchmarkPage() {
           70%  { box-shadow: 0 0 0 7px transparent; }
           100% { box-shadow: 0 0 0 0 transparent; }
         }
+        .bench-log { padding: 12px 20px; }
       `}</style>
 
       {/* Header */}
-      <div className="page-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10, marginBottom: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10, marginBottom: 16 }}>
         <div>
-          <h1 className="page-title">Benchmark tool</h1>
-          <p className="page-subtitle" style={{ fontSize: 13 }}>Upload · download · latency · TX speed trên <strong>{config.label}</strong></p>
+          <h1 style={{ fontSize: 28, fontWeight: 800, margin: 0, letterSpacing: -0.5 }}>Benchmark tool</h1>
+          <p style={{ fontSize: 13, margin: "4px 0 0", color: "var(--text-muted)" }}>
+            Upload · download · latency · TX speed on <strong>{config.label}</strong>
+          </p>
         </div>
         <div style={{ display: "flex", background: "#f4f4f4", borderRadius: 10, padding: 3, gap: 2 }}>
           {(["run", "history"] as const).map(tab => (
@@ -723,7 +721,7 @@ export default function BenchmarkPage() {
           {/* Custom upload */}
           <div style={{ marginBottom: 12 }}>
             <button onClick={() => setShowCustom(v => !v)} className="btn btn-secondary" style={{ fontSize: 12 }}>
-              {showCustom ? "▲ Ẩn" : "▼"} Custom upload (max {fmtBytes(MAX_CUSTOM_BYTES)})
+              {showCustom ? "▲ Hide" : "▼"} Custom upload (max {fmtBytes(MAX_CUSTOM_BYTES)})
             </button>
           </div>
           {showCustom && <CustomUploadCard running={running} network={network} />}
@@ -788,8 +786,8 @@ export default function BenchmarkPage() {
                   <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--gray-400)", marginBottom: 8 }}>Score breakdown</div>
                   <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
                     {[
-                      { label: "Upload 40%",   pts: Math.min(400, result.avgUploadKbs   * 1.0),                                     max: 400, color: "#2563eb" },
-                      { label: "Download 25%", pts: Math.min(250, result.avgDownloadKbs * 0.05),                                    max: 250, color: "#16a34a" },
+                      { label: "Upload 40%",   pts: Math.min(400, result.avgUploadKbs   * 1.0),                                    max: 400, color: "#2563eb" },
+                      { label: "Download 25%", pts: Math.min(250, result.avgDownloadKbs * 0.05),                                   max: 250, color: "#16a34a" },
                       { label: "Latency 20%",  pts: Math.round(200 * Math.max(0, 1 - result.latency.avg    / 5000)), max: 200, color: "#9333ea" },
                       { label: "TX 15%",       pts: Math.round(150 * Math.max(0, 1 - result.tx.confirmTime / 8000)), max: 150, color: "#f59e0b" },
                     ].map(({ label, pts, max, color }) => (

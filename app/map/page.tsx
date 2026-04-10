@@ -3,4 +3,4 @@
 // Re-exports the providers page component directly
 "use client";
 
-export { default } from "../dashboard/providers/page";
+export { default } from "../dashboard/providers/page"

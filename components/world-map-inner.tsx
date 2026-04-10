@@ -1,10 +1,8 @@
 "use client";
-// components/world-map-inner.tsx — v5.1
-// KEY FIX for pan: removed pointerEvents:"none" from ComposableMap
-// Pan: mousedown on background/geography → drag to pan
-// Marker clicks: stopPropagation on mousedown so they don't trigger pan
-// Touch: single finger pan, two finger pinch-zoom
-// NO ZoomableGroup → CF Pages safe
+// components/world-map-inner.tsx — v5.2
+// FIX: scroll wheel only zooms when cursor is actually hovering over the map
+// (tracks isMouseInside via onMouseEnter/Leave on container)
+// When mouse is outside → scroll passes through normally (page scrolls)
 
 import { useState, useCallback, useRef, useEffect } from "react";
 import {
@@ -139,16 +137,19 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
   const [scale,  setScale]  = useState(DEFAULT_SCALE);
   const [center, setCenter] = useState<[number,number]>(DEFAULT_CENTER);
 
-  // Pan state — use refs for performance (no re-render during drag)
+  // Pan state
   const isDragging    = useRef(false);
-  const didDrag       = useRef(false);          // track if actual movement happened
+  const didDrag       = useRef(false);
   const dragStart     = useRef({ x: 0, y: 0 });
   const centerOnDown  = useRef<[number,number]>(DEFAULT_CENTER);
   const containerRef  = useRef<HTMLDivElement>(null);
 
+  // FIX: track whether mouse is inside the map container
+  // Scroll wheel only zooms when mouse is inside — otherwise page scrolls normally
+  const isMouseInside = useRef(false);
+
   // Touch state
   const lastTouchDist = useRef<number | null>(null);
-  const touchStart1   = useRef<{ x: number; y: number } | null>(null);
 
   const [hoverZone,  setHoverZone]  = useState<string|null>(null);
   const [pinnedZone, setPinnedZone] = useState<string|null>(null);
@@ -171,20 +172,18 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
     leaveTimer.current = setTimeout(()=>{if(!pinnedZone)setHoverZone(null);},220);
   },[pinnedZone]);
 
-  // ── Zoom ───────────────────────────────────────────────────────────────────
+  // ── Zoom controls ──────────────────────────────────────────────────────────
   const zoomIn  = useCallback(()=>setScale(s=>Math.min(MAX_SCALE,Math.round(s*1.6))),[]);
   const zoomOut = useCallback(()=>setScale(s=>Math.max(MIN_SCALE,Math.round(s/1.6))),[]);
   const reset   = useCallback(()=>{setScale(DEFAULT_SCALE);setCenter(DEFAULT_CENTER);},[]);
 
-  // ── Mouse pan (attach to window during drag for reliability) ───────────────
+  // ── Mouse pan (window listeners for reliability) ───────────────────────────
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       if (!isDragging.current) return;
       const dx = e.clientX - dragStart.current.x;
       const dy = e.clientY - dragStart.current.y;
       if (Math.abs(dx) > 2 || Math.abs(dy) > 2) didDrag.current = true;
-      // Convert pixel delta to geo delta
-      // Empirically tuned: scale 185 ≈ world width ~540px at default map size
       const pxPerDeg = scale / 60;
       const newLng = centerOnDown.current[0] - dx / pxPerDeg;
       const newLat = Math.max(-80, Math.min(80, centerOnDown.current[1] + dy / pxPerDeg));
@@ -204,7 +203,6 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
   }, [scale]);
 
   const onContainerMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    // Don't start pan if clicking on UI overlay elements (panels, buttons)
     const target = e.target as HTMLElement;
     if (target.closest("[data-nopan]")) return;
     e.preventDefault();
@@ -215,23 +213,46 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
     if (containerRef.current) containerRef.current.style.cursor = "grabbing";
   }, [center]);
 
-  // Scroll wheel zoom
-  const onWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    const factor = e.deltaY < 0 ? 1.18 : 1/1.18;
-    setScale(s => Math.max(MIN_SCALE, Math.min(MAX_SCALE, Math.round(s * factor))));
-  }, []);
+  // ── Scroll wheel zoom — ONLY when mouse is inside map ─────────────────────
+  // FIX: Use native addEventListener with { passive: false } to be able to
+  // call preventDefault(). React synthetic onWheel can't prevent default in
+  // newer browsers (Chrome 73+ makes wheel events passive by default).
+  // We only preventDefault (prevent page scroll) when mouse is inside map.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      // Only intercept scroll when cursor is inside the map container
+      if (!isMouseInside.current) return;
+
+      // Prevent page from scrolling
+      e.preventDefault();
+      e.stopPropagation();
+
+      const factor = e.deltaY < 0 ? 1.18 : 1 / 1.18;
+      setScale(s => Math.max(MIN_SCALE, Math.min(MAX_SCALE, Math.round(s * factor))));
+    };
+
+    // Must be { passive: false } to allow e.preventDefault()
+    el.addEventListener("wheel", handleWheel, { passive: false });
+    return () => el.removeEventListener("wheel", handleWheel);
+  }, []); // no deps — scale update via setState is fine
 
   // ── Touch pan + pinch-zoom ─────────────────────────────────────────────────
-  const getTouchDist = (a: React.Touch, b: React.Touch) => Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY);
+  const getTouchDist = (a: React.Touch, b: React.Touch): number => {
+    return Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY);
+  };
 
   const onTouchStart = useCallback((e: React.TouchEvent<HTMLDivElement>) => {
+    // Early return: Nếu không có dữ liệu touches, không xử lý
+    if (!e.touches || e.touches.length === 0) return;
+
     if (e.touches.length === 1) {
       isDragging.current   = true;
       didDrag.current      = false;
       dragStart.current    = { x: e.touches[0].clientX, y: e.touches[0].clientY };
-      centerOnDown.current = [...center] as [number,number];
-      touchStart1.current  = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      centerOnDown.current = [...center] as [number, number];
       lastTouchDist.current = null;
     } else if (e.touches.length === 2) {
       isDragging.current    = false;
@@ -240,18 +261,29 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
   }, [center]);
 
   const onTouchMove = useCallback((e: React.TouchEvent<HTMLDivElement>) => {
-    e.preventDefault();
+    // Luôn chặn scroll mặc định của trình duyệt khi đang tương tác với bản đồ
+    if (e.cancelable) e.preventDefault();
+
+    // Edge case: Kiểm tra tính hợp lệ của touches trước khi truy cập
+    if (!e.touches || e.touches.length === 0) return;
+
     if (e.touches.length === 1 && isDragging.current) {
       const dx = e.touches[0].clientX - dragStart.current.x;
       const dy = e.touches[0].clientY - dragStart.current.y;
-      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) didDrag.current = true;
+      
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+        didDrag.current = true;
+      }
+
       const pxPerDeg = scale / 60;
       const newLng   = centerOnDown.current[0] - dx / pxPerDeg;
       const newLat   = Math.max(-80, Math.min(80, centerOnDown.current[1] + dy / pxPerDeg));
+      
       setCenter([newLng, newLat]);
     } else if (e.touches.length === 2 && lastTouchDist.current !== null) {
       const newDist = getTouchDist(e.touches[0], e.touches[1]);
       const ratio   = newDist / lastTouchDist.current;
+      
       setScale(s => Math.max(MIN_SCALE, Math.min(MAX_SCALE, Math.round(s * ratio))));
       lastTouchDist.current = newDist;
     }
@@ -274,7 +306,16 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
         touchAction: "none",
       }}
       onMouseDown={onContainerMouseDown}
-      onWheel={onWheel}
+      // FIX: track mouse inside/outside for conditional wheel zoom
+      onMouseEnter={() => { isMouseInside.current = true; }}
+      onMouseLeave={() => {
+        isMouseInside.current = false;
+        // Also stop dragging if mouse leaves
+        if (isDragging.current) {
+          isDragging.current = false;
+          if (containerRef.current) containerRef.current.style.cursor = "grab";
+        }
+      }}
       onTouchStart={onTouchStart}
       onTouchMove={onTouchMove}
       onTouchEnd={onTouchEnd}
@@ -288,7 +329,7 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
         .pulse { animation: pulse-breath 2.1s ease-in-out infinite; }
       `}</style>
 
-      {/* Zoom buttons — data-nopan prevents triggering pan */}
+      {/* Zoom buttons */}
       <div data-nopan="true" style={{position:"absolute",top:12,right:12,zIndex:30,display:"flex",flexDirection:"column",gap:4}}>
         {[{label:"+",fn:zoomIn,title:"Zoom in"},{label:"−",fn:zoomOut,title:"Zoom out"},{label:"⊙",fn:reset,title:"Reset view"}].map(({label,fn,title})=>(
           <button key={label} onClick={fn} title={title} style={{
@@ -302,9 +343,13 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
         <div style={{fontSize:9,color:isDark?"rgba(255,255,255,0.3)":"rgba(0,0,0,0.3)",textAlign:"center",fontFamily:"monospace",marginTop:2}}>
           {Math.round(scale/DEFAULT_SCALE*100)}%
         </div>
+        {/* Scroll hint — only show when mouse is inside */}
+        <div style={{fontSize:8,color:isDark?"rgba(255,255,255,0.2)":"rgba(0,0,0,0.2)",textAlign:"center",fontFamily:"monospace",marginTop:2,lineHeight:1.3}}>
+          scroll<br/>to zoom
+        </div>
       </div>
 
-      {/* Map — NO pointerEvents:none, let SVG receive events naturally */}
+      {/* Map */}
       <ComposableMap
         projection="geoNaturalEarth1"
         projectionConfig={{ scale, center }}
@@ -319,7 +364,6 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
           ))}
         </Geographies>
 
-        {/* Zone markers */}
         {ZONE_LIST.map((zd,zi)=>{
           const sps     = zd.sps;
           const healthy = sps.filter(p=>p.health==="Healthy").length;
@@ -335,13 +379,11 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
                 onMouseEnter={e=>{e.stopPropagation();handleEnter(zd.key);}}
                 onMouseLeave={e=>{e.stopPropagation();handleLeave();}}
                 onMouseDown={e=>{
-                  // Stop mousedown from bubbling to container → prevents pan start
                   e.stopPropagation();
                   isDragging.current = false;
                 }}
                 onClick={e=>{
                   e.stopPropagation();
-                  // Only register click if no drag occurred
                   if(!didDrag.current){
                     setPinnedZone(z=>z===zd.key?null:zd.key);
                     setHoverZone(zd.key);
@@ -350,7 +392,6 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
               >
                 <circle className="halo1" cx={0} cy={0} r={18} fill="none" stroke={glowC} strokeWidth={2.5} opacity={0}/>
                 <circle className="halo2" cx={0} cy={0} r={18} fill="none" stroke={glowC} strokeWidth={1.5} opacity={0}/>
-
                 <defs>
                   <filter id={`gf${zi}`} x="-100%" y="-100%" width="300%" height="300%">
                     <feGaussianBlur stdDeviation={isActive?"7":"3.5"} result="blur"/>
@@ -359,19 +400,13 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
                     <feMerge><feMergeNode in="glow"/><feMergeNode in="SourceGraphic"/></feMerge>
                   </filter>
                 </defs>
-
                 <circle className={allOk?"pulse":undefined} cx={0} cy={0} r={16}
                   fill={allOk?(isDark?"#1e3a5f":"#1e40af"):"#7f1d1d"}
                   stroke={glowC} strokeWidth={isActive?2.8:2}
-                  filter={`url(#gf${zi})`}
-                  fillOpacity={0.93}
+                  filter={`url(#gf${zi})`} fillOpacity={0.93}
                 />
-                <text textAnchor="middle" dy="0.35em" fontSize={12} fontWeight={800} fill="#fff" fontFamily="monospace" style={{pointerEvents:"none"}}>
-                  {sps.length}
-                </text>
-                <text textAnchor="middle" dy={26} fontSize={9} fill={isDark?"#94a3b8":"#374151"} fontFamily="monospace" style={{pointerEvents:"none"}}>
-                  {zd.short}
-                </text>
+                <text textAnchor="middle" dy="0.35em" fontSize={12} fontWeight={800} fill="#fff" fontFamily="monospace" style={{pointerEvents:"none"}}>{sps.length}</text>
+                <text textAnchor="middle" dy={26} fontSize={9} fill={isDark?"#94a3b8":"#374151"} fontFamily="monospace" style={{pointerEvents:"none"}}>{zd.short}</text>
                 {!allOk&&<circle cx={12} cy={-12} r={5} fill="#ef4444" stroke={isDark?"#0d1526":"#fff"} strokeWidth={1.5}/>}
               </g>
             </Marker>
@@ -388,7 +423,6 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
         🇻🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
       </div>
 
-      {/* Cluster popup */}
       {activeZone&&byZone.has(activeZone)&&(
         <div data-nopan="true">
           <ClusterPopup zone={activeZone} sps={byZone.get(activeZone)!}
@@ -399,7 +433,6 @@ export default function WorldMapInner({providers}:{providers:StorageProvider[]})
         </div>
       )}
 
-      {/* GeoShare — top left, data-nopan prevents drag start */}
       {providers.length>0&&(
         <div data-nopan="true" style={{position:"absolute",top:12,left:12,zIndex:25}}>
           <GeoShare byZone={byZone} isDark={isDark}/>

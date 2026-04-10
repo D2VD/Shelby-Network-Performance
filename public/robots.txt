@@ -1,0 +1,26 @@
+# robots.txt — Shelby Analytics Community Dashboard
+# https://shelbyanalytics.site/robots.txt
+
+User-agent: *
+Allow: /
+Allow: /dashboard
+Allow: /dashboard/providers
+Allow: /dashboard/charts
+
+# Block API routes from indexing
+Disallow: /api/
+Disallow: /api/benchmark/
+Disallow: /api/geo-sync/
+Disallow: /api/network/
+Disallow: /api/analytics/
+Disallow: /api/dashboard/
+
+# Block Next.js internal routes
+Disallow: /_next/
+Disallow: /_vercel/
+
+# Sitemap
+Sitemap: https://shelbyanalytics.site/sitemap.xml
+
+# Crawl delay (be nice to servers)
+Crawl-delay: 10

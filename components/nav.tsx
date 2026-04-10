@@ -1,10 +1,14 @@
 "use client";
-// components/nav.tsx — v8.0
-// + ThemeToggle button trong nav-right
-// Thứ tự: Map | Analytics | Charts | Benchmark
+// components/nav.tsx — v9.0
+// CHANGES:
+// 1. Logo: removed green square wrapper
+// 2. Logo: clicking logo text → navigate to /
+// 3. "Analytics" text: CSS gradient animation (blue→purple→cyan shimmer)
+// 4. "Community Dashboard" subtitle below brand name
+// 5. Tab order unchanged: Map | Analytics | Charts | Benchmark
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useNetwork, type NetworkId } from "./network-context";
 import { ThemeToggle } from "./theme-context";
 
@@ -16,7 +20,8 @@ const NAV_TABS = [
 ] as const;
 
 export function Nav() {
-  const pathname = usePathname();
+  const pathname    = usePathname();
+  const router      = useRouter();
   const { network, setNetwork } = useNetwork();
 
   const isActive = (href: string, exact: boolean) => {
@@ -26,15 +31,67 @@ export function Nav() {
 
   return (
     <nav className="nav">
-      {/* Logo */}
-      <div className="nav-logo">
-        <div className="nav-logo-icon">
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/logo.svg" alt="Shelby" width={20} height={20} style={{ display: "block" }} />
+      {/* ── Logo — click anywhere to go home ── */}
+      <style>{`
+        @keyframes gradient-shift {
+          0%   { background-position: 0% 50%; }
+          50%  { background-position: 100% 50%; }
+          100% { background-position: 0% 50%; }
+        }
+        .nav-logo-gradient {
+          background: linear-gradient(90deg, #2563eb, #7c3aed, #06b6d4, #2563eb);
+          background-size: 300% 100%;
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          background-clip: text;
+          animation: gradient-shift 4s ease infinite;
+          font-weight: 700;
+        }
+      `}</style>
+
+      <div
+        className="nav-logo"
+        style={{ cursor: "pointer" }}
+        onClick={() => router.push("/")}
+        role="link"
+        aria-label="Go to home"
+      >
+        {/* Logo image — no green square, just the SVG/img directly */}
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src="/logo.svg"
+          alt="Shelby"
+          width={26}
+          height={26}
+          style={{ display: "block", flexShrink: 0 }}
+          onError={e => { (e.target as HTMLImageElement).style.display = "none"; }}
+        />
+
+        {/* Brand text */}
+        <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.2 }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+            <span style={{
+              fontSize: 17,
+              fontWeight: 700,
+              color: "var(--text-primary)",
+              letterSpacing: -0.3,
+            }}>
+              Shelby
+            </span>
+            <span className="nav-logo-gradient" style={{ fontSize: 17 }}>
+              Analytics
+            </span>
+          </div>
+          <span style={{
+            fontSize: 10,
+            color: "var(--text-dim)",
+            fontWeight: 400,
+            letterSpacing: "0.02em",
+            marginTop: 1,
+          }}>
+            Community Dashboard
+          </span>
         </div>
-        <span className="nav-logo-text">
-          Shelby<span> Analytics</span>
-        </span>
       </div>
 
       {/* Tabs */}
@@ -73,7 +130,12 @@ export function Nav() {
         {/* Theme toggle */}
         <ThemeToggle />
 
-        <a href="https://docs.shelby.xyz" target="_blank" rel="noreferrer" className="nav-docs">
+        <a
+          href="https://docs.shelby.xyz"
+          target="_blank"
+          rel="noreferrer"
+          className="nav-docs"
+        >
           Docs ↗
         </a>
       </div>

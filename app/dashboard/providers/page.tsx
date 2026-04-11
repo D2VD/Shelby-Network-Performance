@@ -29,7 +29,7 @@ function Badge({ label, variant }: { label: string; variant: Variant }) {
   return (
     <span style={{ 
         display: "inline-flex", 
-        alignItems: "center", // Thêm dấu ngoặc kép ở đây
+        alignItems: "center", 
         gap: 5, 
         padding: "3px 10px", 
         borderRadius: 6, 

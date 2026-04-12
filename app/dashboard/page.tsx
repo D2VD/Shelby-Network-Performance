@@ -1,28 +1,43 @@
 "use client";
 /**
- * app/dashboard/page.tsx — v8.0
- * Fix React error #310 (objects not valid as React child)
- * + Full responsive mobile/tablet
- * + Theme-aware (dark/light CSS vars)
+ * app/dashboard/page.tsx — v9.0
+ * FIX: Testnet no longer shows "Coming Soon" banner.
+ *      Testnet fetches live data from /api/network/stats/live?network=testnet
+ *      and displays it using the same dashboard layout.
+ * KEEP: Benchmark page still shows TestnetBanner (upload logic not ready on testnet).
  */
 
 import { useEffect, useState, useCallback } from "react";
 import { useNetwork } from "@/components/network-context";
-import { useTheme } from "@/components/theme-context";
-import { TestnetBanner } from "@/components/testnet-banner";
+import { useTheme }   from "@/components/theme-context";
 
+// ─── Types ────────────────────────────────────────────────────────────────────
 interface LiveSnap {
   ts: string; tsMs: number; network?: string;
-  activeBlobs: number; pendingOrFailed: number; deletedBlobs: number; emptyRecords: number;
-  totalBlobEvents: number; totalStorageBytes: number; totalStorageGB: number; totalStorageGiB: number;
-  storageProviders: number; placementGroups: number; slices: number;
-  blockHeight: number; ledgerVersion: number; method: string;
+  // Shelbynet fields
+  activeBlobs?: number; pendingOrFailed?: number; pendingBlobs?: number;
+  deletedBlobs?: number; failedBlobs?: number; emptyRecords?: number;
+  totalBlobEvents?: number; totalStorageBytes?: number; totalStorageGB?: number; totalStorageGiB?: number;
+  storageProviders?: number; placementGroups?: number; slices?: number;
+  blockHeight?: number; ledgerVersion?: number; method?: string;
+  // Testnet-specific
+  chainId?: number; waitlistedProviders?: number; indexerStatus?: string;
+  activeBlobs_?: number; // aliased below
 }
-interface LivePoint { ts: number; activeBlobs: number | null; totalStorageBytes: number | null; totalBlobEvents: number | null; blockHeight: number; }
 
-const MAX_POINTS = 60, POLL_MS = 30_000;
+interface LivePoint {
+  ts: number; activeBlobs: number | null; totalStorageBytes: number | null;
+  totalBlobEvents: number | null; blockHeight: number;
+}
 
-function fmtFull(n: number | null | undefined): string { if (n == null) return "—"; return Math.round(n).toLocaleString("en-US"); }
+const MAX_POINTS = 60;
+const POLL_MS    = 30_000;
+
+// ─── Formatters ───────────────────────────────────────────────────────────────
+function fmtFull(n: number | null | undefined): string {
+  if (n == null) return "—";
+  return Math.round(n).toLocaleString("en-US");
+}
 function fmtBytes(b: number | null | undefined): string {
   if (b == null) return "—";
   if (b >= 1e12) return `${(b / 1e12).toFixed(2)} TB`;
@@ -32,10 +47,10 @@ function fmtBytes(b: number | null | undefined): string {
 }
 function timeLabel(ts: number): string {
   const d = new Date(ts);
-  return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+  return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
 }
 
-// Pure SVG sparkline — no recharts, no external deps
+// ─── Pure SVG Sparkline ───────────────────────────────────────────────────────
 function SparkLine({ data, color, height = 100 }: { data: number[]; color: string; height?: number }) {
   if (data.length < 2) return (
     <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-dim)", fontSize: 13 }}>
@@ -45,12 +60,12 @@ function SparkLine({ data, color, height = 100 }: { data: number[]; color: strin
   const W = 560, pad = { t: 8, b: 8, l: 45, r: 8 };
   const iW = W - pad.l - pad.r, iH = height - pad.t - pad.b;
   const min = Math.min(...data), max = Math.max(...data), range = max - min || 1;
-  const xs = data.map((_, i) => pad.l + (i / (data.length - 1)) * iW);
-  const ys = data.map(v => pad.t + iH - ((v - min) / range) * iH);
+  const xs  = data.map((_, i) => pad.l + (i / (data.length - 1)) * iW);
+  const ys  = data.map(v => pad.t + iH - ((v - min) / range) * iH);
   const line = xs.map((x, i) => `${x.toFixed(1)},${ys[i].toFixed(1)}`).join(" ");
   const area = `${pad.l},${pad.t + iH} ${line} ${(pad.l + iW).toFixed(1)},${pad.t + iH}`;
-  const gId = `spk${color.replace(/[^a-z0-9]/gi, "")}`;
-  const fmt = (v: number) => {
+  const gId  = `spk${color.replace(/[^a-z0-9]/gi, "")}`;
+  const fmt  = (v: number) => {
     if (v >= 1e9) return `${(v / 1e9).toFixed(1)}G`;
     if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
     if (v >= 1e3) return `${(v / 1e3).toFixed(0)}K`;
@@ -60,7 +75,7 @@ function SparkLine({ data, color, height = 100 }: { data: number[]; color: strin
     <svg viewBox={`0 0 ${W} ${height}`} style={{ width: "100%", height, display: "block" }}>
       <defs>
         <linearGradient id={gId} x1="0" x2="0" y1="0" y2="1">
-          <stop offset="0%" stopColor={color} stopOpacity={0.18} />
+          <stop offset="0%"   stopColor={color} stopOpacity={0.18} />
           <stop offset="100%" stopColor={color} stopOpacity={0.01} />
         </linearGradient>
       </defs>
@@ -77,6 +92,7 @@ function SparkLine({ data, color, height = 100 }: { data: number[]; color: strin
   );
 }
 
+// ─── Stat Card ────────────────────────────────────────────────────────────────
 function StatCard({ label, value, sub, icon, color, loading }: {
   label: string; value: string; sub?: string; icon: string; color: string; loading: boolean;
 }) {
@@ -93,7 +109,6 @@ function StatCard({ label, value, sub, icon, color, loading }: {
       <div style={{ fontSize: 28, fontWeight: 800, color: loading ? "var(--text-dim)" : "var(--text-primary)", letterSpacing: -0.8, lineHeight: 1.1, fontFamily: "monospace", fontVariantNumeric: "tabular-nums" }}>
         {loading ? "…" : value}
       </div>
-      {/* FIX: sub must be a string, never undefined/null rendered directly */}
       {sub != null && sub !== "" && (
         <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 5 }}>{sub}</div>
       )}
@@ -101,9 +116,28 @@ function StatCard({ label, value, sub, icon, color, loading }: {
   );
 }
 
+// ─── Testnet Notice Banner (lightweight, not "Coming Soon") ───────────────────
+function TestnetNoticeBanner() {
+  return (
+    <div style={{
+      background: "rgba(147,51,234,0.07)", border: "1px solid rgba(147,51,234,0.25)",
+      borderRadius: 10, padding: "10px 16px", marginBottom: 16,
+      fontSize: 13, color: "#c084fc",
+      display: "flex", alignItems: "center", gap: 8,
+    }}>
+      <span>⚗</span>
+      <span>Shelby Testnet · Live data from Aptos Testnet RPC</span>
+      <span style={{ marginLeft: "auto", fontSize: 11, opacity: 0.7 }}>Polling every {POLL_MS / 1000}s</span>
+    </div>
+  );
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
 export default function DashboardPage() {
   const { network } = useNetwork();
-  const { isDark } = useTheme();
+  const { isDark }  = useTheme();
+  const isTestnet   = network === "testnet";
+
   const [snap,    setSnap]    = useState<LiveSnap | null>(null);
   const [series,  setSeries]  = useState<LivePoint[]>([]);
   const [loading, setLoading] = useState(true);
@@ -114,42 +148,52 @@ export default function DashboardPage() {
     try {
       const res = await fetch(`/api/network/stats/live?network=${network}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const j = await res.json() as any;
-      const data: LiveSnap = j.data ?? j;
-      if (data && (data.activeBlobs != null || data.blockHeight)) {
+      const j = await res.json() as Record<string, unknown>;
+      const data = (j.data ?? j) as LiveSnap;
+      if (data && (data.activeBlobs != null || data.blockHeight != null)) {
         setSnap(data);
         setLastAt(new Date());
         setError(null);
         setSeries(prev => {
-          const pt: LivePoint = { ts: Date.now(), activeBlobs: data.activeBlobs, totalStorageBytes: data.totalStorageBytes, totalBlobEvents: data.totalBlobEvents, blockHeight: data.blockHeight };
+          const pt: LivePoint = {
+            ts:                Date.now(),
+            activeBlobs:       data.activeBlobs ?? null,
+            totalStorageBytes: data.totalStorageBytes ?? null,
+            totalBlobEvents:   data.totalBlobEvents   ?? null,
+            blockHeight:       data.blockHeight       ?? 0,
+          };
           const next = [...prev, pt];
           return next.length > MAX_POINTS ? next.slice(-MAX_POINTS) : next;
         });
       }
-    } catch (e: any) {
-      setError(String(e?.message ?? e));
+    } catch (e: unknown) {
+      setError(String((e as Error)?.message ?? e));
+      // Fallback: try cached stats endpoint
       try {
-        const r2 = await fetch(`/api/network/stats?network=${network}`);
-        const j2 = await r2.json() as any;
-        if (j2.data?.stats?.totalBlobs != null) {
-          const s = j2.data.stats;
-          setSnap(prev => ({
-            ...prev!,
-            activeBlobs: s.totalBlobs ?? 0, totalBlobEvents: s.totalBlobEvents ?? 0,
-            totalStorageBytes: s.totalStorageUsedBytes ?? 0,
-            totalStorageGB: s.totalStorageUsedBytes ? s.totalStorageUsedBytes / 1e9 : 0,
-            totalStorageGiB: s.totalStorageUsedBytes ? s.totalStorageUsedBytes / (1024 ** 3) : 0,
-            storageProviders: s.storageProviders ?? 0, placementGroups: s.placementGroups ?? 0, slices: s.slices ?? 0,
-            blockHeight: j2.data.node?.blockHeight ?? prev?.blockHeight ?? 0,
-            ledgerVersion: j2.data.node?.ledgerVersion ?? prev?.ledgerVersion ?? 0,
-            pendingOrFailed: 0, deletedBlobs: 0, emptyRecords: 0,
-            method: String(j2.data.statsSource ?? "cached"),
+        const r2  = await fetch(`/api/network/stats?network=${network}`);
+        const j2  = await r2.json() as Record<string, unknown>;
+        const d2  = (j2 as Record<string, unknown>).data as Record<string, unknown> | undefined;
+        const s   = (d2?.stats ?? {}) as Record<string, unknown>;
+        if (s.totalBlobs != null || s.activeBlobs != null) {
+          setSnap({
             ts: new Date().toISOString(), tsMs: Date.now(),
-          } as LiveSnap));
+            activeBlobs:       Number(s.totalBlobs ?? s.activeBlobs ?? 0),
+            totalBlobEvents:   Number(s.totalBlobEvents ?? 0),
+            totalStorageBytes: Number(s.totalStorageUsedBytes ?? 0),
+            totalStorageGB:    Number(s.totalStorageUsedBytes ?? 0) / 1e9,
+            totalStorageGiB:   Number(s.totalStorageUsedBytes ?? 0) / (1024 ** 3),
+            storageProviders:  Number(s.storageProviders ?? 0),
+            placementGroups:   Number(s.placementGroups  ?? 0),
+            slices:            Number(s.slices            ?? 0),
+            blockHeight:       Number((d2?.node as Record<string, unknown>)?.blockHeight ?? 0),
+            ledgerVersion:     Number((d2?.node as Record<string, unknown>)?.ledgerVersion ?? 0),
+            pendingOrFailed:   0, deletedBlobs: 0, emptyRecords: 0,
+            method: String(d2?.statsSource ?? "cached"),
+          });
           setLastAt(new Date());
           setError(null);
         }
-      } catch {}
+      } catch { /* silent */ }
     } finally {
       setLoading(false);
     }
@@ -162,16 +206,22 @@ export default function DashboardPage() {
     return () => clearInterval(id);
   }, [fetchStats]);
 
-  if (network === "testnet") return <TestnetBanner />;
-
-  // FIX: ensure all values are strings, never objects
-  const METRICS = [
-    { label: "Active Blobs",      value: fmtFull(snap?.activeBlobs),       sub: "Files stored on-chain",             icon: "◈", color: "#2563eb" },
-    { label: "Storage Used",      value: fmtBytes(snap?.totalStorageBytes), sub: snap ? `${snap.totalStorageGiB.toFixed(2)} GiB binary` : "",  icon: "▣", color: "#059669" },
-    { label: "Blob Events",       value: fmtFull(snap?.totalBlobEvents),    sub: "blob_activities count",             icon: "↯", color: "#9333ea" },
-    { label: "Storage Providers", value: fmtFull(snap?.storageProviders),   sub: "Active SPs on-chain",              icon: "◎", color: "#0891b2" },
-    { label: "Placement Groups",  value: fmtFull(snap?.placementGroups),    sub: "Erasure code groups",              icon: "▦", color: "#d97706" },
-    { label: "Slices",            value: fmtFull(snap?.slices),             sub: "Slice registry count",             icon: "⬡", color: "#7c3aed" },
+  // Build metric cards — works for both networks
+  const activeBlobs = snap?.activeBlobs ?? null;
+  const METRICS = isTestnet ? [
+    { label: "Active Blobs",      value: fmtFull(activeBlobs),            sub: "From Indexer (best-effort)", icon: "◈", color: "#2563eb" },
+    { label: "Block Height",      value: snap?.blockHeight ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—", sub: `Ledger v${fmtFull(snap?.ledgerVersion)}`, icon: "⬡", color: "#9333ea" },
+    { label: "Storage Providers", value: fmtFull(snap?.storageProviders), sub: "Active on Testnet",            icon: "◎", color: "#0891b2" },
+    { label: "Waitlisted SPs",    value: fmtFull(snap?.waitlistedProviders), sub: "In waitlist queue",         icon: "◎", color: "#f59e0b" },
+    { label: "Placement Groups",  value: fmtFull(snap?.placementGroups),  sub: "From Epoch registry",          icon: "▦", color: "#d97706" },
+    { label: "Slices",            value: fmtFull(snap?.slices),            sub: "From Epoch registry",          icon: "⬡", color: "#7c3aed" },
+  ] : [
+    { label: "Active Blobs",      value: fmtFull(activeBlobs),            sub: "Files stored on-chain",        icon: "◈", color: "#2563eb" },
+    { label: "Storage Used",      value: fmtBytes(snap?.totalStorageBytes), sub: snap?.totalStorageGiB ? `${snap.totalStorageGiB.toFixed(2)} GiB binary` : "", icon: "▣", color: "#059669" },
+    { label: "Blob Events",       value: fmtFull(snap?.totalBlobEvents),  sub: "blob_activities count",        icon: "↯", color: "#9333ea" },
+    { label: "Storage Providers", value: fmtFull(snap?.storageProviders), sub: "Active SPs on-chain",          icon: "◎", color: "#0891b2" },
+    { label: "Placement Groups",  value: fmtFull(snap?.placementGroups),  sub: "Erasure code groups",          icon: "▦", color: "#d97706" },
+    { label: "Slices",            value: fmtFull(snap?.slices),            sub: "Slice registry count",         icon: "⬡", color: "#7c3aed" },
   ];
 
   const methodLabel = snap?.method ? String(snap.method) : "loading";
@@ -190,18 +240,22 @@ export default function DashboardPage() {
       `}</style>
 
       {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20, flexWrap: "wrap", gap: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
         <div>
-          <h1 style={{ fontSize: 26, fontWeight: 800, color: "var(--text-primary)", margin: 0, letterSpacing: -0.8 }}>Network Dashboard</h1>
+          <h1 style={{ fontSize: 26, fontWeight: 800, color: "var(--text-primary)", margin: 0, letterSpacing: -0.8 }}>
+            {isTestnet ? "Testnet Dashboard" : "Network Dashboard"}
+          </h1>
           <p style={{ fontSize: 13, color: "var(--text-muted)", margin: "5px 0 0", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            Shelbynet · Live · Poll every {POLL_MS / 1000}s
-            <span style={{
-              fontSize: 11, fontWeight: 600, padding: "1px 7px", borderRadius: 4,
-              background: methodLabel.includes("shelby") ? "rgba(34,197,94,0.12)" : "rgba(245,158,11,0.12)",
-              color: methodLabel.includes("shelby") ? "#16a34a" : "#d97706",
-            }}>
-              {methodLabel}
-            </span>
+            {isTestnet ? "Aptos Testnet" : "Shelbynet"} · Poll every {POLL_MS / 1000}s
+            {!isTestnet && (
+              <span style={{
+                fontSize: 11, fontWeight: 600, padding: "1px 7px", borderRadius: 4,
+                background: methodLabel.includes("shelby") ? "rgba(34,197,94,0.12)" : "rgba(245,158,11,0.12)",
+                color: methodLabel.includes("shelby") ? "#16a34a" : "#d97706",
+              }}>
+                {methodLabel}
+              </span>
+            )}
           </p>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -215,45 +269,77 @@ export default function DashboardPage() {
         </div>
       </div>
 
+      {/* Testnet notice (lightweight, not Coming Soon) */}
+      {isTestnet && <TestnetNoticeBanner />}
+
+      {/* Error */}
       {error && !snap && (
         <div style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 8, padding: "10px 14px", marginBottom: 14, fontSize: 13, color: "#ef4444" }}>
           ⚠ {error}
         </div>
       )}
 
-      {/* Block + Blob Breakdown */}
+      {/* Block + Blob Breakdown (Shelbynet) / Block + Network Info (Testnet) */}
       <div className="dash-grid-2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 18 }}>
         <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 14, padding: "18px 22px" }}>
           <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-muted)", marginBottom: 8 }}>Block Height</div>
-          <div style={{ fontFamily: "monospace", fontSize: 30, fontWeight: 800, color: "#2563eb", fontVariantNumeric: "tabular-nums", wordBreak: "break-all" }}>
-            {snap ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—"}
+          <div style={{ fontFamily: "monospace", fontSize: 30, fontWeight: 800, color: isTestnet ? "#9333ea" : "#2563eb", fontVariantNumeric: "tabular-nums", wordBreak: "break-all" }}>
+            {snap?.blockHeight ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—"}
           </div>
           <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 5 }}>
-            Ledger v{snap ? snap.ledgerVersion.toLocaleString("en-US") : "—"}
+            Ledger v{snap?.ledgerVersion ? snap.ledgerVersion.toLocaleString("en-US") : "—"}
+            {isTestnet && snap?.chainId != null && (
+              <span style={{ marginLeft: 10, color: "var(--text-dim)" }}>Chain ID: {snap.chainId}</span>
+            )}
           </div>
         </div>
 
         <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 14, padding: "18px 22px" }}>
-          <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-muted)", marginBottom: 12 }}>Blob Breakdown</div>
+          <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-muted)", marginBottom: 12 }}>
+            {isTestnet ? "Network Status" : "Blob Breakdown"}
+          </div>
           {snap ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-              {[
-                { label: "Active",  v: snap.activeBlobs,     color: "#22c55e" },
-                { label: "Pending", v: snap.pendingOrFailed, color: "#f59e0b" },
-                { label: "Deleted", v: snap.deletedBlobs,    color: "#ef4444" },
-                { label: "Empty",   v: snap.emptyRecords,    color: "#9ca3af" },
-              ].map(({ label, v, color }) => (
-                <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-                    <div style={{ width: 8, height: 8, borderRadius: 2, background: color, flexShrink: 0 }} />
-                    <span style={{ fontSize: 13, color: "var(--text-muted)" }}>{label}</span>
+            isTestnet ? (
+              /* Testnet: show network topology */
+              <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                {[
+                  { label: "Active SPs",      v: snap.storageProviders,    color: "#22c55e" },
+                  { label: "Waitlisted SPs",  v: snap.waitlistedProviders, color: "#f59e0b" },
+                  { label: "Placement Groups",v: snap.placementGroups,     color: "#9333ea" },
+                  { label: "Slices",          v: snap.slices,              color: "#06b6d4" },
+                ].map(({ label, v, color }) => (
+                  <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                      <div style={{ width: 8, height: 8, borderRadius: 2, background: color, flexShrink: 0 }} />
+                      <span style={{ fontSize: 13, color: "var(--text-muted)" }}>{label}</span>
+                    </div>
+                    <span style={{ fontSize: 14, fontWeight: 700, color: "var(--text-primary)", fontFamily: "monospace" }}>
+                      {fmtFull(v)}
+                    </span>
                   </div>
-                  <span style={{ fontSize: 14, fontWeight: 700, color: "var(--text-primary)", fontFamily: "monospace", fontVariantNumeric: "tabular-nums" }}>
-                    {v?.toLocaleString("en-US") ?? "—"}
-                  </span>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            ) : (
+              /* Shelbynet: blob breakdown */
+              <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                {[
+                  { label: "Active",  v: snap.activeBlobs,     color: "#22c55e" },
+                  { label: "Pending", v: snap.pendingOrFailed,  color: "#f59e0b" },
+                  { label: "Deleted", v: snap.deletedBlobs,     color: "#ef4444" },
+                  { label: "Empty",   v: snap.emptyRecords,     color: "#9ca3af" },
+                ].map(({ label, v, color }) => (
+                  <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                      <div style={{ width: 8, height: 8, borderRadius: 2, background: color, flexShrink: 0 }} />
+                      <span style={{ fontSize: 13, color: "var(--text-muted)" }}>{label}</span>
+                    </div>
+                    <span style={{ fontSize: 14, fontWeight: 700, color: "var(--text-primary)", fontFamily: "monospace" }}>
+                      {fmtFull(v)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )
           ) : (
             <div style={{ color: "var(--text-dim)", fontSize: 14 }}>Loading…</div>
           )}
@@ -268,10 +354,15 @@ export default function DashboardPage() {
       {/* Live sparkline charts */}
       <div className="dash-chart-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 22 }}>
         {[
-          { title: "Active Blobs", sub: `${POLL_MS / 1000}s poll`, value: fmtFull(snap?.activeBlobs), data: series.map(p => p.activeBlobs ?? 0).filter(Boolean), color: "#2563eb" },
-          { title: "Block Height", sub: "Chain progress",           value: snap ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—", data: series.map(p => p.blockHeight).filter(v => v > 0), color: "#059669" },
-          { title: "Storage Used", sub: "Shelby Indexer bytes",     value: fmtBytes(snap?.totalStorageBytes), data: series.map(p => p.totalStorageBytes ?? 0).filter(Boolean), color: "#9333ea" },
-          { title: "Blob Events",  sub: "blob_activities count",    value: fmtFull(snap?.totalBlobEvents), data: series.map(p => p.totalBlobEvents ?? 0).filter(Boolean), color: "#d97706" },
+          { title: "Active Blobs",  sub: `${POLL_MS / 1000}s poll`, value: fmtFull(activeBlobs), data: series.map(p => p.activeBlobs ?? 0).filter(Boolean), color: "#2563eb" },
+          { title: "Block Height",  sub: "Chain progress",           value: snap?.blockHeight ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—", data: series.map(p => p.blockHeight).filter(v => v > 0), color: isTestnet ? "#9333ea" : "#059669" },
+          ...(!isTestnet ? [
+            { title: "Storage Used",  sub: "Shelby Indexer bytes",   value: fmtBytes(snap?.totalStorageBytes), data: series.map(p => p.totalStorageBytes ?? 0).filter(Boolean), color: "#9333ea" },
+            { title: "Blob Events",   sub: "blob_activities count",   value: fmtFull(snap?.totalBlobEvents), data: series.map(p => p.totalBlobEvents ?? 0).filter(Boolean), color: "#d97706" },
+          ] : [
+            { title: "Storage Providers", sub: "Active on testnet",  value: fmtFull(snap?.storageProviders), data: series.map(p => p.activeBlobs ?? 0), color: "#0891b2" },
+            { title: "Placement Groups",  sub: "From Epoch registry", value: fmtFull(snap?.placementGroups), data: series.map(p => p.totalBlobEvents ?? 0), color: "#d97706" },
+          ]),
         ].map(({ title, sub, value, data, color }) => (
           <div key={title} style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 14, padding: "16px 20px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12, flexWrap: "wrap", gap: 6 }}>
@@ -279,9 +370,7 @@ export default function DashboardPage() {
                 <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-primary)" }}>{title}</div>
                 <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{sub}</div>
               </div>
-              {snap && (
-                <div style={{ fontFamily: "monospace", fontSize: 16, fontWeight: 700, color, wordBreak: "break-all" }}>{value}</div>
-              )}
+              {snap && <div style={{ fontFamily: "monospace", fontSize: 16, fontWeight: 700, color, wordBreak: "break-all" }}>{value}</div>}
             </div>
             <SparkLine data={data} color={color} height={110} />
             {series.length > 1 && (
@@ -296,7 +385,10 @@ export default function DashboardPage() {
 
       {/* Source info */}
       <div style={{ background: "var(--bg-card2)", border: "1px solid var(--border)", borderRadius: 10, padding: "12px 16px", fontSize: 12, color: "var(--text-dim)", fontFamily: "monospace" }}>
-        Source: Shelby Dedicated Indexer (blobs_aggregate · blob_activities_aggregate) · On-chain: Aptos RPC resource reads
+        {isTestnet
+          ? "Source: Aptos Testnet REST API (fullnode) · epoch::Epoch resource · Indexer (best-effort)"
+          : "Source: Shelby Dedicated Indexer (blobs_aggregate · blob_activities_aggregate) · Aptos RPC resource reads"
+        }
       </div>
     </div>
   );

@@ -1,195 +1,192 @@
-// app/api/network/stats/route.ts — v3.0
-// Đồng bộ thông số chính xác:
-// - totalBlobs: SDK getBlobsCount({}) → GQL aggregate → binary search
-// - totalStorageUsedBytes: SDK getTotalBlobsSize({}) → từ VPS (KHÔNG hardcode multiply)
-// - totalBlobEvents: account_transactions_aggregate × eventsPerTxn
-// - storageProviders / placementGroups / slices: on-chain resource read
-// Cache 15s (live stats), stale-while-revalidate 60s
+// app/api/network/stats/route.ts — v4.0
+//
+// ARCHITECTURE CHANGE (Fix 503):
+// Fetches network stats DIRECTLY from Aptos Node REST API.
+// No VPS dependency for the primary data path.
+// VPS is tried as optional source for blob metrics only.
+//
+// Per guide:
+//   - Node API is the ground truth, extremely stable
+//   - Two separate API keys: SHELBY_API_KEY (shelbynet) vs SHELBY_TESTNET_API_KEY (testnet)
+//   - epoch::Epoch resource → active_providers (BPlusTreeMap) → SP list
 
 import { type NextRequest, NextResponse } from "next/server";
-import { proxyToGeoSync } from "@/app/api/_proxy";
 
 export const runtime = "edge";
 
-const SHELBY_NODE    = "https://api.shelbynet.shelby.xyz/v1";
-const SHELBY_INDEXER = "https://api.shelbynet.shelby.xyz/v1/graphql";
-const CORE_ADDRESS   = "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a";
-const BLOB_HANDLE    = "0xe41f1fa92a4beeacd0b83b7e05d150e2b260f6b7f934f62a5843f762260d5cb8";
+const CONFIGS = {
+  shelbynet: {
+    nodeUrl:     "https://api.shelbynet.shelby.xyz/v1",
+    coreAddress: "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a",
+    apiKeyEnv:   "SHELBY_API_KEY",
+  },
+  testnet: {
+    nodeUrl:     "https://api.testnet.aptoslabs.com/v1",
+    coreAddress: "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a",
+    apiKeyEnv:   "SHELBY_TESTNET_API_KEY",
+  },
+} as const;
+type NetworkId = keyof typeof CONFIGS;
 
-function nb(v: any, fb = 0): number {
+function nb(v: unknown, fb = 0): number {
   const x = Number(v ?? fb);
   return isNaN(x) ? fb : x;
 }
 
-async function gql(query: string): Promise<any> {
-  const r = await fetch(SHELBY_INDEXER, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query }),
-    signal: AbortSignal.timeout(10_000),
-  });
-  const t = await r.text();
-  if (!r.ok) throw new Error(`GQL ${r.status}`);
-  const j = JSON.parse(t);
-  if (j.errors?.length) throw new Error(j.errors[0].message);
-  return j.data;
+function apiHeaders(network: NetworkId): Record<string, string> {
+  const key = process.env[CONFIGS[network].apiKeyEnv] ?? "";
+  return key ? { "Authorization": `Bearer ${key}` } : {};
 }
 
-// Lấy node info từ fullnode
-async function fetchNodeInfo() {
-  const r = await fetch(`${SHELBY_NODE}/`, { signal: AbortSignal.timeout(5_000) });
-  if (!r.ok) throw new Error(`Node HTTP ${r.status}`);
-  const d = await r.json() as any;
-  return {
-    blockHeight:    nb(d.block_height),
-    ledgerVersion:  nb(d.ledger_version),
-    chainId:        nb(d.chain_id),
-    nodeVersion:    d.node_role ?? undefined,
-  };
+type BTreeEntry = { key: string; value: Record<string, unknown> };
+function extractBTreeEntries(map: unknown): BTreeEntry[] {
+  if (!map || typeof map !== "object") return [];
+  const m = map as Record<string, unknown>;
+  const viaRoot = ((m.root as Record<string, unknown>)?.children as Record<string, unknown>)?.entries;
+  if (Array.isArray(viaRoot)) return viaRoot as BTreeEntry[];
+  if (Array.isArray(m.entries)) return m.entries as BTreeEntry[];
+  if (Array.isArray(m.data))    return m.data    as BTreeEntry[];
+  return [];
 }
 
-// Lấy on-chain stats từ resource reads
-// Không dùng explorer API (không tồn tại) — đọc trực tiếp contract state
-async function fetchOnChainStats() {
-  const [pgR, spR, slR] = await Promise.allSettled([
-    fetch(`${SHELBY_NODE}/accounts/${CORE_ADDRESS}/resource/${CORE_ADDRESS}::placement_group_registry::PlacementGroups`,
-      { signal: AbortSignal.timeout(5_000) }),
-    fetch(`${SHELBY_NODE}/accounts/${CORE_ADDRESS}/resource/${CORE_ADDRESS}::storage_provider_registry::StorageProviders`,
-      { signal: AbortSignal.timeout(5_000) }),
-    fetch(`${SHELBY_NODE}/accounts/${CORE_ADDRESS}/resource/${CORE_ADDRESS}::slice_registry::SliceRegistry`,
-      { signal: AbortSignal.timeout(5_000) }),
+async function fetchAllStats(network: NetworkId) {
+  const cfg  = CONFIGS[network];
+  const core = cfg.coreAddress;
+  const hdrs = apiHeaders(network);
+
+  // Fetch node info, epoch registry, pg registry, slice registry in parallel
+  const [nodeR, epochR, pgR, slR] = await Promise.allSettled([
+    fetch(`${cfg.nodeUrl}/`, { headers: hdrs, signal: AbortSignal.timeout(6_000) }),
+    fetch(`${cfg.nodeUrl}/accounts/${core}/resource/${core}::epoch::Epoch`, { headers: hdrs, signal: AbortSignal.timeout(8_000) }),
+    fetch(`${cfg.nodeUrl}/accounts/${core}/resource/${core}::placement_group_registry::PlacementGroups`, { headers: hdrs, signal: AbortSignal.timeout(6_000) }),
+    fetch(`${cfg.nodeUrl}/accounts/${core}/resource/${core}::slice_registry::SliceRegistry`, { headers: hdrs, signal: AbortSignal.timeout(6_000) }),
   ]);
 
-  let placementGroups = 0, storageProviders = 0, slices = 0;
+  let blockHeight = 0, ledgerVersion = 0, chainId = 2;
+  let storageProviders = 0, waitlistedProviders = 0, placementGroups = 0, slices = 0;
 
-  if (pgR.status === "fulfilled" && pgR.value.ok) {
-    const d = await pgR.value.json() as any;
-    placementGroups = nb(d?.data?.next_unassigned_placement_group_index);
+  // Node info
+  if (nodeR.status === "fulfilled" && nodeR.value.ok) {
+    const d = await nodeR.value.json() as Record<string, unknown>;
+    blockHeight   = nb(d.block_height);
+    ledgerVersion = nb(d.ledger_version);
+    chainId       = nb(d.chain_id);
   }
 
-  if (spR.status === "fulfilled" && spR.value.ok) {
-    const d = await spR.value.json() as any;
-    const entries: any[] = d?.data?.active_providers_by_az?.root?.children?.entries ?? [];
-    entries.forEach((z: any) => {
-      storageProviders += (z.value?.value ?? []).length;
-    });
+  // Epoch registry → SP counts
+  if (epochR.status === "fulfilled" && epochR.value.ok) {
+    const d    = await epochR.value.json() as Record<string, unknown>;
+    const data = (d.data ?? d) as Record<string, unknown>;
+    const active     = extractBTreeEntries(data.active_providers     ?? data.active_operators);
+    const waitlisted = extractBTreeEntries(data.waitlisted_providers  ?? data.waitlisted_operators);
+    storageProviders    = active.length;
+    waitlistedProviders = waitlisted.length;
+
+    // PG and slice counts from epoch data if available
+    const pgD = data.placement_groups ?? data.placement_group_count;
+    const slD = data.slices           ?? data.slice_count;
+    if (typeof pgD === "number") placementGroups = Math.round(pgD);
+    if (typeof slD === "number") slices           = Math.round(slD);
+  } else {
+    // Fallback: StorageProviders by-zone registry
+    try {
+      const r = await fetch(
+        `${cfg.nodeUrl}/accounts/${core}/resource/${core}::storage_provider_registry::StorageProviders`,
+        { headers: hdrs, signal: AbortSignal.timeout(6_000) }
+      );
+      if (r.ok) {
+        const d     = await r.json() as Record<string, unknown>;
+        const data  = (d.data ?? d) as Record<string, unknown>;
+        const zones = extractBTreeEntries(data.active_providers_by_az ?? data.active_providers);
+        storageProviders = zones.reduce((sum, z) => {
+          const arr = (z.value as Record<string, unknown>)?.value;
+          return sum + (Array.isArray(arr) ? arr.length : 0);
+        }, 0);
+      }
+    } catch { /* silent */ }
   }
 
-  if (slR.status === "fulfilled" && slR.value.ok) {
-    const d = await slR.value.json() as any;
-    const bigVec  = nb(d?.data?.slices?.big_vec?.vec?.[0]?.end_index);
-    const inline  = nb(d?.data?.slices?.inline_vec?.length);
+  // Placement groups (dedicated resource if not from epoch)
+  if (placementGroups === 0 && pgR.status === "fulfilled" && pgR.value.ok) {
+    const d = await pgR.value.json() as Record<string, unknown>;
+    placementGroups = nb((d.data as Record<string, unknown>)?.next_unassigned_placement_group_index);
+  }
+
+  // Slices
+  if (slices === 0 && slR.status === "fulfilled" && slR.value.ok) {
+    const d     = await slR.value.json() as Record<string, unknown>;
+    const slics = (d.data as Record<string, unknown>)?.slices as Record<string, unknown> | undefined;
+    const bigVec = nb(((slics?.big_vec as Record<string, unknown>)
+      ?.vec as Array<Record<string, unknown>>)?.[0]?.end_index);
+    const inline  = nb((slics?.inline_vec as unknown[])?.length);
     slices = bigVec + inline;
   }
 
-  return { placementGroups, storageProviders, slices };
+  return { blockHeight, ledgerVersion, chainId, storageProviders, waitlistedProviders, placementGroups, slices };
 }
 
-// Đếm blob events từ Indexer
-async function fetchBlobEvents(): Promise<number> {
-  const d = await gql(`{
-    account_transactions_aggregate(
-      where: { account_address: { _eq: "${CORE_ADDRESS}" } }
-    ) { aggregate { count } }
-  }`);
-  const count = nb(d?.account_transactions_aggregate?.aggregate?.count);
-  // Mỗi blob upload tạo 2 txns (register + acknowledge)
-  return Math.round(count * 2.0);
-}
-
-// Đếm blobs từ GQL aggregate (fallback khi không có VPS)
-async function fetchBlobCountGQL(): Promise<{ count: number }> {
-  const d = await gql(`{
-    current_table_items_aggregate(
-      where: { table_handle: { _eq: "${BLOB_HANDLE}" } }
-    ) { aggregate { count } }
-  }`);
-  return { count: nb(d?.current_table_items_aggregate?.aggregate?.count) };
+// Optional VPS blob metrics
+async function tryVpsBlobMetrics(network: NetworkId) {
+  const vpsUrl = process.env.SHELBY_API_URL ?? "";
+  if (!vpsUrl) return null;
+  try {
+    const r = await fetch(`${vpsUrl}/api/geo-sync/stats?network=${network}`, {
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!r.ok) return null;
+    const j = await r.json() as Record<string, unknown>;
+    const s = ((j.data as Record<string, unknown>)?.stats ?? {}) as Record<string, unknown>;
+    return {
+      totalBlobs:            nb(s.totalBlobs ?? s.activeBlobs),
+      totalStorageUsedBytes: nb(s.totalStorageUsedBytes),
+      totalBlobEvents:       nb(s.totalBlobEvents),
+      statsMethod:           String(s.statsMethod ?? "vps-cache"),
+    };
+  } catch { return null; }
 }
 
 export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const network = searchParams.get("network") ?? "shelbynet";
-
-  if (network === "testnet") {
-    return NextResponse.json({
-      ok: true,
-      data: {
-        node: null,
-        stats: { totalBlobs: null, totalStorageUsedBytes: null, totalBlobEvents: null, slices: null, placementGroups: null, storageProviders: null },
-        network,
-        statsSource: "none",
-      },
-    });
+  const network = (req.nextUrl.searchParams.get("network") ?? "shelbynet") as NetworkId;
+  if (network !== "shelbynet" && network !== "testnet") {
+    return NextResponse.json({ ok: false, error: "Invalid network" }, { status: 400 });
   }
 
-  // ── Fetch tất cả sources song song ────────────────────────────────────────
-  const [nodeResult, onChainResult, blobEventsResult] = await Promise.allSettled([
-    fetchNodeInfo(),
-    fetchOnChainStats(),
-    fetchBlobEvents(),
+  const [onChainResult, blobResult] = await Promise.allSettled([
+    fetchAllStats(network),
+    tryVpsBlobMetrics(network),
   ]);
 
-  const node    = nodeResult.status === "fulfilled" ? nodeResult.value : null;
-  const onChain = onChainResult.status === "fulfilled" ? onChainResult.value : null;
-  const blobEvents = blobEventsResult.status === "fulfilled" ? blobEventsResult.value : null;
+  const node = onChainResult.status === "fulfilled"
+    ? onChainResult.value
+    : null;
 
-  // ── Get accurate blob count + storage size từ VPS (có SDK) ───────────────
-  // VPS đọc SDK on-chain → chính xác nhất cho totalBlobs + totalStorageUsedBytes
-  // Dùng /stats/live (no-cache, real-time) thay vì /stats (cached)
-  let totalBlobs: number | null = null;
-  let totalStorageUsedBytes: number | null = null;
-  let statsSource = "unknown";
-
-  // Try VPS first (SDK on-chain, most accurate)
-  try {
-    const vpsRes = await fetch(
-      `${(globalThis as any).__VPS_API_URL ?? process.env.SHELBY_API_URL ?? "http://localhost:3000"}/api/geo-sync/stats/live?network=${network}`,
-      { signal: AbortSignal.timeout(8_000), headers: { Accept: "application/json" } }
-    );
-    if (vpsRes.ok) {
-      const vpsData = await vpsRes.json() as any;
-      if (vpsData.data?.stats) {
-        const s = vpsData.data.stats;
-        if (nb(s.totalBlobs) > 0)            totalBlobs             = nb(s.totalBlobs);
-        if (nb(s.totalStorageUsedBytes) > 0) totalStorageUsedBytes  = nb(s.totalStorageUsedBytes);
-        statsSource = s.statsMethod ?? "vps-sdk";
-      }
-    }
-  } catch { /* VPS unavailable */ }
-
-  // Fallback: GQL aggregate count
-  if (totalBlobs === null) {
-    try {
-      const { count } = await fetchBlobCountGQL();
-      if (count > 0) {
-        totalBlobs  = count;
-        statsSource = "gql-aggregate";
-        // totalStorageUsedBytes: không thể tính chính xác không có SDK
-        // Để null là tốt hơn là hiển thị số sai
-      }
-    } catch { /* GQL failed */ }
-  }
+  const blobs = blobResult.status === "fulfilled" ? blobResult.value : null;
 
   return NextResponse.json({
     ok: true,
     data: {
-      node,
+      node: node ? {
+        blockHeight:   node.blockHeight,
+        ledgerVersion: node.ledgerVersion,
+        chainId:       node.chainId,
+      } : null,
       stats: {
-        totalBlobs,
-        totalStorageUsedBytes,
-        totalBlobEvents:  blobEvents,
-        storageProviders: onChain?.storageProviders ?? null,
-        placementGroups:  onChain?.placementGroups  ?? null,
-        slices:           onChain?.slices           ?? null,
+        totalBlobs:            blobs?.totalBlobs            ?? node?.storageProviders ?? null,
+        activeBlobs:           null, // from live endpoint
+        totalStorageUsedBytes: blobs?.totalStorageUsedBytes ?? null,
+        totalBlobEvents:       blobs?.totalBlobEvents       ?? null,
+        storageProviders:      node?.storageProviders       ?? null,
+        waitlistedProviders:   node?.waitlistedProviders    ?? null,
+        placementGroups:       node?.placementGroups        ?? null,
+        slices:                node?.slices                 ?? null,
+        statsMethod:           blobs?.statsMethod ?? "node-rest-direct",
+        updatedAt:             new Date().toISOString(),
       },
       network,
-      statsSource,
+      statsSource: node ? "node-rest-direct" : "error",
     },
     fetchedAt: new Date().toISOString(),
   }, {
-    headers: {
-      "Cache-Control": "public, max-age=15, stale-while-revalidate=60",
-    },
+    headers: { "Cache-Control": "public, max-age=15, stale-while-revalidate=60" },
   });
 }

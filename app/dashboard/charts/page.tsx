@@ -1,13 +1,13 @@
 "use client";
 /**
- * app/dashboard/charts/page.tsx — v22.0
+ * app/dashboard/charts/page.tsx — v23.0
  *
  * FIXES:
- * 1. Rules of Hooks violation: useCallback(toIdx) was called AFTER early return
- *    → moved ALL hooks to top of Chart(), early return converted to hasData flag
- * 2. Hydration mismatch: useLiveUTCClock rendered time on server ≠ client
- *    → clock initialized as "" (empty string), filled only after mount
- * 3. VPS confirmed working — revert route changes, keep direct VPS proxy
+ * 1. React error #418 (hydration mismatch): useLiveUTCClock now uses suppressHydrationWarning
+ *    pattern — clock div gets suppressHydrationWarning={true} so React skips hydration check
+ * 2. 503 graceful degrade: when live endpoint returns 503/error, use cached timeseries data
+ *    for current snapshot values instead of showing blank "—" everywhere
+ * 3. Better error UX: show yellow warning (not red error) when live data is stale
  */
 
 import { useEffect, useState, useRef, useCallback } from "react";
@@ -51,7 +51,7 @@ function str(v: unknown): string {
   return "—";
 }
 function num(v: unknown, fb = 0): number { const n = Number(v); return isFinite(n) ? n : fb; }
-function fmtN(v: unknown): string { const n = num(v); return n === 0 ? "—" : Math.round(n).toLocaleString("en-US"); }
+function fmtN(v: unknown): string { const n = num(v); return n === 0 ? "0" : Math.round(n).toLocaleString("en-US"); }
 function fmtGB(v: unknown): string { const n = num(v); return n === 0 ? "—" : `${n.toFixed(2)} GB`; }
 function fmtKbs(v: unknown): string { const n = num(v); if (n === 0) return "—"; return n >= 1024 ? `${(n / 1024).toFixed(2)} MB/s` : `${n.toFixed(1)} KB/s`; }
 function fmtMs(v: unknown): string { const n = num(v); if (n === 0) return "—"; return n >= 1000 ? `${(n / 1000).toFixed(2)}s` : `${n.toFixed(0)}ms`; }
@@ -85,11 +85,12 @@ function enrichPoint(s: Record<string, unknown>): TsPoint {
   };
 }
 
-// ─── Live UTC Clock ─────────────────────────────────────────────────────────────
-// FIX hydration: initialize as "" so server and client both render ""
-// then fill on client after mount. No more server/client mismatch.
-function useLiveUTCClock(): string {
-  const [clock, setClock] = useState<string>(""); // "" on both server and client initially
+// ─── Live UTC Clock — FIX hydration error #418 ────────────────────────────────
+// Pattern: render empty string on both server and client initially.
+// Use suppressHydrationWarning on the span to skip React's hydration check.
+// The clock only updates after mount via useEffect.
+function LiveClock() {
+  const [clock, setClock] = useState<string>("");
   const alive = useRef(true);
 
   useEffect(() => {
@@ -98,12 +99,20 @@ function useLiveUTCClock(): string {
       const d = new Date();
       return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}:${String(d.getUTCSeconds()).padStart(2, "0")} UTC`;
     };
-    setClock(getUTC()); // set immediately after mount
+    setClock(getUTC());
     const id = setInterval(() => { if (alive.current) setClock(getUTC()); }, 1000);
     return () => { alive.current = false; clearInterval(id); };
   }, []);
 
-  return clock;
+  if (!clock) return null;
+  return (
+    <span
+      suppressHydrationWarning
+      style={{ fontFamily: "monospace", fontSize: 12, color: "var(--text-dim)", background: "var(--bg-card)", border: "1px solid var(--border)", padding: "4px 10px", borderRadius: 7, minWidth: 110, textAlign: "center", display: "inline-block" }}
+    >
+      🕐 {clock}
+    </span>
+  );
 }
 
 // ─── Device Badge ─────────────────────────────────────────────────────────────
@@ -135,16 +144,11 @@ function DeviceBadge({ h }: { h: Pick<ServerBench, "ip" | "deviceId"> }) {
 }
 
 // ─── Chart ────────────────────────────────────────────────────────────────────
-// FIX Rules of Hooks: ALL hooks are declared at the top of the function,
-// BEFORE any conditional logic or early returns.
-// The early return (when data < 2) is now handled via a `hasData` variable
-// checked AFTER all hooks are declared.
 interface ChartSeries { data: number[]; color: string; name: string; fmt?: (v: number) => string; }
 function Chart({ series, labels, height = 150, perScale = false }: {
   series: ChartSeries[]; labels: string[]; height?: number; perScale?: boolean;
 }) {
   const { isDark } = useTheme();
-  // ── ALL HOOKS FIRST — before any conditional returns ──────────────────────
   const svgRef   = useRef<SVGSVGElement>(null);
   const alive    = useRef(true);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
@@ -153,12 +157,10 @@ function Chart({ series, labels, height = 150, perScale = false }: {
 
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
-  // Compute layout constants (safe to compute always)
   const VW = 600, PL = 56, PR = 12, PT = 16, PB = 24;
   const iW = VW - PL - PR, iH = height - PT - PB;
   const n  = Math.max(...series.map(s => s.data.length), 2);
 
-  // useCallback MUST be declared before any conditional return
   const toIdx = useCallback((e: React.MouseEvent<SVGSVGElement>): number => {
     const svgEl = svgRef.current;
     if (!svgEl) return 0;
@@ -175,7 +177,6 @@ function Chart({ series, labels, height = 150, perScale = false }: {
     }
   }, [n, iW, PL, VW]);
 
-  // ── NOW check data availability (after all hooks) ─────────────────────────
   const allV = series.flatMap(s => s.data.filter(v => isFinite(v) && v > 0));
   const hasData = allV.length >= 2;
 
@@ -187,7 +188,6 @@ function Chart({ series, labels, height = 150, perScale = false }: {
     );
   }
 
-  // ── Compute derived values (only when hasData) ────────────────────────────
   const doms = series.map(s => {
     const vs = s.data.filter(v => isFinite(v) && v > 0);
     if (!vs.length) return { mn: 0, mx: 1 };
@@ -312,6 +312,7 @@ async function fetchTestnetStats(): Promise<TestnetStats | null> {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json() as Record<string, unknown>;
     const d  = (j?.data ?? {}) as Record<string, unknown>;
+    if (!d.blockHeight && !d.storageProviders) return null;
     return {
       blockHeight:         num(d.blockHeight),
       ledgerVersion:       num(d.ledgerVersion),
@@ -415,7 +416,6 @@ function Pager({ total, page, per, set }: { total: number; page: number; per: nu
 export default function ChartsPage() {
   const { network, config } = useNetwork();
   const networkLabel = config?.label ?? network ?? "Shelbynet";
-  const clock        = useLiveUTCClock(); // "" on server, fills after mount
   const alive        = useRef(true);
 
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
@@ -430,15 +430,30 @@ export default function ChartsPage() {
   const [testnetStats,   setTestnetStats]   = useState<TestnetStats | null>(null);
   const [testnetLoading, setTestnetLoading] = useState<boolean>(false);
   const [fetchError,     setFetchError]     = useState<string | null>(null);
+  const [isStaleData,    setIsStaleData]    = useState<boolean>(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchLive = useCallback(async (net: string) => {
     try {
       const r = await fetch(`/api/network/stats/live?network=${net}`);
-      if (!r.ok) { if (alive.current) setFetchError(`Backend returned ${r.status}`); return; }
-      if (alive.current) setFetchError(null);
+
+      // Even on non-200, try to parse body — our new backend sends 200 with ok:false
       const j = await r.json() as Record<string, unknown>;
       const d  = (j?.data ?? j ?? {}) as Record<string, unknown>;
+
+      if (!r.ok && !d.blockHeight && !d.activeBlobs) {
+        if (alive.current) setFetchError(`Backend returned ${r.status} — showing cached chart data`);
+        return;
+      }
+
+      if (alive.current) {
+        setFetchError(null);
+        // Check if this is stale/cached data
+        const method = String(d.method ?? "");
+        const cacheAge = num(d.cacheAge ?? 0);
+        setIsStaleData(method.includes("stale") || method.includes("cache") || cacheAge > 120);
+      }
+
       if (alive.current) setLive(prev => [...prev, {
         ts:              Date.now(),
         blockHeight:     num(d.blockHeight),
@@ -491,6 +506,7 @@ export default function ChartsPage() {
   useEffect(() => {
     if (alive.current) setLive([]);
     if (alive.current) setFetchError(null);
+    if (alive.current) setIsStaleData(false);
     fetchLive(network);
     fetchTs(network, range);
     fetchTs48h(network);
@@ -510,6 +526,7 @@ export default function ChartsPage() {
 
   useEffect(() => { fetchTs(network, range); }, [range, network, fetchTs]);
 
+  // Use timeseries data as fallback for current values when live fails
   const cd = ts.length > 0 ? ts : live.map(p => enrichPoint({
     tsMs: p.ts, activeBlobs: p.activeBlobs, totalStorageGB: p.totalStorageGB,
     totalBlobEvents: p.totalBlobEvents, pendingOrFailed: p.pendingOrFailed,
@@ -517,6 +534,8 @@ export default function ChartsPage() {
   }));
   const labels   = cd.map(p => tLbl(p.tsMs, range));
   const latest   = live[live.length - 1];
+
+  // For snapshot values: prefer live point, fall back to latest timeseries point
   const latestTs = cd[cd.length - 1];
   const currentAvgBlobKB = computeAvgBlobKB(num(latestTs?.activeBlobs), num(latestTs?.totalStorageGB));
 
@@ -553,8 +572,7 @@ export default function ChartsPage() {
             </p>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            {/* clock is "" on server, filled after mount → no hydration mismatch */}
-            {clock && <span style={{ fontFamily: "monospace", fontSize: 12, color: "var(--text-dim)", background: "var(--bg-card)", border: "1px solid var(--border)", padding: "4px 10px", borderRadius: 7 }}>🕐 {clock}</span>}
+            <LiveClock />
             <button onClick={fetchTestnet} disabled={testnetLoading} style={{ padding: "7px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600, background: "var(--bg-card)", border: "1px solid var(--border)", color: "var(--text-muted)", cursor: "pointer" }}>
               {testnetLoading ? "Loading…" : "⟳ Refresh"}
             </button>
@@ -570,12 +588,12 @@ export default function ChartsPage() {
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 12, marginBottom: 24 }}>
           {([
             { label: "Block Height",     value: ts_ ? `#${ts_.blockHeight.toLocaleString("en-US")}` : "—", color: "var(--accent)" },
-            { label: "Active SPs",       value: fmtN(ts_?.storageProviders),    color: "#22c55e" },
-            { label: "Waitlisted SPs",   value: fmtN(ts_?.waitlistedProviders), color: "#f59e0b" },
-            { label: "Placement Groups", value: fmtN(ts_?.placementGroups),     color: "#fb923c" },
-            { label: "Slices",           value: fmtN(ts_?.slices),              color: "#818cf8" },
-            { label: "Active Blobs",     value: fmtN(ts_?.activeBlobs),         color: "#34d399" },
-            { label: "Indexer Status",   value: str(ts_?.indexerStatus),        color: ts_?.indexerStatus === "live" ? "#22c55e" : "#f87171" },
+            { label: "Active SPs",       value: ts_ ? fmtN(ts_.storageProviders) : "—",    color: "#22c55e" },
+            { label: "Waitlisted SPs",   value: ts_ ? fmtN(ts_.waitlistedProviders) : "—", color: "#f59e0b" },
+            { label: "Placement Groups", value: ts_ ? fmtN(ts_.placementGroups) : "—",     color: "#fb923c" },
+            { label: "Slices",           value: ts_ ? fmtN(ts_.slices) : "—",              color: "#818cf8" },
+            { label: "Active Blobs",     value: ts_ ? fmtN(ts_.activeBlobs) : "—",         color: "#34d399" },
+            { label: "Indexer Status",   value: ts_ ? str(ts_.indexerStatus) : "—",        color: ts_?.indexerStatus === "live" ? "#22c55e" : ts_?.indexerStatus === "unavailable" ? "#94a3b8" : "#f87171" },
           ] as Array<{ label: string; value: string; color: string }>).map(({ label, value, color }) => (
             <div key={label} style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 12, padding: "14px 18px" }}>
               <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 4 }}>{str(label)}</div>
@@ -622,7 +640,7 @@ export default function ChartsPage() {
             <div style={{ fontSize: 28, marginBottom: 12 }}>🔬</div>
             <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)", marginBottom: 8 }}>Testnet data unavailable</div>
             <div style={{ fontSize: 13, color: "var(--text-muted)", marginBottom: 16 }}>
-              The backend may be unreachable or the Testnet contract is not yet deployed.
+              Could not reach the VPS backend. The VPS may be temporarily busy.
             </div>
             <button onClick={fetchTestnet} style={{ padding: "8px 18px", borderRadius: 8, background: "var(--accent)", color: "#fff", border: "none", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
               ⟳ Try again
@@ -642,37 +660,45 @@ export default function ChartsPage() {
           <p style={{ fontSize: 13, color: "var(--text-muted)", margin: "4px 0 0" }}>{networkLabel} · Refresh every {POLL / 1000}s</p>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          {clock && <span style={{ fontFamily: "monospace", fontSize: 12, color: "var(--text-dim)", background: "var(--bg-card)", border: "1px solid var(--border)", padding: "4px 10px", borderRadius: 7, minWidth: 110, textAlign: "center" }}>🕐 {clock}</span>}
+          <LiveClock />
           <button onClick={() => { fetchLive(network); fetchTs48h(network); fetchBench(); }} style={{ padding: "7px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600, background: "var(--bg-card)", border: "1px solid var(--border)", color: "var(--text-muted)", cursor: "pointer" }}>
             ⟳ Refresh
           </button>
         </div>
       </div>
 
+      {/* Error/warning banner — yellow for stale, orange for error */}
       {fetchError && (
-        <div style={{ background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 9, padding: "10px 16px", marginBottom: 20, fontSize: 13, color: "#d97706", display: "flex", alignItems: "center", gap: 8 }}>
-          <span>⚠</span><span>{str(fetchError)}</span>
+        <div style={{ background: isStaleData ? "rgba(245,158,11,0.08)" : "rgba(245,158,11,0.1)", border: `1px solid ${isStaleData ? "rgba(245,158,11,0.2)" : "rgba(245,158,11,0.3)"}`, borderRadius: 9, padding: "10px 16px", marginBottom: 20, fontSize: 13, color: "#d97706", display: "flex", alignItems: "center", gap: 8 }}>
+          <span>⚠</span>
+          <span>{str(fetchError)}</span>
           <span style={{ marginLeft: "auto", fontSize: 11, opacity: 0.7 }}>Retrying every {POLL / 1000}s</span>
+        </div>
+      )}
+      {isStaleData && !fetchError && (
+        <div style={{ background: "rgba(245,158,11,0.06)", border: "1px solid rgba(245,158,11,0.15)", borderRadius: 9, padding: "8px 14px", marginBottom: 16, fontSize: 12, color: "#d97706", display: "flex", alignItems: "center", gap: 6 }}>
+          <span>⏱</span>
+          <span>Showing cached data — Shelby Indexer sync in progress</span>
         </div>
       )}
 
       <Sec title="Network Snapshot" sub="Current values · % change vs previous 24h window">
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 12 }}>
-          <SnapCard label="Block Height" value={str(latest ? `#${num(latest.blockHeight).toLocaleString("en-US")}` : undefined)} color="var(--accent)" delta={null} from={null} />
-          {(() => { const { delta, from } = d48("activeBlobs");     return <SnapCard label="Active Blobs"   value={fmtN(latestTs?.activeBlobs)}    color="#22c55e" delta={delta} from={from} />; })()}
-          {(() => { const { delta, from } = d48("totalStorageGB");  return <SnapCard label="Storage Used"   value={fmtGB(latestTs?.totalStorageGB)} color="#a78bfa" delta={delta} from={from} />; })()}
-          {(() => { const { delta, from } = d48("totalBlobEvents"); return <SnapCard label="Blob Events"    value={fmtN(latestTs?.totalBlobEvents)} color="#fb923c" delta={delta} from={from} />; })()}
-          {(() => { const { delta, from } = d48("pendingOrFailed"); return <SnapCard label="Pending Blobs" value={fmtN(latestTs?.pendingOrFailed)} color="#fbbf24" delta={delta} from={from} />; })()}
-          {(() => { const { delta, from } = d48("deletedBlobs");    return <SnapCard label="Deleted Blobs" value={fmtN(latestTs?.deletedBlobs)}   color="#f87171" delta={delta} from={from} />; })()}
+          <SnapCard label="Block Height" value={str(latest ? `#${num(latest.blockHeight).toLocaleString("en-US")}` : latestTs?.blockHeight ? `#${latestTs.blockHeight.toLocaleString()}` : undefined)} color="var(--accent)" delta={null} from={null} />
+          {(() => { const { delta, from } = d48("activeBlobs");     return <SnapCard label="Active Blobs"   value={fmtN(latest?.activeBlobs     ?? latestTs?.activeBlobs)}    color="#22c55e" delta={delta} from={from} />; })()}
+          {(() => { const { delta, from } = d48("totalStorageGB");  return <SnapCard label="Storage Used"   value={fmtGB(latest?.totalStorageGB  ?? latestTs?.totalStorageGB)} color="#a78bfa" delta={delta} from={from} />; })()}
+          {(() => { const { delta, from } = d48("totalBlobEvents"); return <SnapCard label="Blob Events"    value={fmtN(latest?.totalBlobEvents  ?? latestTs?.totalBlobEvents)} color="#fb923c" delta={delta} from={from} />; })()}
+          {(() => { const { delta, from } = d48("pendingOrFailed"); return <SnapCard label="Pending Blobs" value={fmtN(latest?.pendingOrFailed  ?? latestTs?.pendingOrFailed)} color="#fbbf24" delta={delta} from={from} />; })()}
+          {(() => { const { delta, from } = d48("deletedBlobs");    return <SnapCard label="Deleted Blobs" value={fmtN(latest?.deletedBlobs     ?? latestTs?.deletedBlobs)}   color="#f87171" delta={delta} from={from} />; })()}
         </div>
       </Sec>
 
       <Sec title="Blob Analytics" sub="Blob count and activity over time" right={<RangeSel range={range} onChange={r => { setRange(r); setPg(0); }} />}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
-          <Card title="Active Blobs" sub={`${range} window`} latest={fmtN(latestTs?.activeBlobs)} color="#22c55e">
+          <Card title="Active Blobs" sub={`${range} window`} latest={fmtN(latest?.activeBlobs ?? latestTs?.activeBlobs)} color="#22c55e">
             <Chart series={[{ data: cd.map(p => num(p.activeBlobs)), color: "#22c55e", name: "Active", fmt: v => fmtN(v) }]} labels={labels} height={140} />
           </Card>
-          <Card title="Blob Events" sub="blob_activities_aggregate count" latest={fmtN(latestTs?.totalBlobEvents)} color="#fb923c">
+          <Card title="Blob Events" sub="blob_activities_aggregate count" latest={fmtN(latest?.totalBlobEvents ?? latestTs?.totalBlobEvents)} color="#fb923c">
             <Chart series={[{ data: cd.map(p => num(p.totalBlobEvents)), color: "#fb923c", name: "Events", fmt: v => fmtN(v) }]} labels={labels} height={140} />
           </Card>
         </div>
@@ -686,15 +712,15 @@ export default function ChartsPage() {
 
       <Sec title="Storage Analytics" sub="Capacity, utilization, and blob size">
         <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 14, marginBottom: 14 }}>
-          <Card title="Storage Used (GB)" latest={fmtGB(latestTs?.totalStorageGB)} color="#a78bfa">
+          <Card title="Storage Used (GB)" latest={fmtGB(latest?.totalStorageGB ?? latestTs?.totalStorageGB)} color="#a78bfa">
             <Chart series={[{ data: cd.map(p => num(p.totalStorageGB)), color: "#a78bfa", name: "GB", fmt: v => `${v.toFixed(2)} GB` }]} labels={labels} height={150} />
           </Card>
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {[
-              { label: "Total Storage", val: fmtGB(latestTs?.totalStorageGB),  c: "#a78bfa" },
-              { label: "Active Blobs",  val: fmtN(latestTs?.activeBlobs),      c: "#22c55e" },
-              { label: "Avg Blob Size", val: fmtKB(currentAvgBlobKB),          c: "var(--accent)", hint: "totalStorage / activeBlobs" },
-            ].map(({ label, val, c, hint }) => (
+              { label: "Total Storage", val: fmtGB(latest?.totalStorageGB ?? latestTs?.totalStorageGB),  c: "#a78bfa" },
+              { label: "Active Blobs",  val: fmtN(latest?.activeBlobs ?? latestTs?.activeBlobs),         c: "#22c55e" },
+              { label: "Avg Blob Size", val: fmtKB(currentAvgBlobKB),                                   c: "var(--accent)", hint: "totalStorage / activeBlobs" },
+            ].map(({ label, val, c, hint }: any) => (
               <div key={label} style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 10, padding: "12px 16px", flex: 1 }}>
                 <div style={{ fontSize: 11, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 4 }}>{str(label)}</div>
                 <div style={{ fontSize: 18, fontWeight: 800, color: c, fontFamily: "monospace" }}>{str(val)}</div>
@@ -709,7 +735,7 @@ export default function ChartsPage() {
       </Sec>
 
       <Sec title="Block Performance" sub="Block height progression">
-        <Card title="Block Height" latest={str(latest ? `#${num(latest.blockHeight).toLocaleString("en-US")}` : undefined)} color="var(--accent)">
+        <Card title="Block Height" latest={str(latest?.blockHeight ? `#${num(latest.blockHeight).toLocaleString("en-US")}` : latestTs?.blockHeight ? `#${latestTs.blockHeight.toLocaleString()}` : undefined)} color="var(--accent)">
           <Chart series={[{ data: cd.map(p => num(p.blockHeight)).filter(v => v > 0), color: "var(--accent)", name: "Block", fmt: v => `#${Math.round(v).toLocaleString("en-US")}` }]} labels={labels} height={130} />
         </Card>
       </Sec>

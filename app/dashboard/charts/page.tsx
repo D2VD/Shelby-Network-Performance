@@ -1,20 +1,13 @@
 "use client";
 /**
- * app/dashboard/charts/page.tsx — v21.0
+ * app/dashboard/charts/page.tsx — v22.0
  *
- * FIX ts(2345) "safeSet" errors:
- * Root cause: safeSet<T> generic infers T from the literal value (e.g. null → T=null,
- * [] → T=never[]), not from the Dispatch type, causing type mismatch.
- *
- * Solution: Remove safeSet entirely. Guard each setState call directly with
- * `if (mounted.current) setter(value)` — fully type-safe because TypeScript
- * already knows the type from the useState<T> declaration.
- *
- * All other fixes from v20 preserved:
- * - useLiveUTCClock cleanup via mounted ref
- * - CSS color props never pass through str()
- * - config?.label safe access
- * - 503 / network error banner
+ * FIXES:
+ * 1. Rules of Hooks violation: useCallback(toIdx) was called AFTER early return
+ *    → moved ALL hooks to top of Chart(), early return converted to hasData flag
+ * 2. Hydration mismatch: useLiveUTCClock rendered time on server ≠ client
+ *    → clock initialized as "" (empty string), filled only after mount
+ * 3. VPS confirmed working — revert route changes, keep direct VPS proxy
  */
 
 import { useEffect, useState, useRef, useCallback } from "react";
@@ -50,7 +43,6 @@ const PG   = 15;
 const TESTNET_CONTRACT = "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-/** Safe JSX text coercion. NEVER use for CSS property values. */
 function str(v: unknown): string {
   if (v == null)              return "—";
   if (typeof v === "string")  return v.trim() || "—";
@@ -58,34 +50,13 @@ function str(v: unknown): string {
   if (typeof v === "boolean") return v ? "true" : "false";
   return "—";
 }
+function num(v: unknown, fb = 0): number { const n = Number(v); return isFinite(n) ? n : fb; }
+function fmtN(v: unknown): string { const n = num(v); return n === 0 ? "—" : Math.round(n).toLocaleString("en-US"); }
+function fmtGB(v: unknown): string { const n = num(v); return n === 0 ? "—" : `${n.toFixed(2)} GB`; }
+function fmtKbs(v: unknown): string { const n = num(v); if (n === 0) return "—"; return n >= 1024 ? `${(n / 1024).toFixed(2)} MB/s` : `${n.toFixed(1)} KB/s`; }
+function fmtMs(v: unknown): string { const n = num(v); if (n === 0) return "—"; return n >= 1000 ? `${(n / 1000).toFixed(2)}s` : `${n.toFixed(0)}ms`; }
+function fmtKB(v: unknown): string { const n = num(v); if (n === 0) return "—"; return n >= 1024 ? `${(n / 1024).toFixed(1)} MB` : `${n.toFixed(0)} KB`; }
 
-function num(v: unknown, fb = 0): number {
-  const n = Number(v);
-  return isFinite(n) ? n : fb;
-}
-function fmtN(v: unknown): string {
-  const n = num(v);
-  return n === 0 ? "—" : Math.round(n).toLocaleString("en-US");
-}
-function fmtGB(v: unknown): string {
-  const n = num(v);
-  return n === 0 ? "—" : `${n.toFixed(2)} GB`;
-}
-function fmtKbs(v: unknown): string {
-  const n = num(v);
-  if (n === 0) return "—";
-  return n >= 1024 ? `${(n / 1024).toFixed(2)} MB/s` : `${n.toFixed(1)} KB/s`;
-}
-function fmtMs(v: unknown): string {
-  const n = num(v);
-  if (n === 0) return "—";
-  return n >= 1000 ? `${(n / 1000).toFixed(2)}s` : `${n.toFixed(0)}ms`;
-}
-function fmtKB(v: unknown): string {
-  const n = num(v);
-  if (n === 0) return "—";
-  return n >= 1024 ? `${(n / 1024).toFixed(1)} MB` : `${n.toFixed(0)} KB`;
-}
 function tLbl(tsMs: number, range: TimeRange): string {
   try {
     const d = new Date(tsMs);
@@ -94,10 +65,12 @@ function tLbl(tsMs: number, range: TimeRange): string {
     return `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
   } catch { return ""; }
 }
+
 function computeAvgBlobKB(a: number, gb: number): number {
   if (a <= 0 || gb <= 0) return 0;
   return (gb * 1e9) / a / 1024;
 }
+
 function enrichPoint(s: Record<string, unknown>): TsPoint {
   const activeBlobs = num(s.activeBlobs), totalStorageGB = num(s.totalStorageGB);
   return {
@@ -112,20 +85,24 @@ function enrichPoint(s: Record<string, unknown>): TsPoint {
   };
 }
 
-// ─── Live UTC Clock — cleanup guard ───────────────────────────────────────────
+// ─── Live UTC Clock ─────────────────────────────────────────────────────────────
+// FIX hydration: initialize as "" so server and client both render ""
+// then fill on client after mount. No more server/client mismatch.
 function useLiveUTCClock(): string {
-  const getUTC = () => {
-    const d = new Date();
-    return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}:${String(d.getUTCSeconds()).padStart(2, "0")} UTC`;
-  };
-  const [clock, setClock] = useState<string>(getUTC);
+  const [clock, setClock] = useState<string>(""); // "" on both server and client initially
   const alive = useRef(true);
+
   useEffect(() => {
     alive.current = true;
-    setClock(getUTC());
+    const getUTC = () => {
+      const d = new Date();
+      return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}:${String(d.getUTCSeconds()).padStart(2, "0")} UTC`;
+    };
+    setClock(getUTC()); // set immediately after mount
     const id = setInterval(() => { if (alive.current) setClock(getUTC()); }, 1000);
     return () => { alive.current = false; clearInterval(id); };
   }, []);
+
   return clock;
 }
 
@@ -158,27 +135,59 @@ function DeviceBadge({ h }: { h: Pick<ServerBench, "ip" | "deviceId"> }) {
 }
 
 // ─── Chart ────────────────────────────────────────────────────────────────────
+// FIX Rules of Hooks: ALL hooks are declared at the top of the function,
+// BEFORE any conditional logic or early returns.
+// The early return (when data < 2) is now handled via a `hasData` variable
+// checked AFTER all hooks are declared.
 interface ChartSeries { data: number[]; color: string; name: string; fmt?: (v: number) => string; }
 function Chart({ series, labels, height = 150, perScale = false }: {
   series: ChartSeries[]; labels: string[]; height?: number; perScale?: boolean;
 }) {
   const { isDark } = useTheme();
-  const svgRef  = useRef<SVGSVGElement>(null);
-  const alive   = useRef(true);
+  // ── ALL HOOKS FIRST — before any conditional returns ──────────────────────
+  const svgRef   = useRef<SVGSVGElement>(null);
+  const alive    = useRef(true);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [pinIdx,   setPinIdx]   = useState<number | null>(null);
   const [inChart,  setInChart]  = useState(false);
 
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
+  // Compute layout constants (safe to compute always)
   const VW = 600, PL = 56, PR = 12, PT = 16, PB = 24;
   const iW = VW - PL - PR, iH = height - PT - PB;
   const n  = Math.max(...series.map(s => s.data.length), 2);
-  const allV = series.flatMap(s => s.data.filter(v => isFinite(v) && v > 0));
-  if (allV.length < 2) return (
-    <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-dim)", fontSize: 12 }}>Collecting data…</div>
-  );
 
+  // useCallback MUST be declared before any conditional return
+  const toIdx = useCallback((e: React.MouseEvent<SVGSVGElement>): number => {
+    const svgEl = svgRef.current;
+    if (!svgEl) return 0;
+    try {
+      const pt = svgEl.createSVGPoint();
+      pt.x = e.clientX; pt.y = e.clientY;
+      const ctm = svgEl.getScreenCTM();
+      if (!ctm) throw new Error("no CTM");
+      const sp = pt.matrixTransform(ctm.inverse());
+      return Math.round(Math.max(0, Math.min(1, (sp.x - PL) / iW)) * (n - 1));
+    } catch {
+      const rect = svgEl.getBoundingClientRect();
+      return Math.round(Math.max(0, Math.min(1, ((e.clientX - rect.left) / rect.width * VW - PL) / iW)) * (n - 1));
+    }
+  }, [n, iW, PL, VW]);
+
+  // ── NOW check data availability (after all hooks) ─────────────────────────
+  const allV = series.flatMap(s => s.data.filter(v => isFinite(v) && v > 0));
+  const hasData = allV.length >= 2;
+
+  if (!hasData) {
+    return (
+      <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-dim)", fontSize: 12 }}>
+        Collecting data…
+      </div>
+    );
+  }
+
+  // ── Compute derived values (only when hasData) ────────────────────────────
   const doms = series.map(s => {
     const vs = s.data.filter(v => isFinite(v) && v > 0);
     if (!vs.length) return { mn: 0, mx: 1 };
@@ -201,26 +210,11 @@ function Chart({ series, labels, height = 150, perScale = false }: {
     if (v >= 1e3) return `${(v / 1e3).toFixed(0)}K`;
     return String(Math.round(v));
   };
-  const toIdx = useCallback((e: React.MouseEvent<SVGSVGElement>): number => {
-    const svgEl = svgRef.current;
-    if (!svgEl) return 0;
-    try {
-      const pt = svgEl.createSVGPoint();
-      pt.x = e.clientX; pt.y = e.clientY;
-      const ctm = svgEl.getScreenCTM();
-      if (!ctm) throw new Error("no CTM");
-      const sp = pt.matrixTransform(ctm.inverse());
-      return Math.round(Math.max(0, Math.min(1, (sp.x - PL) / iW)) * (n - 1));
-    } catch {
-      const rect = svgEl.getBoundingClientRect();
-      return Math.round(Math.max(0, Math.min(1, ((e.clientX - rect.left) / rect.width * VW - PL) / iW)) * (n - 1));
-    }
-  }, [n, iW, PL, VW]);
 
-  const active  = pinIdx ?? hoverIdx;
-  const gc      = isDark ? "#1e3a5f" : "#e5e7eb";
-  const tc      = "var(--text-dim)";
-  const ticks   = [0, 0.25, 0.5, 0.75, 1].map(f => ({ f, v: perScale ? doms[0].mn + f * (doms[0].mx - doms[0].mn) : gMn + f * (gMx - gMn) }));
+  const active     = pinIdx ?? hoverIdx;
+  const gc         = isDark ? "#1e3a5f" : "#e5e7eb";
+  const tc         = "var(--text-dim)";
+  const ticks      = [0, 0.25, 0.5, 0.75, 1].map(f => ({ f, v: perScale ? doms[0].mn + f * (doms[0].mx - doms[0].mn) : gMn + f * (gMx - gMn) }));
   const tipOnRight = active !== null ? active < n * 0.5 : true;
   const tipXpct    = active !== null ? xp(active) / VW * 100 : 50;
 
@@ -311,7 +305,7 @@ function Chart({ series, labels, height = 150, perScale = false }: {
   );
 }
 
-// ─── Testnet stats ────────────────────────────────────────────────────────────
+// ─── Testnet stats ─────────────────────────────────────────────────────────────
 async function fetchTestnetStats(): Promise<TestnetStats | null> {
   try {
     const r = await fetch("/api/geo-sync/stats/live?network=testnet");
@@ -319,17 +313,20 @@ async function fetchTestnetStats(): Promise<TestnetStats | null> {
     const j = await r.json() as Record<string, unknown>;
     const d  = (j?.data ?? {}) as Record<string, unknown>;
     return {
-      blockHeight: num(d.blockHeight), ledgerVersion: num(d.ledgerVersion),
-      chainId: num(d.chainId) || 2, activeBlobs: num(d.activeBlobs),
-      slices: num(d.slices), placementGroups: num(d.placementGroups),
-      storageProviders: num(d.storageProviders),
+      blockHeight:         num(d.blockHeight),
+      ledgerVersion:       num(d.ledgerVersion),
+      chainId:             num(d.chainId) || 2,
+      activeBlobs:         num(d.activeBlobs),
+      slices:              num(d.slices),
+      placementGroups:     num(d.placementGroups),
+      storageProviders:    num(d.storageProviders),
       waitlistedProviders: num(d.waitlistedProviders),
-      indexerStatus: String(d.indexerStatus ?? "unknown"),
+      indexerStatus:       String(d.indexerStatus ?? "unknown"),
     };
   } catch (e) { console.warn("[testnet stats]", e); return null; }
 }
 
-// ─── UI Components ────────────────────────────────────────────────────────────
+// ─── UI Components ─────────────────────────────────────────────────────────────
 function Sec({ title, sub, children, right }: { title: string; sub?: string; children: React.ReactNode; right?: React.ReactNode }) {
   return (
     <div style={{ marginBottom: 32 }}>
@@ -346,7 +343,6 @@ function Sec({ title, sub, children, right }: { title: string; sub?: string; chi
 }
 
 function Card({ title, sub, latest, color, children }: { title: string; sub?: string; latest?: string; color?: string; children: React.ReactNode }) {
-  const safeColor = color || "var(--text-primary)";
   return (
     <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 13, padding: "16px 18px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
@@ -354,7 +350,7 @@ function Card({ title, sub, latest, color, children }: { title: string; sub?: st
           <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-secondary)" }}>{str(title)}</div>
           {sub && <div style={{ fontSize: 11, color: "var(--text-dim)" }}>{str(sub)}</div>}
         </div>
-        {latest && <div style={{ fontFamily: "monospace", fontSize: 15, fontWeight: 800, color: safeColor }}>{str(latest)}</div>}
+        {latest && <div style={{ fontFamily: "monospace", fontSize: 15, fontWeight: 800, color: color || "var(--text-primary)" }}>{str(latest)}</div>}
       </div>
       {children}
     </div>
@@ -415,16 +411,15 @@ function Pager({ total, page, per, set }: { total: number; page: number; per: nu
   );
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── Main ──────────────────────────────────────────────────────────────────────
 export default function ChartsPage() {
   const { network, config } = useNetwork();
   const networkLabel = config?.label ?? network ?? "Shelbynet";
-  const clock        = useLiveUTCClock();
+  const clock        = useLiveUTCClock(); // "" on server, fills after mount
   const alive        = useRef(true);
 
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
-  // ── State ── All setState types explicitly declared so TypeScript is happy ──
   const [range,          setRange]          = useState<TimeRange>("24h");
   const [ts,             setTs]             = useState<TsPoint[]>([]);
   const [ts48h,          setTs48h]          = useState<TsPoint[]>([]);
@@ -437,18 +432,10 @@ export default function ChartsPage() {
   const [fetchError,     setFetchError]     = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // ── FIX ts(2345): No safeSet wrapper. Direct mounted guard per setState. ───
-  // TypeScript already knows each setter's type from useState<T> declaration.
-  // The generic safeSet<T> was broken because TS inferred T from the literal,
-  // e.g. safeSet(setFetchError, null) → T=null ≠ string|null → ts(2345).
-
   const fetchLive = useCallback(async (net: string) => {
     try {
       const r = await fetch(`/api/network/stats/live?network=${net}`);
-      if (!r.ok) {
-        if (alive.current) setFetchError(`Backend returned ${r.status}`);
-        return;
-      }
+      if (!r.ok) { if (alive.current) setFetchError(`Backend returned ${r.status}`); return; }
       if (alive.current) setFetchError(null);
       const j = await r.json() as Record<string, unknown>;
       const d  = (j?.data ?? j ?? {}) as Record<string, unknown>;
@@ -553,7 +540,7 @@ export default function ChartsPage() {
   const avgLatency   = allBench.length ? allBench.reduce((s, h) => s + num(h.latencyAvg),   0) / allBench.length : 0;
   const avgTxConfirm = allBench.length ? allBench.reduce((s, h) => s + num(h.txConfirmMs),  0) / allBench.length : 0;
 
-  // ── Testnet view ─────────────────────────────────────────────────────────────
+  // ── Testnet view ──────────────────────────────────────────────────────────────
   if (network === "testnet") {
     const ts_ = testnetStats;
     return (
@@ -566,7 +553,8 @@ export default function ChartsPage() {
             </p>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <span style={{ fontFamily: "monospace", fontSize: 12, color: "var(--text-dim)", background: "var(--bg-card)", border: "1px solid var(--border)", padding: "4px 10px", borderRadius: 7 }}>🕐 {clock}</span>
+            {/* clock is "" on server, filled after mount → no hydration mismatch */}
+            {clock && <span style={{ fontFamily: "monospace", fontSize: 12, color: "var(--text-dim)", background: "var(--bg-card)", border: "1px solid var(--border)", padding: "4px 10px", borderRadius: 7 }}>🕐 {clock}</span>}
             <button onClick={fetchTestnet} disabled={testnetLoading} style={{ padding: "7px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600, background: "var(--bg-card)", border: "1px solid var(--border)", color: "var(--text-muted)", cursor: "pointer" }}>
               {testnetLoading ? "Loading…" : "⟳ Refresh"}
             </button>
@@ -645,7 +633,7 @@ export default function ChartsPage() {
     );
   }
 
-  // ── Shelbynet view ────────────────────────────────────────────────────────────
+  // ── Shelbynet view ─────────────────────────────────────────────────────────────
   return (
     <div style={{ background: "var(--bg-primary)", minHeight: "100vh", padding: "28px 36px 48px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 28 }}>
@@ -654,7 +642,7 @@ export default function ChartsPage() {
           <p style={{ fontSize: 13, color: "var(--text-muted)", margin: "4px 0 0" }}>{networkLabel} · Refresh every {POLL / 1000}s</p>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <span style={{ fontFamily: "monospace", fontSize: 12, color: "var(--text-dim)", background: "var(--bg-card)", border: "1px solid var(--border)", padding: "4px 10px", borderRadius: 7, minWidth: 110, textAlign: "center" }}>🕐 {clock}</span>
+          {clock && <span style={{ fontFamily: "monospace", fontSize: 12, color: "var(--text-dim)", background: "var(--bg-card)", border: "1px solid var(--border)", padding: "4px 10px", borderRadius: 7, minWidth: 110, textAlign: "center" }}>🕐 {clock}</span>}
           <button onClick={() => { fetchLive(network); fetchTs48h(network); fetchBench(); }} style={{ padding: "7px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600, background: "var(--bg-card)", border: "1px solid var(--border)", color: "var(--text-muted)", cursor: "pointer" }}>
             ⟳ Refresh
           </button>
@@ -753,7 +741,6 @@ export default function ChartsPage() {
                 </div>
               ))}
             </div>
-
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
               <Card title="Score History" sub="All users · all time" latest={str(allBench[0]?.score)} color="#818cf8">
                 <Chart series={[{ data: benchChronological.map(h => num(h.score)), color: "#818cf8", name: "Score", fmt: v => `${Math.round(v)}/1000` }]} labels={benchLabels} height={130} />
@@ -768,7 +755,6 @@ export default function ChartsPage() {
                 <Chart series={[{ data: benchChronological.map(h => num(h.txConfirmMs)), color: "#fb923c", name: "TX Confirm", fmt: v => fmtMs(v) }]} labels={benchLabels} height={130} />
               </Card>
             </div>
-
             <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 12, overflow: "hidden" }}>
               <div style={{ padding: "13px 18px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
                 <div>

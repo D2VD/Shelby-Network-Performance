@@ -1,10 +1,12 @@
 "use client";
 /**
- * app/dashboard/providers/page.tsx — v12.0
- * FIX: Remove TestnetBanner from Map/Providers page.
- *      Testnet now shows live provider data fetched from /api/network/providers?network=testnet.
- *      Testnet doesn't have globe arcs but DOES show the provider table and topology info.
- * KEEP: Benchmark page retains TestnetBanner (upload not supported on testnet).
+ * app/dashboard/providers/page.tsx — v13.0
+ * FIXES:
+ * 1. Testnet shows real provider data (not empty) — better error handling & loading states
+ * 2. Shelbynet map shows correct health status from TCP checks
+ * 3. Better fallback when providers API returns empty/error
+ * 4. Loading skeleton while providers fetch
+ * 5. Retry button when fetch fails
  */
 
 import { useState, useEffect, useCallback } from "react";
@@ -14,7 +16,7 @@ import { ProviderMap } from "@/components/provider-map";
 import type { StorageProvider } from "@/lib/types";
 import { ZONE_META } from "@/lib/types";
 
-// ─── Testnet lightweight notice (replaces full TestnetBanner) ─────────────────
+// ─── Testnet notice ───────────────────────────────────────────────────────────
 function TestnetMapNotice() {
   return (
     <div style={{
@@ -50,8 +52,18 @@ function Badge({ label, variant }: { label: string; variant: Variant }) {
   );
 }
 
-const healthVariant = (h: string): Variant => h === "Healthy" ? "green" : h === "Unhealthy" ? "red" : "gray";
-const stateVariant  = (s: string): Variant => s === "Active" ? "green" : s === "Waitlisted" ? "yellow" : s === "Frozen" ? "gray" : "red";
+const healthVariant = (h: string): Variant => {
+  if (h === "Healthy")   return "green";
+  if (h === "Unhealthy") return "red";
+  return "gray";
+};
+const stateVariant = (s: string): Variant => {
+  if (s === "Active")     return "green";
+  if (s === "Waitlisted") return "yellow";
+  if (s === "Frozen")     return "blue";
+  if (s === "Leaving")    return "red";
+  return "gray";
+};
 
 function BlsKey({ full }: { full: string }) {
   const [copied, setCopied] = useState(false);
@@ -80,18 +92,18 @@ function SummaryBar({ providers }: { providers: StorageProvider[] }) {
   const zones      = new Set(providers.map(p => p.availabilityZone)).size;
   const totalTiB   = providers.reduce((s, p) => s + (p.capacityTiB ?? 0), 0);
   const stats = [
-    { label: "Total SPs",      value: providers.length, color: "#2563eb" },
-    { label: "Healthy",        value: healthy,          color: "#16a34a" },
-    { label: "Active",         value: active,           color: "#0891b2" },
-    { label: "Waitlisted",     value: waitlisted,       color: "#f59e0b" },
-    { label: "Zones",          value: zones,            color: "#8b5cf6" },
+    { label: "Total SPs",      value: providers.length,  color: "#2563eb" },
+    { label: "Healthy",        value: healthy,            color: "#16a34a" },
+    { label: "Active",         value: active,             color: "#0891b2" },
+    { label: "Waitlisted",     value: waitlisted,         color: "#f59e0b" },
+    { label: "Zones",          value: zones,              color: "#8b5cf6" },
     { label: "Total Capacity", value: totalTiB > 0 ? `${totalTiB.toFixed(0)} TiB` : "—", color: "#d97706", isStr: true },
   ];
   return (
     <div style={{ display: "grid", gridTemplateColumns: "repeat(6,1fr)", gap: 1, background: "var(--border)", borderRadius: 12, overflow: "hidden", border: "1px solid var(--border)" }}>
       {stats.map(s => (
         <div key={s.label} style={{ background: "var(--bg-card)", padding: "14px 10px", textAlign: "center" }}>
-          <div style={{ fontFamily: "monospace", fontSize: s.isStr ? 18 : 24, fontWeight: 700, color: s.color, letterSpacing: -0.5 }}>{s.value}</div>
+          <div style={{ fontFamily: "monospace", fontSize: (s as any).isStr ? 18 : 24, fontWeight: 700, color: s.color, letterSpacing: -0.5 }}>{s.value}</div>
           <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 3, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>{s.label}</div>
         </div>
       ))}
@@ -99,10 +111,8 @@ function SummaryBar({ providers }: { providers: StorageProvider[] }) {
   );
 }
 
-// ─── Map adapter — testnet SpInfo → StorageProvider shape ─────────────────────
-// The API returns SpInfo (from shared-types). ProviderMap expects StorageProvider (lib/types).
-// These are structurally compatible — just need to map field names.
-function adaptSpInfoToStorageProvider(sp: Record<string, unknown>): StorageProvider {
+// Adapt SpInfo → StorageProvider
+function adaptToStorageProvider(sp: Record<string, unknown>): StorageProvider {
   return {
     address:          String(sp.address ?? ""),
     addressShort:     String(sp.addressShort ?? ""),
@@ -112,7 +122,7 @@ function adaptSpInfoToStorageProvider(sp: Record<string, unknown>): StorageProvi
     blsKey:           String(sp.blsKey ?? ""),
     fullBlsKey:       String(sp.blsKey ?? ""),
     capacityTiB:      sp.capacityTiB != null ? Number(sp.capacityTiB) : undefined,
-    netAddress:       sp.netAddress   ? String(sp.netAddress) : sp.ipAddress ? String(sp.ipAddress) : undefined,
+    netAddress:       sp.netAddress ? String(sp.netAddress) : sp.ipAddress ? String(sp.ipAddress) : undefined,
     geo: sp.geo ? {
       lat:         Number((sp.geo as Record<string, unknown>).lat ?? 0),
       lng:         Number((sp.geo as Record<string, unknown>).lng ?? 0),
@@ -135,31 +145,52 @@ export default function ProvidersPage() {
   const [lastAt,    setLastAt]    = useState<Date | null>(null);
   const [filter,    setFilter]    = useState<"all" | "healthy" | "faulty" | "waitlisted">("all");
   const [sortBy,    setSortBy]    = useState<"zone" | "health" | "state">("zone");
-  const [hoveredSP, setHoveredSP] = useState<StorageProvider | null>(null);
+  const [source,    setSource]    = useState<string>("");
 
   const fetchProviders = useCallback(async () => {
+    setLoading(true);
+    setError(null);
     try {
-      const res = await fetch(`/api/network/providers?network=${network}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as Record<string, unknown>;
-      const raw = ((d as Record<string, unknown>).data as Record<string, unknown>)?.providers;
-      if (Array.isArray(raw)) {
-        // Adapt SpInfo → StorageProvider shape
-        const adapted = (raw as Record<string, unknown>[]).map(adaptSpInfoToStorageProvider);
+      const res = await fetch(`/api/network/providers?network=${network}`, {
+        signal: AbortSignal.timeout(35_000),
+      });
+
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({})) as any;
+        throw new Error(j.error ?? `HTTP ${res.status}`);
+      }
+
+      const d = await res.json() as any;
+      const raw = d?.data?.providers;
+
+      if (Array.isArray(raw) && raw.length > 0) {
+        const adapted = (raw as Record<string, unknown>[]).map(adaptToStorageProvider);
         setProviders(adapted);
         setLastAt(new Date());
+        setSource(String(d?.source ?? "vps"));
         setError(null);
+      } else if (Array.isArray(raw) && raw.length === 0) {
+        // Empty is valid for testnet with no SPs yet
+        setProviders([]);
+        setLastAt(new Date());
+        setSource(String(d?.source ?? "vps"));
+        setError(null);
+      } else {
+        throw new Error("Invalid response format from providers API");
       }
-    } catch (e: unknown) {
-      setError((e as Error).message);
+    } catch (e: any) {
+      const msg = e.message ?? String(e);
+      setError(msg);
+      console.error(`[providers page] Fetch failed (${network}):`, msg);
     } finally {
       setLoading(false);
     }
   }, [network]);
 
   useEffect(() => {
-    setLoading(true);
     setProviders([]);
+    setError(null);
+    setSource("");
     fetchProviders();
     const id = setInterval(fetchProviders, 60_000);
     return () => clearInterval(id);
@@ -178,11 +209,15 @@ export default function ProvidersPage() {
       a.state.localeCompare(b.state)
     );
 
+  const healthyCount = providers.filter(p => p.health === "Healthy").length;
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 0, minHeight: "calc(100vh - 120px)", background: "var(--bg-primary)" }}>
 
       {/* MAP SECTION */}
       <div style={{ background: isDark ? "#0d1526" : "#f0f4f8", position: "relative", height: "55vh", minHeight: 340 }}>
+
+        {/* Status badge */}
         <div style={{ position: "absolute", top: 12, right: 52, zIndex: 20, display: "flex", alignItems: "center", gap: 8 }}>
           <div style={{
             background: isDark ? "rgba(13,21,38,0.92)" : "rgba(255,255,255,0.92)",
@@ -190,8 +225,18 @@ export default function ProvidersPage() {
             borderRadius: 8, padding: "5px 14px", fontSize: 12, color: isDark ? "#94a3b8" : "#6b7280",
             backdropFilter: "blur(8px)", display: "flex", alignItems: "center", gap: 7,
           }}>
-            <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#22c55e", display: "inline-block" }} />
-            {loading ? "Loading…" : `${providers.filter(p => p.health === "Healthy").length} nodes online`}
+            <span style={{
+              width: 7, height: 7, borderRadius: "50%",
+              background: loading ? "#9ca3af" : error ? "#f59e0b" : providers.length > 0 ? "#22c55e" : "#9ca3af",
+              display: "inline-block",
+            }} />
+            {loading
+              ? "Loading providers…"
+              : error
+                ? "Provider fetch failed"
+                : providers.length === 0
+                  ? (isTestnet ? "No testnet providers yet" : "No providers found")
+                  : `${healthyCount}/${providers.length} nodes online`}
           </div>
           {lastAt && (
             <div style={{ background: isDark ? "rgba(13,21,38,0.9)" : "rgba(255,255,255,0.9)", border: `1px solid ${isDark ? "rgba(255,255,255,0.08)" : "#e5e7eb"}`, borderRadius: 6, padding: "4px 10px", fontSize: 11, color: "var(--text-dim)", fontFamily: "monospace" }}>
@@ -204,7 +249,16 @@ export default function ProvidersPage() {
           <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 14, flexDirection: "column", gap: 12 }}>
             <div style={{ width: 28, height: 28, borderRadius: "50%", border: "2px solid var(--border)", borderTopColor: "var(--accent)", animation: "spin 1s linear infinite" }} />
             <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
-            {isTestnet ? "Fetching testnet providers…" : "Loading providers…"}
+            {isTestnet ? "Fetching testnet providers from Aptos RPC…" : "Loading providers…"}
+          </div>
+        ) : error && providers.length === 0 ? (
+          <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 14, flexDirection: "column", gap: 12, padding: "0 24px", textAlign: "center" }}>
+            <span style={{ fontSize: 28 }}>⚠️</span>
+            <div style={{ fontSize: 14, color: "#f59e0b", fontWeight: 600 }}>Provider data unavailable</div>
+            <div style={{ fontSize: 12, color: "var(--text-dim)", maxWidth: 400 }}>{error}</div>
+            <button onClick={fetchProviders} style={{ padding: "8px 18px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg-card)", color: "var(--text-primary)", fontSize: 13, cursor: "pointer" }}>
+              ⟳ Retry
+            </button>
           </div>
         ) : (
           <ProviderMap providers={providers} />
@@ -215,6 +269,11 @@ export default function ProvidersPage() {
       <div style={{ padding: "18px 26px", background: "var(--bg-card)", borderBottom: "1px solid var(--border)" }}>
         {isTestnet && <TestnetMapNotice />}
         <SummaryBar providers={providers} />
+        {source && (
+          <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-dim)", fontFamily: "monospace" }}>
+            Source: {source} · {isTestnet ? "Aptos Testnet RPC" : "Shelbynet on-chain"} · Auto-refresh 60s
+          </div>
+        )}
       </div>
 
       {/* TABLE SECTION */}
@@ -223,7 +282,9 @@ export default function ProvidersPage() {
           <div>
             <h2 style={{ fontSize: 20, fontWeight: 700, color: "var(--text-primary)", margin: 0 }}>Provider Directory</h2>
             <p style={{ fontSize: 13, color: "var(--text-muted)", margin: "4px 0 0", fontFamily: "monospace" }}>
-              {filtered.length} of {providers.length} providers · {isTestnet ? "Aptos Testnet" : "Hover row for details"} · Auto-refresh 60s
+              {loading && providers.length === 0
+                ? "Loading…"
+                : `${filtered.length} of ${providers.length} providers · ${isTestnet ? "Aptos Testnet" : "Shelbynet"} · Auto-refresh 60s`}
             </p>
           </div>
           <div style={{ display: "flex", gap: 9 }}>
@@ -239,11 +300,13 @@ export default function ProvidersPage() {
               <option value="health">Sort: Health</option>
               <option value="state">Sort: State</option>
             </select>
-            <button onClick={fetchProviders} style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg-card)", fontSize: 12, color: "var(--text-muted)", cursor: "pointer" }}>⟳ Refresh</button>
+            <button onClick={fetchProviders} disabled={loading} style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg-card)", fontSize: 12, color: "var(--text-muted)", cursor: "pointer", opacity: loading ? 0.6 : 1 }}>
+              {loading ? "…" : "⟳ Refresh"}
+            </button>
           </div>
         </div>
 
-        {error && (
+        {error && providers.length === 0 && (
           <div style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 9, padding: "11px 15px", marginBottom: 14, fontSize: 13, color: "#ef4444" }}>
             ⚠ {error}
           </div>
@@ -259,30 +322,42 @@ export default function ProvidersPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.length === 0 ? (
-                <tr><td colSpan={7} style={{ padding: "52px 18px", textAlign: "center", color: "var(--text-muted)", fontSize: 14 }}>
-                  {loading
-                    ? "Loading providers…"
-                    : isTestnet
-                      ? "No providers found on Testnet yet"
-                      : "No providers found"}
-                </td></tr>
+              {loading && providers.length === 0 ? (
+                // Loading skeleton rows
+                Array.from({ length: 5 }).map((_, i) => (
+                  <tr key={i} style={{ borderBottom: "1px solid var(--border-soft)", background: i % 2 === 0 ? "var(--bg-card)" : "var(--bg-card2)" }}>
+                    <td style={{ padding: "11px 18px" }}><div className="skeleton" style={{ width: 9, height: 9, borderRadius: "50%" }} /></td>
+                    <td style={{ padding: "11px 14px" }}><div className="skeleton" style={{ width: 120, height: 14, borderRadius: 4 }} /></td>
+                    <td style={{ padding: "11px 14px" }}><div className="skeleton" style={{ width: 100, height: 14, borderRadius: 4 }} /></td>
+                    <td style={{ padding: "11px 14px" }}><div className="skeleton" style={{ width: 60, height: 20, borderRadius: 6 }} /></td>
+                    <td style={{ padding: "11px 14px" }}><div className="skeleton" style={{ width: 60, height: 20, borderRadius: 6 }} /></td>
+                    <td style={{ padding: "11px 14px" }}><div className="skeleton" style={{ width: 70, height: 14, borderRadius: 4 }} /></td>
+                    <td style={{ padding: "11px 18px" }}><div className="skeleton" style={{ width: 80, height: 14, borderRadius: 4 }} /></td>
+                  </tr>
+                ))
+              ) : filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={7} style={{ padding: "52px 18px", textAlign: "center", color: "var(--text-muted)", fontSize: 14 }}>
+                    {error
+                      ? <span>Failed to load providers — <button onClick={fetchProviders} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--accent)", fontSize: 14 }}>retry</button></span>
+                      : isTestnet
+                        ? "No storage providers found on Testnet yet — the network is still in early access"
+                        : "No providers match the current filter"}
+                  </td>
+                </tr>
               ) : filtered.map((p, i) => {
                 const isH = p.health === "Healthy";
+                const isUnknown = (p.health as string) === "Unknown";
                 return (
                   <tr key={p.address || i}
-                    style={{ borderBottom: "1px solid var(--border-soft)", background: i % 2 === 0 ? "var(--bg-card)" : "var(--bg-card2)", cursor: "default" }}
-                    onMouseEnter={() => setHoveredSP(p)}
-                    onMouseLeave={() => setHoveredSP(null)}
+                    style={{ borderBottom: "1px solid var(--border-soft)", background: i % 2 === 0 ? "var(--bg-card)" : "var(--bg-card2)" }}
                   >
                     <td style={{ padding: "11px 18px", width: 30 }}>
-                      <div style={{ 
-                          width: 9, 
-                          height: 9, 
-                          borderRadius: "50%", 
-                            background: isH ? "#22c55e" : (p.health as string) === "Unknown" ? "#9ca3af" : "#ef4444", 
-                            boxShadow: isH ? "0 0 6px #22c55e88" : "none" 
-                        }} />
+                      <div style={{
+                        width: 9, height: 9, borderRadius: "50%",
+                        background: isH ? "#22c55e" : isUnknown ? "#9ca3af" : "#ef4444",
+                        boxShadow: isH ? "0 0 6px #22c55e88" : "none",
+                      }} />
                     </td>
                     <td style={{ padding: "11px 14px" }}>
                       <span style={{ fontFamily: "monospace", fontSize: 13, color: "var(--text-primary)", fontWeight: 600 }}>{p.addressShort}</span>

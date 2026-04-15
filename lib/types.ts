@@ -1,4 +1,4 @@
-// lib/types.ts — Shared TypeScript types (v2.0 — Phase 3 update)
+// lib/types.ts — Shared TypeScript types (v2.1 — add Unknown health state)
 
 // ── Network / Node ────────────────────────────────────────────────────────────
 export interface NodeInfo {
@@ -30,7 +30,8 @@ export interface GeoLocation {
 
 // ── Storage Provider ──────────────────────────────────────────────────────────
 export type ProviderState  = "Active" | "Waitlisted" | "Frozen" | "Leaving";
-export type ProviderHealth = "Healthy" | "Faulty";
+// FIX ts(2367): Added "Unknown" — used for SPs without TCP check or no IP
+export type ProviderHealth = "Healthy" | "Faulty" | "Unhealthy" | "Unknown";
 export type AvailabilityZone =
   | "dc_asia"
   | "dc_australia"

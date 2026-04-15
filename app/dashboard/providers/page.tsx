@@ -51,8 +51,8 @@ function Badge({ label, variant }: { label: string; variant: Variant }) {
 }
 
 const healthVariant = (h: string): Variant => {
-  if (h === "Healthy") return "green";
-  if (h === "Faulty")  return "red"; // Đổi Unhealthy -> Faulty
+  if (h === "Healthy")   return "green";
+  if (h === "Unhealthy") return "red";
   return "gray";
 };
 const stateVariant = (s: string): Variant => {
@@ -114,6 +114,7 @@ function SummaryBar({ providers }: { providers: StorageProvider[] }) {
 // Adapt API SpInfo → StorageProvider (handles testnet AZ names like "Stakely-0")
 function adaptToStorageProvider(sp: Record<string, unknown>): StorageProvider {
   const az = String(sp.availabilityZone ?? "unknown");
+  // Map custom AZ names to ZONE_META keys or keep as-is
   const azMapped = az.startsWith("dc_") ? az : az;
 
   return {
@@ -121,8 +122,7 @@ function adaptToStorageProvider(sp: Record<string, unknown>): StorageProvider {
     addressShort:     String(sp.addressShort ?? ""),
     availabilityZone: azMapped,
     state:            String(sp.state ?? "Active") as StorageProvider["state"],
-    // NEW LOGIC: Tránh dùng "Unknown" nếu Type StorageProvider["health"] không hỗ trợ
-    health: (String(sp.health ?? "Unhealthy")) as StorageProvider["health"], 
+    health:           String(sp.health ?? "Unknown") as StorageProvider["health"],
     blsKey:           String(sp.blsKey ?? ""),
     fullBlsKey:       String(sp.blsKey ?? ""),
     capacityTiB:      sp.capacityTiB != null ? Number(sp.capacityTiB) : undefined,
@@ -197,12 +197,12 @@ export default function ProvidersPage() {
   }, [fetchProviders]);
 
   const filtered = providers
-  .filter(p => {
-    if (filter === "healthy")    return p.health === "Healthy";
-    if (filter === "faulty")     return p.health === "Faulty"; // Dùng Faulty
-    if (filter === "waitlisted") return p.state  === "Waitlisted";
-    return true;
-  })
+    .filter(p => {
+      if (filter === "healthy")    return p.health === "Healthy";
+      if (filter === "faulty")     return p.health !== "Healthy" && p.health !== "Unknown";
+      if (filter === "waitlisted") return p.state  === "Waitlisted";
+      return true;
+    })
     .sort((a, b) =>
       sortBy === "zone"   ? (a.availabilityZone ?? "").localeCompare(b.availabilityZone ?? "") :
       sortBy === "health" ? a.health.localeCompare(b.health) :
@@ -358,7 +358,7 @@ export default function ProvidersPage() {
                 </tr>
               ) : filtered.map((p, i) => {
                 const isH      = p.health === "Healthy";
-                const isUnknown = p.health !== "Healthy" && p.health !== "Faulty";
+                const isUnknown = p.health === "Unknown";
                 const zoneLabel = getZoneLabel(p.availabilityZone);
                 return (
                   <tr key={p.address || i} style={{ borderBottom: "1px solid var(--border-soft)", background: i % 2 === 0 ? "var(--bg-card)" : "var(--bg-card2)" }}>

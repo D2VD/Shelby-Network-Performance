@@ -1,5 +1,6 @@
-// app/api/network/providers/route.ts — v5.0
-// Better error handling, multiple VPS URL fallback, longer timeout for provider metadata
+// app/api/network/providers/route.ts — v6.0
+// FIX: Always request no_tcp=1 — health comes from on-chain condition field
+// This makes providers load FAST (no TCP wait for private IPs)
 
 import { type NextRequest, NextResponse } from "next/server";
 
@@ -13,7 +14,6 @@ const VPS_URLS = [
 
 export async function GET(req: NextRequest) {
   const network = req.nextUrl.searchParams.get("network") ?? "shelbynet";
-  const noTcp   = req.nextUrl.searchParams.get("no_tcp") ?? "";
 
   if (VPS_URLS.length === 0) {
     return NextResponse.json(
@@ -22,19 +22,18 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  const params = new URLSearchParams({ network });
-  if (noTcp) params.set("no_tcp", noTcp);
-
+  // Always no_tcp=1: health derived from on-chain condition field (faster & accurate)
+  // Shelbynet SPs use private IPs (172.16.x.x) unreachable from VPS
+  const params = new URLSearchParams({ network, no_tcp: "1" });
   let lastError = "";
 
   for (const vpsUrl of VPS_URLS) {
     try {
       const controller = new AbortController();
-      // Providers can take longer — SP metadata lookup in batches
-      const timeoutId = setTimeout(() => controller.abort(), 30_000);
+      const timeoutId  = setTimeout(() => controller.abort(), 25_000);
 
       const r = await fetch(`${vpsUrl}/api/geo-sync/providers?${params}`, {
-        signal: controller.signal,
+        signal:  controller.signal,
         headers: { Accept: "application/json" },
       });
 
@@ -42,9 +41,9 @@ export async function GET(req: NextRequest) {
 
       const body = await r.text();
       return new NextResponse(body, {
-        status: r.status,
+        status:  r.status,
         headers: {
-          "Content-Type": "application/json",
+          "Content-Type":  "application/json",
           "Cache-Control": "public, max-age=60, stale-while-revalidate=300",
         },
       });
@@ -54,11 +53,7 @@ export async function GET(req: NextRequest) {
   }
 
   return NextResponse.json(
-    {
-      ok: false,
-      error: `VPS unreachable: ${lastError}`,
-      data: { providers: [], count: 0 },
-    },
+    { ok: false, error: `VPS unreachable: ${lastError}`, data: { providers: [], count: 0 } },
     { status: 503 }
   );
 }

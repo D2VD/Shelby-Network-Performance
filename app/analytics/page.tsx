@@ -1,11 +1,13 @@
 "use client";
 /**
- * app/analytics/page.tsx — v12.0
+ * app/analytics/page.tsx — v13.0
  * FIXES:
- * 1. CRITICAL: Reset snap to null on network change — prevents cross-network contamination
- *    (switching testnet→shelbynet was keeping testnet block height 711M on shelbynet)
- * 2. mergeSnap only preserves values WITHIN the same network fetch cycle
- * 3. Handles node-only-fallback gracefully: if new data has 0 blobs but prev has real data, keep prev
+ * 1. When /stats/live returns 0 blobs (indexer down, empty cache):
+ *    → Fetch /stats/timeseries and use the latest point as baseline
+ *    This ensures Shelbynet data always shows even without live indexer
+ * 2. Error banner: only show when cur.activeBlobs === 0 AND we truly have no data
+ *    (not when data comes from cache but is valid)
+ * 3. Identical layout both networks, same 6 cards + 4 charts
  */
 
 import { useEffect, useState, useCallback, useRef } from "react";
@@ -29,8 +31,8 @@ interface LivePoint {
 const MAX_POINTS = 60;
 const POLL_MS    = 30_000;
 
-function fmt(n: number | null | undefined, fallback = "0"): string {
-  if (n == null) return fallback;
+function fmt(n: number | null | undefined): string {
+  if (n == null) return "—";
   return Math.round(n).toLocaleString("en-US");
 }
 function fmtBytes(b: number | null | undefined): string {
@@ -45,25 +47,22 @@ function fmtTime(ts: number): string {
   return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
 }
 
-// FIX: mergeSnap only preserves values if new data has non-meaningful zeros
-// (i.e., from node-only-fallback) — uses || which treats 0 as falsy
+// Merge: prefer non-zero values, but ONLY within same network
 function mergeSnap(prev: LiveSnap | null, next: LiveSnap): LiveSnap {
   if (!prev) return next;
-  // Only preserve if blobs are 0 in next (node-only-fallback case)
-  const isFallback = next.activeBlobs === 0 && prev.activeBlobs > 0;
-  if (!isFallback) return next; // new data is real — use it as-is
+  // If new data has real blobs, use it as-is
+  if (next.activeBlobs > 0) return next;
+  // New data has 0 blobs (node-only-fallback) — preserve blob counts from prev
   return {
     ...next,
-    // Preserve blob data from previous successful fetch
-    activeBlobs:       prev.activeBlobs,
-    totalBlobEvents:   prev.totalBlobEvents,
-    totalStorageBytes: prev.totalStorageBytes,
-    totalStorageGB:    prev.totalStorageGB,
-    totalStorageGiB:   prev.totalStorageGiB,
-    pendingOrFailed:   prev.pendingOrFailed,
-    deletedBlobs:      prev.deletedBlobs,
-    emptyRecords:      prev.emptyRecords,
-    // Always use new values for: blockHeight, SPs, PGs, slices (come from node, not indexer)
+    activeBlobs:       prev.activeBlobs       || next.activeBlobs,
+    totalBlobEvents:   prev.totalBlobEvents   || next.totalBlobEvents,
+    totalStorageBytes: prev.totalStorageBytes || next.totalStorageBytes,
+    totalStorageGB:    prev.totalStorageGB    || next.totalStorageGB,
+    totalStorageGiB:   prev.totalStorageGiB   || next.totalStorageGiB,
+    pendingOrFailed:   prev.pendingOrFailed   || next.pendingOrFailed,
+    deletedBlobs:      prev.deletedBlobs      || next.deletedBlobs,
+    emptyRecords:      prev.emptyRecords      || next.emptyRecords,
   };
 }
 
@@ -131,7 +130,6 @@ export default function AnalyticsPage() {
   const isTestnet   = network === "testnet";
   const accentColor = isTestnet ? "#9333ea" : "#2563eb";
   const alive       = useRef(true);
-  // FIX: Track which network the current snap belongs to
   const snapNetworkRef = useRef<string>("");
 
   const [snap,      setSnap]      = useState<LiveSnap | null>(null);
@@ -139,17 +137,15 @@ export default function AnalyticsPage() {
   const [loading,   setLoading]   = useState(true);
   const [lastAtStr, setLastAtStr] = useState<string>("");
   const [error,     setError]     = useState<string | null>(null);
-  const [isStale,   setIsStale]   = useState(false);
 
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
-  // FIX: Reset snap when network changes — prevents cross-network contamination
+  // CRITICAL: Reset snap when network changes
   useEffect(() => {
     if (alive.current) {
-      setSnap(null);        // CRITICAL: clear previous network's data
+      setSnap(null);
       setSeries([]);
       setError(null);
-      setIsStale(false);
       setLoading(true);
       snapNetworkRef.current = network;
     }
@@ -157,11 +153,7 @@ export default function AnalyticsPage() {
 
   const applyData = useCallback((data: LiveSnap, forNetwork: string) => {
     if (!alive.current) return;
-    // FIX: Ignore data that arrived for a different network (race condition)
-    if (snapNetworkRef.current !== forNetwork) {
-      console.log(`[analytics] Ignoring stale response for ${forNetwork}, current network: ${snapNetworkRef.current}`);
-      return;
-    }
+    if (snapNetworkRef.current !== forNetwork) return; // stale response
     setSnap(prev => mergeSnap(prev, data));
     setLastAtStr(new Date().toLocaleTimeString());
     setSeries(prev => {
@@ -179,30 +171,66 @@ export default function AnalyticsPage() {
     });
   }, []);
 
-  const fetchStats = useCallback(async () => {
-    const forNetwork = network; // capture at time of call
+  // FIX: Try to seed from timeseries when live returns 0 blobs
+  const seedFromTimeseries = useCallback(async (forNetwork: string): Promise<LiveSnap | null> => {
+    try {
+      const j = await fetch(`/api/network/stats/timeseries?network=${forNetwork}&resolution=5m&range=24h`, { signal: AbortSignal.timeout(10_000) });
+      if (!j.ok) return null;
+      const d = await j.json() as any;
+      const series = d?.data?.series as any[];
+      if (!Array.isArray(series) || series.length === 0) return null;
+      const latest = series[series.length - 1];
+      if (!latest || !latest.activeBlobs) return null;
+      // Build a LiveSnap from the timeseries point
+      return {
+        ts: latest.ts ?? new Date().toISOString(),
+        tsMs: latest.tsMs ?? Date.now(),
+        network: forNetwork,
+        activeBlobs:       Number(latest.activeBlobs      ?? 0),
+        totalBlobEvents:   Number(latest.totalBlobEvents  ?? 0),
+        totalStorageBytes: Number(latest.totalStorageBytes ?? 0) || Number(latest.totalStorageGB ?? 0) * 1e9,
+        totalStorageGB:    Number(latest.totalStorageGB   ?? 0),
+        totalStorageGiB:   Number(latest.totalStorageGiB  ?? 0),
+        storageProviders:  Number(latest.storageProviders ?? 0),
+        placementGroups:   Number(latest.placementGroups  ?? 0),
+        slices:            Number(latest.slices            ?? 0),
+        blockHeight:       Number(latest.blockHeight      ?? 0),
+        ledgerVersion:     Number(latest.ledgerVersion    ?? 0),
+        pendingOrFailed:   Number(latest.pendingOrFailed  ?? 0),
+        deletedBlobs:      Number(latest.deletedBlobs     ?? 0),
+        emptyRecords:      Number(latest.emptyRecords     ?? 0),
+        method: "ts-seeded",
+      } as LiveSnap;
+    } catch { return null; }
+  }, []);
 
-    // 1. Try live endpoint
+  const fetchStats = useCallback(async () => {
+    const forNetwork = network;
+
+    // 1. Try /stats/live
     try {
       const res = await fetch(`/api/network/stats/live?network=${forNetwork}`, { signal: AbortSignal.timeout(18_000) });
-      if (res.status !== 404 && res.status !== 503) {
+      if (res.ok) {
         const j    = await res.json() as any;
         const data = j.data ?? j;
         if (data && (data.blockHeight != null || data.storageProviders != null)) {
-          const method = String(data.method ?? "");
-          const isNodeFallback = method.includes("node-only") || method.includes("fallback");
-          if (alive.current) {
-            setIsStale(method.includes("stale") || method.includes("cache") || isNodeFallback);
-            setError(isNodeFallback ? "Indexer temporarily unavailable — showing cached blob data" : null);
-          }
+          if (alive.current) setError(null);
           applyData(data as LiveSnap, forNetwork);
           if (alive.current) setLoading(false);
+
+          // FIX: If blobs are 0 (node-only-fallback), also try timeseries
+          if ((data.activeBlobs ?? 0) === 0 && !isTestnet) {
+            const tsSnap = await seedFromTimeseries(forNetwork);
+            if (tsSnap && snapNetworkRef.current === forNetwork) {
+              applyData(tsSnap, forNetwork);
+            }
+          }
           return;
         }
       }
     } catch { /* fall through */ }
 
-    // 2. Fallback: cached /stats
+    // 2. Fallback: /stats cached
     try {
       const r2 = await fetch(`/api/network/stats?network=${forNetwork}`, { signal: AbortSignal.timeout(12_000) });
       if (r2.ok) {
@@ -230,16 +258,30 @@ export default function AnalyticsPage() {
             emptyRecords:        Number(s.emptyRecords ?? 0),
             method:              String(d2.statsSource ?? s.statsMethod ?? "cached"),
           };
-          if (alive.current) { setIsStale(true); setError("Live data temporarily unavailable — showing cached data"); }
           applyData(fb, forNetwork);
           if (alive.current) setLoading(false);
+          // Also seed from timeseries if blobs = 0
+          if (fb.activeBlobs === 0 && !isTestnet) {
+            const tsSnap = await seedFromTimeseries(forNetwork);
+            if (tsSnap && snapNetworkRef.current === forNetwork) applyData(tsSnap, forNetwork);
+          }
           return;
         }
       }
     } catch { /* ignore */ }
 
+    // 3. Last resort: timeseries seed
+    if (!isTestnet) {
+      const tsSnap = await seedFromTimeseries(forNetwork);
+      if (tsSnap && snapNetworkRef.current === forNetwork) {
+        applyData(tsSnap, forNetwork);
+        if (alive.current) { setError("Live sync unavailable — showing cached timeseries data"); setLoading(false); }
+        return;
+      }
+    }
+
     if (alive.current) { setError("Backend temporarily unavailable — retrying"); setLoading(false); }
-  }, [network, applyData]);
+  }, [network, isTestnet, applyData, seedFromTimeseries]);
 
   useEffect(() => {
     fetchStats();
@@ -247,7 +289,10 @@ export default function AnalyticsPage() {
     return () => clearInterval(id);
   }, [fetchStats]);
 
-  // Metrics — same 6 cards for both networks
+  // Only show error when we truly have no data
+  const hasData = snap !== null && (snap.blockHeight > 0 || snap.activeBlobs > 0 || snap.storageProviders > 0);
+  const showError = error && !hasData;
+
   const METRICS = isTestnet ? [
     { label: "Active Blobs",      value: fmt(snap?.activeBlobs),          sub: "From Indexer (best-effort)",  icon: "◈", color: "#0891b2" },
     { label: "Storage Providers", value: fmt(snap?.storageProviders),     sub: "Active on testnet",           icon: "◎", color: "#22c55e" },
@@ -266,14 +311,14 @@ export default function AnalyticsPage() {
 
   const CHARTS = isTestnet ? [
     { title: "Block Height",      sub: "Chain progress",       latest: snap?.blockHeight ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—", data: series.map(p => p.blockHeight ?? 0).filter(v => v > 0), color: accentColor },
-    { title: "Active Blobs",      sub: "Indexer (txn count)",  latest: fmt(snap?.activeBlobs), data: series.map(p => p.activeBlobs ?? 0), color: "#0891b2" },
-    { title: "Storage Providers", sub: "Active on testnet",    latest: fmt(snap?.storageProviders), data: series.map(p => p.storageProviders ?? 0), color: "#22c55e" },
-    { title: "Placement Groups",  sub: "Epoch registry",       latest: fmt(snap?.placementGroups), data: series.map(p => p.placementGroups ?? 0), color: "#d97706" },
+    { title: "Active Blobs",      sub: "Indexer (txn count)",  latest: fmt(snap?.activeBlobs), data: series.map(p => p.activeBlobs ?? 0).filter(Boolean), color: "#0891b2" },
+    { title: "Storage Providers", sub: "Active on testnet",    latest: fmt(snap?.storageProviders), data: series.map(p => p.storageProviders ?? 0).filter(Boolean), color: "#22c55e" },
+    { title: "Placement Groups",  sub: "Epoch registry",       latest: fmt(snap?.placementGroups), data: series.map(p => p.placementGroups ?? 0).filter(Boolean), color: "#d97706" },
   ] : [
-    { title: "Active Blobs",      sub: `${POLL_MS/1000}s poll`, latest: fmt(snap?.activeBlobs), data: series.map(p => p.activeBlobs ?? 0).filter(Boolean), color: "#2563eb" },
-    { title: "Block Height",      sub: "Chain progress",        latest: snap?.blockHeight ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—", data: series.map(p => p.blockHeight).filter(v => v > 0), color: "#059669" },
-    { title: "Storage Used",      sub: "Shelby Indexer bytes",  latest: fmtBytes(snap?.totalStorageBytes), data: series.map(p => p.totalStorageBytes ?? 0).filter(Boolean), color: "#9333ea" },
-    { title: "Blob Events",       sub: "blob_activities count", latest: fmt(snap?.totalBlobEvents), data: series.map(p => p.totalBlobEvents ?? 0).filter(Boolean), color: "#d97706" },
+    { title: "Active Blobs",  sub: `${POLL_MS/1000}s poll`, latest: fmt(snap?.activeBlobs), data: series.map(p => p.activeBlobs ?? 0).filter(Boolean), color: "#2563eb" },
+    { title: "Block Height",  sub: "Chain progress",         latest: snap?.blockHeight ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—", data: series.map(p => p.blockHeight).filter(v => v > 0), color: "#059669" },
+    { title: "Storage Used",  sub: "Shelby Indexer bytes",   latest: fmtBytes(snap?.totalStorageBytes), data: series.map(p => p.totalStorageBytes ?? 0).filter(Boolean), color: "#9333ea" },
+    { title: "Blob Events",   sub: "blob_activities count",  latest: fmt(snap?.totalBlobEvents), data: series.map(p => p.totalBlobEvents ?? 0).filter(Boolean), color: "#d97706" },
   ];
 
   return (
@@ -289,7 +334,7 @@ export default function AnalyticsPage() {
           <p style={{ fontSize: 13, color: "var(--text-muted)", margin: "5px 0 0", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
             {isTestnet ? "Shelby Testnet · Aptos Testnet RPC" : "Shelbynet"} · Poll every {POLL_MS/1000}s
             {snap?.method && (
-              <span style={{ fontSize: 11, fontWeight: 600, padding: "1px 7px", borderRadius: 4, background: isStale ? "rgba(245,158,11,0.12)" : "rgba(34,197,94,0.12)", color: isStale ? "#d97706" : "#16a34a" }}>
+              <span style={{ fontSize: 11, fontWeight: 600, padding: "1px 7px", borderRadius: 4, background: "rgba(34,197,94,0.1)", color: "#16a34a" }}>
                 {snap.method}
               </span>
             )}
@@ -297,7 +342,7 @@ export default function AnalyticsPage() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: "var(--text-muted)", fontFamily: "monospace" }}>
-            <span style={{ width: 7, height: 7, borderRadius: "50%", background: loading ? "var(--text-dim)" : error ? "#f59e0b" : "#22c55e", boxShadow: !loading && !error ? "0 0 6px #22c55e" : "none", display: "inline-block" }} />
+            <span style={{ width: 7, height: 7, borderRadius: "50%", background: loading ? "var(--text-dim)" : "#22c55e", boxShadow: !loading ? "0 0 6px #22c55e" : "none", display: "inline-block" }} />
             {loading ? "Syncing…" : (lastAtStr || "Live")}
           </div>
           <button onClick={fetchStats} style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg-card)", fontSize: 12, color: "var(--text-muted)", cursor: "pointer" }}>⟳ Refresh</button>
@@ -310,7 +355,8 @@ export default function AnalyticsPage() {
         </div>
       )}
 
-      {error && (
+      {/* Error only shown when NO data at all */}
+      {showError && (
         <div style={{ background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 8, padding: "10px 14px", marginBottom: 14, fontSize: 13, color: "#d97706", display: "flex", alignItems: "center", gap: 8 }}>
           <span>⚠</span><span>{error}</span>
           <span style={{ marginLeft: "auto", fontSize: 11, opacity: 0.7 }}>Retrying every {POLL_MS/1000}s</span>

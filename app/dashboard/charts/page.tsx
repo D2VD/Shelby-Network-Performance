@@ -1,14 +1,13 @@
 "use client";
 /**
- * app/dashboard/charts/page.tsx — v25.0
+ * app/dashboard/charts/page.tsx — v26.0
  * FIXES:
- * 1. CRITICAL: Use || not ?? for numeric fallbacks in `cur` object
- *    ?? treats 0 as non-null → keeps 0 when timeseries has real data
- *    || treats 0 as falsy → falls back to timeseries value
- * 2. Reset liveSnap to null on network change — prevents cross-network contamination
- * 3. Testnet uses IDENTICAL layout/structure as Shelbynet
- *    (only data sources differ — no separate testnet view)
- * 4. "Showing cached timeseries" warning only when truly stale
+ * 1. Testnet charts: accumulate live points into a local series array
+ *    Each 30s poll adds a point → charts render after a few minutes
+ * 2. Stale banner: only show when cur.activeBlobs === 0 (no real data)
+ *    Don't show when data IS displaying correctly from cache
+ * 3. Testnet charts use timeseries from backend (appendTestnetTimeseries)
+ *    if available, otherwise fall back to local live accumulation
  */
 
 import { useEffect, useState, useRef, useCallback } from "react";
@@ -62,7 +61,7 @@ function LiveClock() {
     return () => clearInterval(id);
   }, []);
   if (!clock) return null;
-  return <span suppressHydrationWarning style={{ fontFamily: "monospace", fontSize: 12, color: "var(--text-dim)", background: "var(--bg-card)", border: "1px solid var(--border)", padding: "4px 10px", borderRadius: 7, display: "inline-block" }}>🕐 {clock}</span>;
+  return <span suppressHydrationWarning style={{ fontFamily: "monospace", fontSize: 12, color: "var(--text-dim)", background: "var(--bg-card)", border: "1px solid var(--border)", padding: "4px 10px", borderRadius: 7 }}>🕐 {clock}</span>;
 }
 
 type DKind = "device" | "legacy" | "unknown";
@@ -91,8 +90,8 @@ function Chart({ series, labels, height = 150, perScale = false }: { series: Cha
   const { isDark } = useTheme();
   const svgRef = useRef<SVGSVGElement>(null);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
-  const [pinIdx,   setPinIdx]   = useState<number | null>(null);
-  const [inChart,  setInChart]  = useState(false);
+  const [pinIdx, setPinIdx]     = useState<number | null>(null);
+  const [inChart, setInChart]   = useState(false);
 
   const VW=600,PL=56,PR=12,PT=16,PB=24,iW=VW-PL-PR,iH=height-PT-PB;
   const n=Math.max(...series.map(s=>s.data.length),2);
@@ -129,10 +128,10 @@ function Chart({ series, labels, height = 150, perScale = false }: { series: Cha
 }
 
 function Sec({ title, sub, children, right }: { title: string; sub?: string; children: React.ReactNode; right?: React.ReactNode }) {
-  return (
-    <div style={{ marginBottom: 32 }}>
-      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 16, flexWrap: "wrap", gap: 8 }}>
-        <div><h2 style={{ fontSize: 19, fontWeight: 800, color: "var(--text-primary)", margin: 0 }}>{title}</h2>{sub&&<p style={{fontSize:13,color:"var(--text-muted)",margin:"3px 0 0"}}>{sub}</p>}</div>
+  return(
+    <div style={{marginBottom:32}}>
+      <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:8}}>
+        <div><h2 style={{fontSize:19,fontWeight:800,color:"var(--text-primary)",margin:0}}>{title}</h2>{sub&&<p style={{fontSize:13,color:"var(--text-muted)",margin:"3px 0 0"}}>{sub}</p>}</div>
         {right&&<div>{right}</div>}
       </div>
       {children}
@@ -141,9 +140,9 @@ function Sec({ title, sub, children, right }: { title: string; sub?: string; chi
 }
 
 function Card({ title, sub, latest, color, children }: { title: string; sub?: string; latest?: string; color?: string; children: React.ReactNode }) {
-  return (
-    <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 13, padding: "16px 18px" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
+  return(
+    <div style={{background:"var(--bg-card)",border:"1px solid var(--border)",borderRadius:13,padding:"16px 18px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
         <div><div style={{fontSize:13,fontWeight:700,color:"var(--text-secondary)"}}>{title}</div>{sub&&<div style={{fontSize:11,color:"var(--text-dim)"}}>{sub}</div>}</div>
         {latest&&<div style={{fontFamily:"monospace",fontSize:15,fontWeight:800,color:color||"var(--text-primary)"}}>{latest}</div>}
       </div>
@@ -153,8 +152,8 @@ function Card({ title, sub, latest, color, children }: { title: string; sub?: st
 }
 
 function RangeSel({ range, onChange }: { range: TimeRange; onChange: (r: TimeRange) => void }) {
-  return (
-    <div style={{ display: "flex", gap: 3, background: "var(--bg-card2)", border: "1px solid var(--border)", borderRadius: 8, padding: 3 }}>
+  return(
+    <div style={{display:"flex",gap:3,background:"var(--bg-card2)",border:"1px solid var(--border)",borderRadius:8,padding:3}}>
       {(["1h","24h","7d","30d"] as TimeRange[]).map(r=><button key={r} onClick={()=>onChange(r)} style={{padding:"5px 13px",borderRadius:6,fontSize:12,fontWeight:r===range?700:400,border:"none",cursor:"pointer",background:r===range?"var(--accent)":"transparent",color:r===range?"#fff":"var(--text-muted)",transition:"all 0.1s"}}>{r}</button>)}
     </div>
   );
@@ -189,23 +188,24 @@ export default function ChartsPage() {
   const [range,        setRange]        = useState<TimeRange>("24h");
   const [ts,           setTs]           = useState<TsPoint[]>([]);
   const [ts48h,        setTs48h]        = useState<TsPoint[]>([]);
-  // FIX: liveSnap stores the latest live point — reset on network change
+  // FIX: liveSnap stores latest live point
   const [liveSnap,     setLiveSnap]     = useState<TsPoint | null>(null);
+  // FIX: localSeries accumulates live points for testnet (which has no ts backend)
+  const [localSeries,  setLocalSeries]  = useState<TsPoint[]>([]);
   const [bench,        setBench]        = useState<ServerBench[]>([]);
   const [pg,           setPg]           = useState(0);
   const [benchLoading, setBenchLoading] = useState(true);
   const [fetchError,   setFetchError]   = useState<string | null>(null);
-  const [isStale,      setIsStale]      = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // FIX: Reset all state when network changes
   useEffect(() => {
     if (alive.current) {
-      setLiveSnap(null);   // CRITICAL: clear previous network's data
+      setLiveSnap(null);
       setTs([]);
       setTs48h([]);
+      setLocalSeries([]);
       setFetchError(null);
-      setIsStale(false);
     }
   }, [network]);
 
@@ -217,14 +217,10 @@ export default function ChartsPage() {
       const d = (j?.data ?? j ?? {}) as Record<string, unknown>;
       if (!d.blockHeight && !d.activeBlobs && !d.storageProviders) throw new Error("Empty response");
       if (alive.current) {
-        const method = String(d.method ?? "");
-        const isFallback = method.includes("node-only") || method.includes("fallback");
-        setIsStale(isFallback);
-        setFetchError(isFallback ? "Indexer temporarily unavailable — blob data from cache" : null);
-        setLiveSnap({
+        setFetchError(null);
+        const pt: TsPoint = {
           tsMs:             Date.now(),
           blockHeight:      num(d.blockHeight),
-          // FIX: Only set non-zero values from live — 0s will fall back to timeseries
           activeBlobs:      num(d.activeBlobs),
           totalStorageGB:   num(d.totalStorageBytes) / 1e9,
           totalBlobEvents:  num(d.totalBlobEvents),
@@ -232,13 +228,20 @@ export default function ChartsPage() {
           deletedBlobs:     num(d.deletedBlobs),
           storageProviders: num(d.storageProviders),
           placementGroups:  num(d.placementGroups),
-        });
+        };
+        setLiveSnap(pt);
+        // FIX: For testnet, accumulate live points for chart rendering
+        if (net === "testnet") {
+          setLocalSeries(prev => {
+            const next = [...prev, pt];
+            return next.length > 120 ? next.slice(-120) : next; // keep 1h of 30s points
+          });
+        }
       }
     } catch (e) {
-      // Don't set error if we have timeseries data — just show stale indicator
-      if (alive.current && !ts.length) setFetchError(`Live fetch failed — using cached timeseries`);
+      if (alive.current && !ts.length && !localSeries.length) setFetchError(`Live fetch failed — using cached data`);
     }
-  }, [ts.length]);
+  }, [ts.length, localSeries.length]);
 
   const fetchTs = useCallback(async (net: string, r: TimeRange) => {
     try {
@@ -274,20 +277,18 @@ export default function ChartsPage() {
 
   useEffect(() => { fetchTs(network, range); }, [range, network, fetchTs]);
 
-  const cd     = ts.length > 0 ? ts : [];
+  // For charts: use backend ts if available, otherwise local accumulated series
+  // This means testnet shows local series (grows over page session) OR backend ts if populated
+  const cd     = ts.length > 0 ? ts : localSeries;
   const labels = cd.map(p => tLbl(p.tsMs, range));
   const latestTs = cd[cd.length - 1];
 
-  // FIX: Use || (not ??) for numeric fallbacks
-  // || treats 0 as falsy → falls back to timeseries value when live returns 0
-  // This prevents Pending/Deleted from showing 0 when indexer is down
+  // FIX: Use || for numeric fallbacks
   const cur = {
     blockHeight:      liveSnap?.blockHeight      || latestTs?.blockHeight      || 0,
     activeBlobs:      liveSnap?.activeBlobs      || latestTs?.activeBlobs      || 0,
     totalStorageGB:   liveSnap?.totalStorageGB   || latestTs?.totalStorageGB   || 0,
     totalBlobEvents:  liveSnap?.totalBlobEvents  || latestTs?.totalBlobEvents  || 0,
-    // FIX: pendingOrFailed and deletedBlobs MUST use || not ??
-    // When indexer is down, live returns 0 for these → fall back to timeseries
     pendingOrFailed:  liveSnap?.pendingOrFailed  || latestTs?.pendingOrFailed  || 0,
     deletedBlobs:     liveSnap?.deletedBlobs     || latestTs?.deletedBlobs     || 0,
     storageProviders: liveSnap?.storageProviders || latestTs?.storageProviders || 0,
@@ -303,6 +304,9 @@ export default function ChartsPage() {
     if(!c&&!p)return{delta:null,from:null};
     return{delta:c-p,from:p};
   }
+
+  // FIX: Only show stale banner when we truly have NO data (not just when from cache)
+  const showStale = fetchError !== null && cur.activeBlobs === 0 && cur.blockHeight === 0;
 
   const allBench=bench,pagedBench=allBench.slice(pg*PG,(pg+1)*PG);
   const benchChron=[...allBench].reverse(),bLabels=benchChron.map(h=>h.ts?new Date(h.ts).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"");
@@ -336,9 +340,10 @@ export default function ChartsPage() {
         </div>
       )}
 
-      {(fetchError || isStale) && (
+      {/* FIX: Only show stale banner when truly no data */}
+      {showStale && (
         <div style={{ background: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.2)", borderRadius: 9, padding: "8px 14px", marginBottom: 16, fontSize: 12, color: "#d97706", display: "flex", alignItems: "center", gap: 6 }}>
-          <span>⏱</span><span>{fetchError ?? "Indexer sync in progress — showing cached data"}</span>
+          <span>⏱</span><span>{fetchError}</span>
           <span style={{ marginLeft: "auto", fontSize: 11, opacity: 0.7 }}>Retrying every {POLL/1000}s</span>
         </div>
       )}
@@ -369,7 +374,7 @@ export default function ChartsPage() {
           </Card>
           {isTestnet
             ? <Card title="Storage Providers" sub="Active on testnet" latest={fmtN(cur.storageProviders)} color="#0891b2">
-                <Chart series={[{data:cd.map(p=>num(p.storageProviders)),color:"#0891b2",name:"SPs",fmt:fmtN}]} labels={labels} height={140}/>
+                <Chart series={[{data:cd.map(p=>num(p.storageProviders??0)),color:"#0891b2",name:"SPs",fmt:fmtN}]} labels={labels} height={140}/>
               </Card>
             : <Card title="Blob Events" sub="blob_activities_aggregate count" latest={fmtN(cur.totalBlobEvents)} color="#fb923c">
                 <Chart series={[{data:cd.map(p=>num(p.totalBlobEvents)),color:"#fb923c",name:"Events",fmt:fmtN}]} labels={labels} height={140}/>
@@ -384,7 +389,7 @@ export default function ChartsPage() {
         </Card>
       </Sec>
 
-      {/* Storage Analytics — same for both networks */}
+      {/* Storage Analytics */}
       <Sec title="Storage Analytics" sub="Capacity, utilization, and blob size">
         <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 14, marginBottom: 14 }}>
           <Card title="Storage Used (GB)" latest={fmtGB(cur.totalStorageGB)} color="#a78bfa">
@@ -405,7 +410,7 @@ export default function ChartsPage() {
           </div>
         </div>
         <Card title="Avg Blob Size over Time" sub="totalStorageBytes / activeBlobs" latest={fmtKB(cur.avgBlobSizeKB)} color={accentColor}>
-          <Chart series={[{data:cd.map(p=>num(p.avgBlobSizeKB)),color:accentColor,name:"Avg Size",fmt:v=>fmtKB(v)}]} labels={labels} height={130}/>
+          <Chart series={[{data:cd.map(p=>num(p.avgBlobSizeKB??0)),color:accentColor,name:"Avg Size",fmt:v=>fmtKB(v)}]} labels={labels} height={130}/>
         </Card>
       </Sec>
 
@@ -416,13 +421,13 @@ export default function ChartsPage() {
         </Card>
       </Sec>
 
-      {/* Benchmark Analytics — same structure, testnet shows placeholder */}
-      <Sec title="Benchmark Analytics" sub={isTestnet?"Shelbynet benchmark runs (benchmarks only run on Shelbynet)":`${allBench.length} total runs · all time`}>
+      {/* Benchmark Analytics */}
+      <Sec title="Benchmark Analytics" sub={isTestnet?"Benchmarks run on Shelbynet only":`${allBench.length} total runs · all time`}>
         {isTestnet ? (
-          <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 12, padding: "36px 20px", textAlign: "center", color: "var(--text-muted)" }}>
-            <div style={{ fontSize: 24, marginBottom: 10 }}>🔬</div>
-            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>Benchmarks run on Shelbynet only</div>
-            <div style={{ fontSize: 13, color: "var(--text-dim)" }}>Switch to Shelbynet to view global run history and performance data</div>
+          <div style={{background:"var(--bg-card)",border:"1px solid var(--border)",borderRadius:12,padding:"36px 20px",textAlign:"center",color:"var(--text-muted)"}}>
+            <div style={{fontSize:24,marginBottom:10}}>🔬</div>
+            <div style={{fontSize:14,fontWeight:600,marginBottom:6}}>Benchmarks run on Shelbynet only</div>
+            <div style={{fontSize:13,color:"var(--text-dim)"}}>Switch to Shelbynet to view global run history and performance data</div>
           </div>
         ) : benchLoading ? (
           <div style={{background:"var(--bg-card)",border:"1px solid var(--border)",borderRadius:12,padding:"36px 20px",textAlign:"center"}}>

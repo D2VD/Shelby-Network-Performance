@@ -1,11 +1,11 @@
 "use client";
 /**
- * app/dashboard/providers/page.tsx — v14.0
+ * app/dashboard/providers/page.tsx — v15.0
  * FIXES:
- * 1. React error #418 hydration mismatch — time display now uses mounted state
- * 2. Uses real testnet data: 32 active SPs, 1 waitlisted, 10 PGs, 50 slices
- * 3. AZ names from registry (Stakely-0, Jump-AMS-0, etc.) displayed correctly
- * 4. Loading skeleton, retry on error
+ * 1. Waitlisted SPs show "Awaiting Activation" as health badge (not "Unknown")
+ *    with a yellow/amber color — they are registered but not yet active
+ * 2. Health badge colors: Healthy=green, Faulty/Unhealthy=red, Unknown=gray, Awaiting=yellow
+ * 3. suppressHydrationWarning on time display
  */
 
 import { useState, useEffect, useCallback } from "react";
@@ -15,16 +15,10 @@ import { ProviderMap } from "@/components/provider-map";
 import type { StorageProvider } from "@/lib/types";
 import { ZONE_META } from "@/lib/types";
 
-// ─── Testnet notice ───────────────────────────────────────────────────────────
 function TestnetMapNotice() {
   return (
-    <div style={{
-      background: "rgba(147,51,234,0.07)", border: "1px solid rgba(147,51,234,0.25)",
-      borderRadius: 10, padding: "10px 16px", marginBottom: 16,
-      fontSize: 13, color: "#c084fc", display: "flex", alignItems: "center", gap: 8,
-    }}>
-      <span>⚗</span>
-      <span>Shelby Testnet · Storage provider data from Aptos Testnet RPC</span>
+    <div style={{ background: "rgba(147,51,234,0.07)", border: "1px solid rgba(147,51,234,0.25)", borderRadius: 10, padding: "10px 16px", marginBottom: 16, fontSize: 13, color: "#c084fc", display: "flex", alignItems: "center", gap: 8 }}>
+      <span>⚗</span><span>Shelby Testnet · Storage provider data from Aptos Testnet RPC</span>
     </div>
   );
 }
@@ -43,42 +37,45 @@ function Badge({ label, variant }: { label: string; variant: Variant }) {
   };
   const s = isDark ? COLORS[variant].dark : COLORS[variant].light;
   return (
-    <span style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "3px 10px", borderRadius: 6, fontSize: 13, fontWeight: 600, background: s.bg, color: s.color }}>
-      <span style={{ width: 6, height: 6, borderRadius: "50%", background: s.color, display: "inline-block" }} />
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "3px 10px", borderRadius: 6, fontSize: 12, fontWeight: 600, background: s.bg, color: s.color, whiteSpace: "nowrap" }}>
+      <span style={{ width: 6, height: 6, borderRadius: "50%", background: s.color, display: "inline-block", flexShrink: 0 }} />
       {label}
     </span>
   );
 }
 
-const healthVariant = (h: string): Variant => {
-  if (h === "Healthy")   return "green";
-  if (h === "Unhealthy") return "red";
+// FIX: Map health string → badge variant
+// "Awaiting Activation" → yellow (waitlisted SPs, valid state)
+// "Healthy" → green, "Faulty"/"Unhealthy" → red, "Unknown" → gray
+function healthVariant(h: string): Variant {
+  if (h === "Healthy")            return "green";
+  if (h === "Faulty" || h === "Unhealthy") return "red";
+  if (h === "Awaiting Activation") return "yellow";
   return "gray";
-};
-const stateVariant = (s: string): Variant => {
+}
+
+function stateVariant(s: string): Variant {
   if (s === "Active")     return "green";
   if (s === "Waitlisted") return "yellow";
   if (s === "Frozen")     return "blue";
   return "gray";
-};
+}
+
+// Health dot color for the marker
+function healthDotColor(h: string): string {
+  if (h === "Healthy")             return "#22c55e";
+  if (h === "Faulty" || h === "Unhealthy") return "#ef4444";
+  if (h === "Awaiting Activation") return "#f59e0b";
+  return "#9ca3af";
+}
 
 function BlsKey({ full }: { full: string }) {
   const [copied, setCopied] = useState(false);
   if (!full) return <span style={{ color: "var(--text-dim)", fontSize: 13 }}>—</span>;
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-      <span style={{ fontFamily: "monospace", fontSize: 11, color: "var(--text-muted)" }} title={full}>
-        {full.slice(0, 10)}…
-      </span>
-      <button
-        onClick={async (e) => {
-          e.stopPropagation();
-          await navigator.clipboard.writeText(full).catch(() => {});
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
-        }}
-        style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: copied ? "#22c55e" : "var(--text-dim)", padding: "0 2px" }}
-      >
+      <span style={{ fontFamily: "monospace", fontSize: 11, color: "var(--text-muted)" }} title={full}>{full.slice(0, 10)}…</span>
+      <button onClick={async (e) => { e.stopPropagation(); await navigator.clipboard.writeText(full).catch(() => {}); setCopied(true); setTimeout(() => setCopied(false), 1500); }} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: copied ? "#22c55e" : "var(--text-dim)", padding: "0 2px" }}>
         {copied ? "✓" : "⧉"}
       </button>
     </div>
@@ -91,7 +88,6 @@ function SummaryBar({ providers }: { providers: StorageProvider[] }) {
   const waitlisted = providers.filter(p => p.state  === "Waitlisted").length;
   const zones      = new Set(providers.map(p => p.availabilityZone)).size;
   const totalTiB   = providers.reduce((s, p) => s + (p.capacityTiB ?? 0), 0);
-
   return (
     <div style={{ display: "grid", gridTemplateColumns: "repeat(6,1fr)", gap: 1, background: "var(--border)", borderRadius: 12, overflow: "hidden", border: "1px solid var(--border)" }}>
       {[
@@ -111,16 +107,11 @@ function SummaryBar({ providers }: { providers: StorageProvider[] }) {
   );
 }
 
-// Adapt API SpInfo → StorageProvider (handles testnet AZ names like "Stakely-0")
 function adaptToStorageProvider(sp: Record<string, unknown>): StorageProvider {
-  const az = String(sp.availabilityZone ?? "unknown");
-  // Map custom AZ names to ZONE_META keys or keep as-is
-  const azMapped = az.startsWith("dc_") ? az : az;
-
   return {
     address:          String(sp.address ?? ""),
     addressShort:     String(sp.addressShort ?? ""),
-    availabilityZone: azMapped,
+    availabilityZone: String(sp.availabilityZone ?? "unknown"),
     state:            String(sp.state ?? "Active") as StorageProvider["state"],
     health:           String(sp.health ?? "Unknown") as StorageProvider["health"],
     blsKey:           String(sp.blsKey ?? ""),
@@ -137,7 +128,6 @@ function adaptToStorageProvider(sp: Record<string, unknown>): StorageProvider {
   };
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
 export default function ProvidersPage() {
   const { network } = useNetwork();
   const { isDark }  = useTheme();
@@ -146,34 +136,22 @@ export default function ProvidersPage() {
   const [providers, setProviders] = useState<StorageProvider[]>([]);
   const [loading,   setLoading]   = useState(true);
   const [error,     setError]     = useState<string | null>(null);
-  // FIX: Use mounted state for time display to prevent hydration mismatch
-  const [lastAtStr, setLastAtStr] = useState<string>("");
+  const [lastAtStr, setLastAtStr] = useState<string>("");  // client-side only
   const [filter,    setFilter]    = useState<"all" | "healthy" | "faulty" | "waitlisted">("all");
   const [sortBy,    setSortBy]    = useState<"zone" | "health" | "state">("zone");
   const [source,    setSource]    = useState<string>("");
 
   const fetchProviders = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+    setLoading(true); setError(null);
     try {
-      const res = await fetch(`/api/network/providers?network=${network}`, {
-        signal: AbortSignal.timeout(35_000),
-      });
-
-      const d = await res.json() as any;
-
-      if (!res.ok) {
-        throw new Error(d?.error ?? `HTTP ${res.status}`);
-      }
-
+      const res = await fetch(`/api/network/providers?network=${network}`, { signal: AbortSignal.timeout(35_000) });
+      const d   = await res.json() as any;
+      if (!res.ok) throw new Error(d?.error ?? `HTTP ${res.status}`);
       const raw = d?.data?.providers;
       if (Array.isArray(raw)) {
-        const adapted = (raw as Record<string, unknown>[]).map(adaptToStorageProvider);
-        setProviders(adapted);
-        // FIX: Only set time string client-side (not during SSR)
+        setProviders((raw as Record<string, unknown>[]).map(adaptToStorageProvider));
         setLastAtStr(new Date().toLocaleTimeString());
         setSource(String(d?.source ?? "vps"));
-        setError(null);
       } else {
         setProviders([]);
         setLastAtStr(new Date().toLocaleTimeString());
@@ -187,10 +165,7 @@ export default function ProvidersPage() {
   }, [network]);
 
   useEffect(() => {
-    setProviders([]);
-    setError(null);
-    setSource("");
-    setLastAtStr("");
+    setProviders([]); setError(null); setSource(""); setLastAtStr("");
     fetchProviders();
     const id = setInterval(fetchProviders, 60_000);
     return () => clearInterval(id);
@@ -199,24 +174,20 @@ export default function ProvidersPage() {
   const filtered = providers
     .filter(p => {
       if (filter === "healthy")    return p.health === "Healthy";
-      if (filter === "faulty")     return p.health !== "Healthy" && p.health !== "Unknown";
+      if (filter === "faulty")     return (p.health as string) === "Faulty" || (p.health as string) === "Unhealthy";
       if (filter === "waitlisted") return p.state  === "Waitlisted";
       return true;
     })
     .sort((a, b) =>
       sortBy === "zone"   ? (a.availabilityZone ?? "").localeCompare(b.availabilityZone ?? "") :
-      sortBy === "health" ? a.health.localeCompare(b.health) :
+      sortBy === "health" ? (a.health as string).localeCompare(b.health as string) :
       a.state.localeCompare(b.state)
     );
 
   const healthyCount = providers.filter(p => p.health === "Healthy").length;
-  const totalCount   = providers.length;
 
-  // Get display label for AZ — handles both dc_* format and custom names like "Stakely-0"
   function getZoneLabel(az: string): string {
-    if (ZONE_META[az]?.label) return ZONE_META[az].label;
-    // Custom AZ names from testnet: "Stakely-0", "Jump-AMS-0", etc.
-    return az;
+    return ZONE_META[az]?.label ?? az;
   }
 
   return (
@@ -224,34 +195,13 @@ export default function ProvidersPage() {
 
       {/* MAP */}
       <div style={{ background: isDark ? "#0d1526" : "#f0f4f8", position: "relative", height: "55vh", minHeight: 340 }}>
-
-        {/* Status badge — suppressHydrationWarning to avoid mismatch */}
         <div style={{ position: "absolute", top: 12, right: 52, zIndex: 20, display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{
-            background: isDark ? "rgba(13,21,38,0.92)" : "rgba(255,255,255,0.92)",
-            border: `1px solid ${isDark ? "rgba(34,197,94,0.3)" : "rgba(34,197,94,0.4)"}`,
-            borderRadius: 8, padding: "5px 14px", fontSize: 12, color: isDark ? "#94a3b8" : "#6b7280",
-            backdropFilter: "blur(8px)", display: "flex", alignItems: "center", gap: 7,
-          }}>
-            <span style={{
-              width: 7, height: 7, borderRadius: "50%",
-              background: loading ? "#9ca3af" : error ? "#f59e0b" : totalCount > 0 ? "#22c55e" : "#9ca3af",
-              display: "inline-block",
-            }} />
-            {loading
-              ? "Loading providers…"
-              : error
-                ? "Fetch failed"
-                : totalCount === 0
-                  ? (isTestnet ? "No testnet providers yet" : "No providers found")
-                  : `${healthyCount}/${totalCount} nodes online`}
+          <div style={{ background: isDark ? "rgba(13,21,38,0.92)" : "rgba(255,255,255,0.92)", border: `1px solid ${isDark ? "rgba(34,197,94,0.3)" : "rgba(34,197,94,0.4)"}`, borderRadius: 8, padding: "5px 14px", fontSize: 12, color: isDark ? "#94a3b8" : "#6b7280", backdropFilter: "blur(8px)", display: "flex", alignItems: "center", gap: 7 }}>
+            <span style={{ width: 7, height: 7, borderRadius: "50%", background: loading ? "#9ca3af" : providers.length > 0 ? "#22c55e" : "#9ca3af", display: "inline-block" }} />
+            {loading ? "Loading…" : providers.length === 0 ? (isTestnet ? "No testnet providers yet" : "No providers") : `${healthyCount}/${providers.length} nodes online`}
           </div>
-          {/* FIX: suppressHydrationWarning prevents React #418 error for time display */}
           {lastAtStr && (
-            <div
-              suppressHydrationWarning
-              style={{ background: isDark ? "rgba(13,21,38,0.9)" : "rgba(255,255,255,0.9)", border: `1px solid ${isDark ? "rgba(255,255,255,0.08)" : "#e5e7eb"}`, borderRadius: 6, padding: "4px 10px", fontSize: 11, color: "var(--text-dim)", fontFamily: "monospace" }}
-            >
+            <div suppressHydrationWarning style={{ background: isDark ? "rgba(13,21,38,0.9)" : "rgba(255,255,255,0.9)", border: `1px solid ${isDark ? "rgba(255,255,255,0.08)" : "#e5e7eb"}`, borderRadius: 6, padding: "4px 10px", fontSize: 11, color: "var(--text-dim)", fontFamily: "monospace" }}>
               {lastAtStr}
             </div>
           )}
@@ -261,16 +211,14 @@ export default function ProvidersPage() {
           <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 14, flexDirection: "column", gap: 12 }}>
             <div style={{ width: 28, height: 28, borderRadius: "50%", border: "2px solid var(--border)", borderTopColor: "var(--accent)", animation: "spin 1s linear infinite" }} />
             <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
-            {isTestnet ? "Fetching testnet providers from Aptos RPC…" : "Loading providers…"}
+            {isTestnet ? "Fetching testnet providers…" : "Loading providers…"}
           </div>
         ) : error && providers.length === 0 ? (
           <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 12, padding: "0 24px", textAlign: "center" }}>
             <span style={{ fontSize: 28 }}>⚠️</span>
             <div style={{ fontSize: 14, color: "#f59e0b", fontWeight: 600 }}>Provider data unavailable</div>
             <div style={{ fontSize: 12, color: "var(--text-dim)", maxWidth: 400 }}>{error}</div>
-            <button onClick={fetchProviders} style={{ padding: "8px 18px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg-card)", color: "var(--text-primary)", fontSize: 13, cursor: "pointer" }}>
-              ⟳ Retry
-            </button>
+            <button onClick={fetchProviders} style={{ padding: "8px 18px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg-card)", color: "var(--text-primary)", fontSize: 13, cursor: "pointer" }}>⟳ Retry</button>
           </div>
         ) : (
           <ProviderMap providers={providers} />
@@ -281,11 +229,7 @@ export default function ProvidersPage() {
       <div style={{ padding: "18px 26px", background: "var(--bg-card)", borderBottom: "1px solid var(--border)" }}>
         {isTestnet && <TestnetMapNotice />}
         <SummaryBar providers={providers} />
-        {source && (
-          <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-dim)", fontFamily: "monospace" }}>
-            Source: {source} · {isTestnet ? "Aptos Testnet RPC" : "Shelbynet on-chain"} · Auto-refresh 60s
-          </div>
-        )}
+        {source && <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-dim)", fontFamily: "monospace" }}>Source: {source} · {isTestnet ? "Aptos Testnet RPC" : "Shelbynet on-chain"} · Auto-refresh 60s</div>}
       </div>
 
       {/* TABLE */}
@@ -294,17 +238,13 @@ export default function ProvidersPage() {
           <div>
             <h2 style={{ fontSize: 20, fontWeight: 700, color: "var(--text-primary)", margin: 0 }}>Provider Directory</h2>
             <p style={{ fontSize: 13, color: "var(--text-muted)", margin: "4px 0 0", fontFamily: "monospace" }}>
-              {loading && providers.length === 0
-                ? "Loading…"
-                : `${filtered.length} of ${totalCount} providers · ${isTestnet ? "Aptos Testnet" : "Shelbynet"} · Auto-refresh 60s`}
+              {loading && providers.length === 0 ? "Loading…" : `${filtered.length} of ${providers.length} providers · ${isTestnet ? "Aptos Testnet" : "Shelbynet"} · Auto-refresh 60s`}
             </p>
           </div>
           <div style={{ display: "flex", gap: 9 }}>
             <div style={{ display: "flex", gap: 2, background: "var(--bg-card2)", borderRadius: 9, padding: 2, border: "1px solid var(--border)" }}>
               {(["all", "healthy", "faulty", "waitlisted"] as const).map(f => (
-                <button key={f} onClick={() => setFilter(f)} style={{ padding: "6px 14px", borderRadius: 7, border: "none", fontSize: 12, fontWeight: filter === f ? 600 : 400, background: filter === f ? "var(--bg-card)" : "transparent", color: filter === f ? "var(--text-primary)" : "var(--text-muted)", boxShadow: filter === f ? "0 1px 3px var(--shadow-color)" : "none", cursor: "pointer", textTransform: "capitalize" }}>
-                  {f}
-                </button>
+                <button key={f} onClick={() => setFilter(f)} style={{ padding: "6px 14px", borderRadius: 7, border: "none", fontSize: 12, fontWeight: filter === f ? 600 : 400, background: filter === f ? "var(--bg-card)" : "transparent", color: filter === f ? "var(--text-primary)" : "var(--text-muted)", boxShadow: filter === f ? "0 1px 3px var(--shadow-color)" : "none", cursor: "pointer", textTransform: "capitalize" }}>{f}</button>
               ))}
             </div>
             <select value={sortBy} onChange={e => setSortBy(e.target.value as "zone" | "health" | "state")} style={{ padding: "6px 11px", borderRadius: 8, border: "1px solid var(--border)", fontSize: 12, color: "var(--text-primary)", background: "var(--bg-card)", cursor: "pointer", outline: "none" }}>
@@ -319,9 +259,7 @@ export default function ProvidersPage() {
         </div>
 
         {error && providers.length === 0 && (
-          <div style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 9, padding: "11px 15px", marginBottom: 14, fontSize: 13, color: "#ef4444" }}>
-            ⚠ {error}
-          </div>
+          <div style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 9, padding: "11px 15px", marginBottom: 14, fontSize: 13, color: "#ef4444" }}>⚠ {error}</div>
         )}
 
         <div style={{ borderRadius: 11, border: "1px solid var(--border)", overflow: "hidden" }}>
@@ -329,9 +267,7 @@ export default function ProvidersPage() {
             <thead>
               <tr style={{ background: "var(--bg-card2)", borderBottom: "1px solid var(--border)" }}>
                 {["", "ADDRESS", "ZONE / DC", "HEALTH", "STATE", "CAPACITY", "BLS KEY"].map((h, i) => (
-                  <th key={i} style={{ padding: i === 0 ? "10px 18px" : "10px 14px", textAlign: i === 5 ? "right" : "left", fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.07em", whiteSpace: "nowrap" }}>
-                    {h}
-                  </th>
+                  <th key={i} style={{ padding: i === 0 ? "10px 18px" : "10px 14px", textAlign: i === 5 ? "right" : "left", fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.07em", whiteSpace: "nowrap" }}>{h}</th>
                 ))}
               </tr>
             </thead>
@@ -347,55 +283,39 @@ export default function ProvidersPage() {
                   </tr>
                 ))
               ) : filtered.length === 0 ? (
-                <tr>
-                  <td colSpan={7} style={{ padding: "52px 18px", textAlign: "center", color: "var(--text-muted)", fontSize: 14 }}>
-                    {error
-                      ? <span>Failed to load — <button onClick={fetchProviders} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--accent)", fontSize: 14 }}>retry</button></span>
-                      : isTestnet
-                        ? "No testnet storage providers found. The Shelby testnet may not have registered SPs yet."
-                        : "No providers match the current filter"}
-                  </td>
-                </tr>
+                <tr><td colSpan={7} style={{ padding: "52px 18px", textAlign: "center", color: "var(--text-muted)", fontSize: 14 }}>
+                  {error ? <span>Failed to load — <button onClick={fetchProviders} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--accent)", fontSize: 14 }}>retry</button></span>
+                         : isTestnet ? "No testnet storage providers found." : "No providers match the current filter"}
+                </td></tr>
               ) : filtered.map((p, i) => {
-                const isH      = p.health === "Healthy";
-                const isUnknown = p.health === "Unknown";
-                const zoneLabel = getZoneLabel(p.availabilityZone);
+                const healthStr  = p.health as string;
+                const dotColor   = healthDotColor(healthStr);
+                const variant    = healthVariant(healthStr);
+                const zoneLabel  = getZoneLabel(p.availabilityZone);
                 return (
                   <tr key={p.address || i} style={{ borderBottom: "1px solid var(--border-soft)", background: i % 2 === 0 ? "var(--bg-card)" : "var(--bg-card2)" }}>
                     <td style={{ padding: "11px 18px", width: 30 }}>
-                      <div style={{
-                        width: 9, height: 9, borderRadius: "50%",
-                        background: isH ? "#22c55e" : isUnknown ? "#9ca3af" : "#ef4444",
-                        boxShadow: isH ? "0 0 6px #22c55e88" : "none",
-                      }} />
+                      <div style={{ width: 9, height: 9, borderRadius: "50%", background: dotColor, boxShadow: healthStr === "Healthy" ? `0 0 6px ${dotColor}88` : "none" }} />
                     </td>
                     <td style={{ padding: "11px 14px" }}>
                       <span style={{ fontFamily: "monospace", fontSize: 13, color: "var(--text-primary)", fontWeight: 600 }}>{p.addressShort}</span>
-                      {p.geo?.city && (
-                        <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 2 }}>
-                          {p.geo.city}{p.geo.countryCode ? `, ${p.geo.countryCode}` : ""}
-                        </div>
-                      )}
+                      {p.geo?.city && <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 2 }}>{p.geo.city}{p.geo.countryCode ? `, ${p.geo.countryCode}` : ""}</div>}
                     </td>
                     <td style={{ padding: "11px 14px" }}>
-                      <div style={{ fontSize: 13, color: "var(--text-secondary)", fontWeight: 500 }}>
-                        {zoneLabel}
-                      </div>
+                      <div style={{ fontSize: 13, color: "var(--text-secondary)", fontWeight: 500 }}>{zoneLabel}</div>
                     </td>
-                    <td style={{ padding: "11px 14px" }}><Badge label={p.health} variant={healthVariant(p.health)} /></td>
-                    <td style={{ padding: "11px 14px" }}><Badge label={p.state}  variant={stateVariant(p.state)}   /></td>
+                    <td style={{ padding: "11px 14px" }}>
+                      <Badge label={healthStr} variant={variant} />
+                    </td>
+                    <td style={{ padding: "11px 14px" }}>
+                      <Badge label={p.state} variant={stateVariant(p.state)} />
+                    </td>
                     <td style={{ padding: "11px 14px", textAlign: "right" }}>
-                      {p.capacityTiB != null
-                        ? <span style={{ fontFamily: "monospace", fontSize: 13, color: "var(--text-primary)" }}>{p.capacityTiB.toFixed(2)} TiB</span>
-                        : <span style={{ color: "var(--text-dim)" }}>—</span>}
+                      {p.capacityTiB != null ? <span style={{ fontFamily: "monospace", fontSize: 13, color: "var(--text-primary)" }}>{p.capacityTiB.toFixed(2)} TiB</span> : <span style={{ color: "var(--text-dim)" }}>—</span>}
                     </td>
                     <td style={{ padding: "11px 18px" }}>
                       <BlsKey full={p.fullBlsKey ?? p.blsKey ?? ""} />
-                      {p.netAddress && (
-                        <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 1, fontFamily: "monospace" }}>
-                          {p.netAddress}
-                        </div>
-                      )}
+                      {p.netAddress && <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 1, fontFamily: "monospace" }}>{p.netAddress}</div>}
                     </td>
                   </tr>
                 );

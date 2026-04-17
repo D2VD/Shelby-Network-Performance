@@ -321,7 +321,7 @@ export default function ChartsPage() {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 28 }}>
         <div>
           <h1 style={{ fontSize: 26, fontWeight: 800, color: "var(--text-primary)", margin: 0, letterSpacing: -0.5 }}>
-            {isTestnet ? "Testnet Analytics" : "Network Analytics"}
+            Network Analytics
           </h1>
           <p style={{ fontSize: 13, color: "var(--text-muted)", margin: "4px 0 0" }}>
             {isTestnet ? "Shelby Testnet · Aptos Testnet RPC" : (config?.label ?? "Shelbynet")} · Refresh every {POLL/1000}s
@@ -353,14 +353,8 @@ export default function ChartsPage() {
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 12 }}>
           <SnapCard label="Block Height" value={cur.blockHeight?`#${cur.blockHeight.toLocaleString("en-US")}`:"—"} color={accentColor} delta={null} from={null} />
           {(()=>{const{delta,from}=d48("activeBlobs");return<SnapCard label="Active Blobs" value={fmtN(cur.activeBlobs)} color="#22c55e" delta={delta} from={from}/>;})()}
-          {isTestnet
-            ? <SnapCard label="Storage Providers" value={fmtN(cur.storageProviders)} color="#0891b2" delta={null} from={null} />
-            : (()=>{const{delta,from}=d48("totalStorageGB");return<SnapCard label="Storage Used" value={fmtGB(cur.totalStorageGB)} color="#a78bfa" delta={delta} from={from}/>;})()
-          }
-          {isTestnet
-            ? <SnapCard label="Placement Groups" value={fmtN(cur.placementGroups)} color="#d97706" delta={null} from={null} />
-            : (()=>{const{delta,from}=d48("totalBlobEvents");return<SnapCard label="Blob Events" value={fmtN(cur.totalBlobEvents)} color="#fb923c" delta={delta} from={from}/>;})()
-          }
+          {(()=>{const{delta,from}=d48("totalStorageGB");return<SnapCard label="Storage Used" value={fmtGB(cur.totalStorageGB)} color="#a78bfa" delta={delta} from={from}/>;})()}
+          {(()=>{const{delta,from}=d48("totalBlobEvents");return<SnapCard label="Blob Events" value={fmtN(cur.totalBlobEvents)} color="#fb923c" delta={delta} from={from}/>;})()}
           {(()=>{const{delta,from}=d48("pendingOrFailed");return<SnapCard label="Pending Blobs" value={fmtN(cur.pendingOrFailed)} color="#fbbf24" delta={delta} from={from}/>;})()}
           {(()=>{const{delta,from}=d48("deletedBlobs");return<SnapCard label="Deleted Blobs" value={fmtN(cur.deletedBlobs)} color="#f87171" delta={delta} from={from}/>;})()}
         </div>
@@ -372,14 +366,9 @@ export default function ChartsPage() {
           <Card title="Active Blobs" sub={`${range} window`} latest={fmtN(cur.activeBlobs)} color="#22c55e">
             <Chart series={[{data:cd.map(p=>num(p.activeBlobs)),color:"#22c55e",name:"Active",fmt:fmtN}]} labels={labels} height={140}/>
           </Card>
-          {isTestnet
-            ? <Card title="Storage Providers" sub="Active on testnet" latest={fmtN(cur.storageProviders)} color="#0891b2">
-                <Chart series={[{data:cd.map(p=>num(p.storageProviders??0)),color:"#0891b2",name:"SPs",fmt:fmtN}]} labels={labels} height={140}/>
-              </Card>
-            : <Card title="Blob Events" sub="blob_activities_aggregate count" latest={fmtN(cur.totalBlobEvents)} color="#fb923c">
-                <Chart series={[{data:cd.map(p=>num(p.totalBlobEvents)),color:"#fb923c",name:"Events",fmt:fmtN}]} labels={labels} height={140}/>
-              </Card>
-          }
+          <Card title="Blob Events" sub="blob_activities_aggregate count" latest={fmtN(cur.totalBlobEvents)} color="#fb923c">
+            <Chart series={[{data:cd.map(p=>num(p.totalBlobEvents)),color:"#fb923c",name:"Events",fmt:fmtN}]} labels={labels} height={140}/>
+          </Card>
         </div>
         <Card title="Pending & Deleted Blobs" sub="Anomaly tracking · auto-scaled per series">
           <Chart perScale series={[

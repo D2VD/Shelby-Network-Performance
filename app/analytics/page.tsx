@@ -293,31 +293,21 @@ export default function AnalyticsPage() {
   const hasData = snap !== null && (snap.blockHeight > 0 || snap.activeBlobs > 0 || snap.storageProviders > 0);
   const showError = error && !hasData;
 
-  const METRICS = isTestnet ? [
-    { label: "Active Blobs",      value: fmt(snap?.activeBlobs),          sub: "From Indexer (best-effort)",  icon: "◈", color: "#0891b2" },
-    { label: "Storage Providers", value: fmt(snap?.storageProviders),     sub: "Active on testnet",           icon: "◎", color: "#22c55e" },
-    { label: "Waitlisted SPs",    value: fmt(snap?.waitlistedProviders),  sub: "Awaiting activation",         icon: "◎", color: "#f59e0b" },
-    { label: "Placement Groups",  value: fmt(snap?.placementGroups),      sub: "Epoch registry",              icon: "▦", color: "#d97706" },
-    { label: "Slices",            value: fmt(snap?.slices),               sub: "Slice registry count",        icon: "⬡", color: "#7c3aed" },
-    { label: "Block Height",      value: snap?.blockHeight ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—", sub: `Ledger v${fmt(snap?.ledgerVersion)}`, icon: "⬡", color: accentColor },
-  ] : [
-    { label: "Active Blobs",      value: fmt(snap?.activeBlobs),          sub: "Files stored on-chain",       icon: "◈", color: "#2563eb" },
-    { label: "Storage Used",      value: fmtBytes(snap?.totalStorageBytes), sub: snap?.totalStorageGiB ? `${Number(snap.totalStorageGiB).toFixed(2)} GiB` : "", icon: "▣", color: "#059669" },
+  // Unified 6 metrics — same layout for both networks, only label/sub differs
+  const METRICS = [
+    { label: "Active Blobs",      value: fmt(snap?.activeBlobs),          sub: isTestnet ? "From Indexer (testnet)" : "Files stored on-chain", icon: "◈", color: isTestnet ? "#0891b2" : "#2563eb" },
+    { label: "Storage Used",      value: fmtBytes(snap?.totalStorageBytes), sub: snap?.totalStorageGiB ? `${Number(snap.totalStorageGiB).toFixed(2)} GiB` : (isTestnet ? "From Indexer" : ""), icon: "▣", color: "#059669" },
     { label: "Blob Events",       value: fmt(snap?.totalBlobEvents),      sub: "blob_activities count",       icon: "↯", color: "#9333ea" },
-    { label: "Storage Providers", value: fmt(snap?.storageProviders),     sub: "Active SPs on-chain",         icon: "◎", color: "#0891b2" },
-    { label: "Placement Groups",  value: fmt(snap?.placementGroups),      sub: "Erasure code groups",         icon: "▦", color: "#d97706" },
+    { label: "Storage Providers", value: fmt(snap?.storageProviders),     sub: isTestnet ? "Active on testnet" : "Active SPs on-chain", icon: "◎", color: "#0891b2" },
+    { label: "Placement Groups",  value: fmt(snap?.placementGroups),      sub: isTestnet ? "Epoch registry" : "Erasure code groups", icon: "▦", color: "#d97706" },
     { label: "Slices",            value: fmt(snap?.slices),               sub: "Slice registry count",        icon: "⬡", color: "#7c3aed" },
   ];
 
-  const CHARTS = isTestnet ? [
-    { title: "Block Height",      sub: "Chain progress",       latest: snap?.blockHeight ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—", data: series.map(p => p.blockHeight ?? 0).filter(v => v > 0), color: accentColor },
-    { title: "Active Blobs",      sub: "Indexer (txn count)",  latest: fmt(snap?.activeBlobs), data: series.map(p => p.activeBlobs ?? 0).filter(Boolean), color: "#0891b2" },
-    { title: "Storage Providers", sub: "Active on testnet",    latest: fmt(snap?.storageProviders), data: series.map(p => p.storageProviders ?? 0).filter(Boolean), color: "#22c55e" },
-    { title: "Placement Groups",  sub: "Epoch registry",       latest: fmt(snap?.placementGroups), data: series.map(p => p.placementGroups ?? 0).filter(Boolean), color: "#d97706" },
-  ] : [
-    { title: "Active Blobs",  sub: `${POLL_MS/1000}s poll`, latest: fmt(snap?.activeBlobs), data: series.map(p => p.activeBlobs ?? 0).filter(Boolean), color: "#2563eb" },
-    { title: "Block Height",  sub: "Chain progress",         latest: snap?.blockHeight ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—", data: series.map(p => p.blockHeight).filter(v => v > 0), color: "#059669" },
-    { title: "Storage Used",  sub: "Shelby Indexer bytes",   latest: fmtBytes(snap?.totalStorageBytes), data: series.map(p => p.totalStorageBytes ?? 0).filter(Boolean), color: "#9333ea" },
+  // Unified 4 sparkline charts — same layout for both networks
+  const CHARTS = [
+    { title: "Active Blobs",  sub: isTestnet ? "Indexer (testnet)" : `${POLL_MS/1000}s poll`, latest: fmt(snap?.activeBlobs), data: series.map(p => p.activeBlobs ?? 0).filter(Boolean), color: isTestnet ? "#0891b2" : "#2563eb" },
+    { title: "Block Height",  sub: "Chain progress",         latest: snap?.blockHeight ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—", data: series.map(p => p.blockHeight).filter(v => v > 0), color: isTestnet ? accentColor : "#059669" },
+    { title: "Storage Used",  sub: isTestnet ? "Indexer (testnet)" : "Shelby Indexer bytes", latest: fmtBytes(snap?.totalStorageBytes), data: series.map(p => p.totalStorageBytes ?? 0).filter(Boolean), color: "#9333ea" },
     { title: "Blob Events",   sub: "blob_activities count",  latest: fmt(snap?.totalBlobEvents), data: series.map(p => p.totalBlobEvents ?? 0).filter(Boolean), color: "#d97706" },
   ];
 
@@ -378,24 +368,10 @@ export default function AnalyticsPage() {
 
         <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 14, padding: "18px 22px" }}>
           <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-muted)", marginBottom: 12 }}>
-            {isTestnet ? "Network Status" : "Blob Breakdown"}
+            Blob Breakdown
           </div>
           {!snap ? (
             <div style={{ color: "var(--text-dim)", fontSize: 14 }}>{loading ? "Loading…" : "No data"}</div>
-          ) : isTestnet ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-              {[
-                { label: "Active SPs",       v: snap.storageProviders,    color: "#22c55e" },
-                { label: "Waitlisted SPs",   v: snap.waitlistedProviders, color: "#f59e0b" },
-                { label: "Placement Groups", v: snap.placementGroups,     color: "#9333ea" },
-                { label: "Slices",           v: snap.slices,              color: "#06b6d4" },
-              ].map(({ label, v, color }) => (
-                <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 7 }}><div style={{ width: 8, height: 8, borderRadius: 2, background: color, flexShrink: 0 }} /><span style={{ fontSize: 13, color: "var(--text-muted)" }}>{label}</span></div>
-                  <span style={{ fontSize: 14, fontWeight: 700, color: "var(--text-primary)", fontFamily: "monospace" }}>{fmt(v)}</span>
-                </div>
-              ))}
-            </div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
               {[

@@ -1,13 +1,13 @@
 "use client";
 /**
- * app/analytics/page.tsx — v13.0
- * FIXES:
- * 1. When /stats/live returns 0 blobs (indexer down, empty cache):
- *    → Fetch /stats/timeseries and use the latest point as baseline
- *    This ensures Shelbynet data always shows even without live indexer
- * 2. Error banner: only show when cur.activeBlobs === 0 AND we truly have no data
- *    (not when data comes from cache but is valid)
- * 3. Identical layout both networks, same 6 cards + 4 charts
+ * app/analytics/page.tsx — v14.0
+ *
+ * CHANGES v14.0:
+ * - totalBlobs (is_written=1, kể cả deleted) → hiển thị là "Total Blobs" — match Explorer
+ * - activeBlobs (is_written=1, is_deleted=0) → hiển thị là "Active Blobs" — blobs đang stored
+ * - totalStorageBytes → "Storage Used" (match Explorer)
+ * - activeStorageBytes → "Active Storage" (blobs chưa xóa)
+ * - Blob Breakdown dùng totalBlobs làm base
  */
 
 import { useEffect, useState, useCallback, useRef } from "react";
@@ -15,17 +15,30 @@ import { useNetwork } from "@/components/network-context";
 
 interface LiveSnap {
   ts: string; tsMs: number; network?: string;
-  activeBlobs: number; pendingOrFailed: number; deletedBlobs: number; emptyRecords: number;
-  totalBlobEvents: number; totalStorageBytes: number; totalStorageGB: number; totalStorageGiB: number;
+  // Explorer-aligned
+  totalBlobs: number;
+  totalStorageBytes: number; totalStorageGB: number; totalStorageGiB: number;
+  totalBlobEvents: number;
+  // Breakdown
+  activeBlobs: number;
+  activeStorageBytes?: number; activeStorageGB?: number;
+  pendingBlobs: number; pendingOrFailed: number;
+  deletedBlobs: number; failedBlobs: number; emptyRecords: number;
+  // On-chain
   storageProviders: number; placementGroups: number; slices: number;
-  blockHeight: number; ledgerVersion: number; method: string;
+  blockHeight: number; ledgerVersion: number;
+  // Testnet extras
   waitlistedProviders?: number; chainId?: number; indexerStatus?: string;
+  method: string;
 }
 
 interface LivePoint {
-  ts: number; activeBlobs: number | null; totalStorageBytes: number | null;
-  totalBlobEvents: number | null; blockHeight: number;
-  storageProviders: number | null; placementGroups: number | null;
+  ts: number;
+  totalBlobs:        number | null;
+  totalStorageBytes: number | null;
+  totalBlobEvents:   number | null;
+  blockHeight:       number;
+  storageProviders:  number | null;
 }
 
 const MAX_POINTS = 60;
@@ -47,23 +60,11 @@ function fmtTime(ts: number): string {
   return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
 }
 
-// Merge: prefer non-zero values, but ONLY within same network
+// Merge: prefer non-zero values from same network
 function mergeSnap(prev: LiveSnap | null, next: LiveSnap): LiveSnap {
   if (!prev) return next;
-  // If new data has real blobs, use it as-is
-  if (next.activeBlobs > 0) return next;
-  // New data has 0 blobs (node-only-fallback) — preserve blob counts from prev
-  return {
-    ...next,
-    activeBlobs:       prev.activeBlobs       || next.activeBlobs,
-    totalBlobEvents:   prev.totalBlobEvents   || next.totalBlobEvents,
-    totalStorageBytes: prev.totalStorageBytes || next.totalStorageBytes,
-    totalStorageGB:    prev.totalStorageGB    || next.totalStorageGB,
-    totalStorageGiB:   prev.totalStorageGiB   || next.totalStorageGiB,
-    pendingOrFailed:   prev.pendingOrFailed   || next.pendingOrFailed,
-    deletedBlobs:      prev.deletedBlobs      || next.deletedBlobs,
-    emptyRecords:      prev.emptyRecords      || next.emptyRecords,
-  };
+  if (next.totalBlobs > 0 || next.blockHeight > 0) return next;
+  return { ...next, totalBlobs: prev.totalBlobs || next.totalBlobs, totalStorageBytes: prev.totalStorageBytes || next.totalStorageBytes, totalBlobEvents: prev.totalBlobEvents || next.totalBlobEvents, activeBlobs: prev.activeBlobs || next.activeBlobs };
 }
 
 function SparkLine({ data, color, height = 110 }: { data: number[]; color: string; height?: number }) {
@@ -140,65 +141,58 @@ export default function AnalyticsPage() {
 
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
-  // CRITICAL: Reset snap when network changes
   useEffect(() => {
     if (alive.current) {
-      setSnap(null);
-      setSeries([]);
-      setError(null);
-      setLoading(true);
+      setSnap(null); setSeries([]); setError(null); setLoading(true);
       snapNetworkRef.current = network;
     }
   }, [network]);
 
   const applyData = useCallback((data: LiveSnap, forNetwork: string) => {
-    if (!alive.current) return;
-    if (snapNetworkRef.current !== forNetwork) return; // stale response
+    if (!alive.current || snapNetworkRef.current !== forNetwork) return;
     setSnap(prev => mergeSnap(prev, data));
     setLastAtStr(new Date().toLocaleTimeString());
     setSeries(prev => {
       const pt: LivePoint = {
         ts:                Date.now(),
-        activeBlobs:       data.activeBlobs       || null,
+        totalBlobs:        data.totalBlobs        || null,
         totalStorageBytes: data.totalStorageBytes || null,
         totalBlobEvents:   data.totalBlobEvents   || null,
         blockHeight:       data.blockHeight       || 0,
         storageProviders:  data.storageProviders  || null,
-        placementGroups:   data.placementGroups   || null,
       };
       const next = [...prev, pt];
       return next.length > MAX_POINTS ? next.slice(-MAX_POINTS) : next;
     });
   }, []);
 
-  // FIX: Try to seed from timeseries when live returns 0 blobs
   const seedFromTimeseries = useCallback(async (forNetwork: string): Promise<LiveSnap | null> => {
     try {
       const j = await fetch(`/api/network/stats/timeseries?network=${forNetwork}&resolution=5m&range=24h`, { signal: AbortSignal.timeout(10_000) });
       if (!j.ok) return null;
       const d = await j.json() as any;
-      const series = d?.data?.series as any[];
-      if (!Array.isArray(series) || series.length === 0) return null;
-      const latest = series[series.length - 1];
-      if (!latest || !latest.activeBlobs) return null;
-      // Build a LiveSnap from the timeseries point
+      const seriesArr = d?.data?.series as any[];
+      if (!Array.isArray(seriesArr) || seriesArr.length === 0) return null;
+      const latest = seriesArr[seriesArr.length - 1];
+      if (!latest || (!latest.totalBlobs && !latest.activeBlobs)) return null;
       return {
-        ts: latest.ts ?? new Date().toISOString(),
-        tsMs: latest.tsMs ?? Date.now(),
-        network: forNetwork,
-        activeBlobs:       Number(latest.activeBlobs      ?? 0),
-        totalBlobEvents:   Number(latest.totalBlobEvents  ?? 0),
+        ts: latest.ts ?? new Date().toISOString(), tsMs: latest.tsMs ?? Date.now(), network: forNetwork,
+        totalBlobs:        Number(latest.totalBlobs        ?? latest.activeBlobs ?? 0),
         totalStorageBytes: Number(latest.totalStorageBytes ?? 0) || Number(latest.totalStorageGB ?? 0) * 1e9,
-        totalStorageGB:    Number(latest.totalStorageGB   ?? 0),
-        totalStorageGiB:   Number(latest.totalStorageGiB  ?? 0),
-        storageProviders:  Number(latest.storageProviders ?? 0),
-        placementGroups:   Number(latest.placementGroups  ?? 0),
-        slices:            Number(latest.slices            ?? 0),
-        blockHeight:       Number(latest.blockHeight      ?? 0),
-        ledgerVersion:     Number(latest.ledgerVersion    ?? 0),
-        pendingOrFailed:   Number(latest.pendingOrFailed  ?? 0),
-        deletedBlobs:      Number(latest.deletedBlobs     ?? 0),
-        emptyRecords:      Number(latest.emptyRecords     ?? 0),
+        totalStorageGB:    Number(latest.totalStorageGB    ?? 0),
+        totalStorageGiB:   Number(latest.totalStorageGiB   ?? 0),
+        totalBlobEvents:   Number(latest.totalBlobEvents   ?? 0),
+        activeBlobs:       Number(latest.activeBlobs       ?? 0),
+        pendingBlobs:      Number(latest.pendingBlobs      ?? 0),
+        pendingOrFailed:   Number(latest.pendingOrFailed   ?? 0),
+        deletedBlobs:      Number(latest.deletedBlobs      ?? 0),
+        failedBlobs:       Number(latest.failedBlobs       ?? 0),
+        emptyRecords:      Number(latest.emptyRecords      ?? 0),
+        storageProviders:  Number(latest.storageProviders  ?? 0),
+        placementGroups:   Number(latest.placementGroups   ?? 0),
+        slices:            Number(latest.slices             ?? 0),
+        blockHeight:       Number(latest.blockHeight       ?? 0),
+        ledgerVersion:     Number(latest.ledgerVersion     ?? 0),
         method: "ts-seeded",
       } as LiveSnap;
     } catch { return null; }
@@ -207,30 +201,26 @@ export default function AnalyticsPage() {
   const fetchStats = useCallback(async () => {
     const forNetwork = network;
 
-    // 1. Try /stats/live
     try {
       const res = await fetch(`/api/network/stats/live?network=${forNetwork}`, { signal: AbortSignal.timeout(18_000) });
       if (res.ok) {
         const j    = await res.json() as any;
         const data = j.data ?? j;
-        if (data && (data.blockHeight != null || data.storageProviders != null)) {
+        if (data && (data.blockHeight != null || data.storageProviders != null || data.totalBlobs != null)) {
           if (alive.current) setError(null);
           applyData(data as LiveSnap, forNetwork);
           if (alive.current) setLoading(false);
-
-          // FIX: If blobs are 0 (node-only-fallback), also try timeseries
-          if ((data.activeBlobs ?? 0) === 0 && !isTestnet) {
+          // Nếu totalBlobs = 0 (node-only fallback), thử timeseries
+          if ((data.totalBlobs ?? 0) === 0 && !isTestnet) {
             const tsSnap = await seedFromTimeseries(forNetwork);
-            if (tsSnap && snapNetworkRef.current === forNetwork) {
-              applyData(tsSnap, forNetwork);
-            }
+            if (tsSnap) applyData(tsSnap, forNetwork);
           }
           return;
         }
       }
     } catch { /* fall through */ }
 
-    // 2. Fallback: /stats cached
+    // Fallback: /stats cached
     try {
       const r2 = await fetch(`/api/network/stats?network=${forNetwork}`, { signal: AbortSignal.timeout(12_000) });
       if (r2.ok) {
@@ -241,41 +231,43 @@ export default function AnalyticsPage() {
         if (nd.blockHeight || s.totalBlobs || s.activeBlobs) {
           const fb: LiveSnap = {
             ts: new Date().toISOString(), tsMs: Date.now(), network: forNetwork,
-            activeBlobs:         Number(s.totalBlobs ?? s.activeBlobs ?? 0),
-            totalBlobEvents:     Number(s.totalBlobEvents ?? 0),
-            totalStorageBytes:   Number(s.totalStorageUsedBytes ?? 0),
-            totalStorageGB:      Number(s.totalStorageUsedBytes ?? 0) / 1e9,
-            totalStorageGiB:     Number(s.totalStorageUsedBytes ?? 0) / (1024 ** 3),
-            storageProviders:    Number(s.storageProviders ?? 0),
+            totalBlobs:        Number(s.totalBlobs        ?? s.activeBlobs ?? 0),
+            totalStorageBytes: Number(s.totalStorageUsedBytes ?? 0),
+            totalStorageGB:    Number(s.totalStorageGB    ?? 0) || Number(s.totalStorageUsedBytes ?? 0) / 1e9,
+            totalStorageGiB:   Number(s.totalStorageGiB   ?? 0),
+            totalBlobEvents:   Number(s.totalBlobEvents   ?? 0),
+            activeBlobs:       Number(s.activeBlobs       ?? 0),
+            pendingBlobs:      Number(s.pendingBlobs      ?? 0),
+            pendingOrFailed:   Number(s.pendingOrFailed   ?? s.pendingBlobs ?? 0),
+            deletedBlobs:      Number(s.deletedBlobs      ?? 0),
+            failedBlobs:       Number(s.failedBlobs       ?? 0),
+            emptyRecords:      Number(s.emptyRecords      ?? 0),
+            storageProviders:  Number(s.storageProviders  ?? 0),
             waitlistedProviders: Number(s.waitlistedProviders ?? 0),
-            placementGroups:     Number(s.placementGroups ?? 0),
-            slices:              Number(s.slices ?? 0),
-            blockHeight:         Number(nd.blockHeight ?? 0),
-            ledgerVersion:       Number(nd.ledgerVersion ?? 0),
-            chainId:             Number(nd.chainId ?? 2),
-            pendingOrFailed:     Number(s.pendingOrFailed ?? s.pendingBlobs ?? 0),
-            deletedBlobs:        Number(s.deletedBlobs ?? 0),
-            emptyRecords:        Number(s.emptyRecords ?? 0),
-            method:              String(d2.statsSource ?? s.statsMethod ?? "cached"),
+            placementGroups:   Number(s.placementGroups   ?? 0),
+            slices:            Number(s.slices             ?? 0),
+            blockHeight:       Number(nd.blockHeight      ?? 0),
+            ledgerVersion:     Number(nd.ledgerVersion    ?? 0),
+            chainId:           Number(nd.chainId          ?? 2),
+            method:            String(d2.statsSource ?? s.statsMethod ?? "cached"),
           };
           applyData(fb, forNetwork);
           if (alive.current) setLoading(false);
-          // Also seed from timeseries if blobs = 0
-          if (fb.activeBlobs === 0 && !isTestnet) {
+          if (fb.totalBlobs === 0 && !isTestnet) {
             const tsSnap = await seedFromTimeseries(forNetwork);
-            if (tsSnap && snapNetworkRef.current === forNetwork) applyData(tsSnap, forNetwork);
+            if (tsSnap) applyData(tsSnap, forNetwork);
           }
           return;
         }
       }
     } catch { /* ignore */ }
 
-    // 3. Last resort: timeseries seed
+    // Timeseries seed
     if (!isTestnet) {
       const tsSnap = await seedFromTimeseries(forNetwork);
-      if (tsSnap && snapNetworkRef.current === forNetwork) {
+      if (tsSnap) {
         applyData(tsSnap, forNetwork);
-        if (alive.current) { setError("Live sync unavailable — showing cached timeseries data"); setLoading(false); }
+        if (alive.current) { setError("Live sync unavailable — using cached data"); setLoading(false); }
         return;
       }
     }
@@ -289,26 +281,86 @@ export default function AnalyticsPage() {
     return () => clearInterval(id);
   }, [fetchStats]);
 
-  // Only show error when we truly have no data
-  const hasData = snap !== null && (snap.blockHeight > 0 || snap.activeBlobs > 0 || snap.storageProviders > 0);
+  const hasData = snap !== null && (snap.blockHeight > 0 || snap.totalBlobs > 0 || snap.storageProviders > 0);
   const showError = error && !hasData;
 
-  // Unified 6 metrics — same layout for both networks, only label/sub differs
+  // === Metric cards (6 cards) ===
+  // Unified layout cho cả 2 networks, chỉ khác label/sub
   const METRICS = [
-    { label: "Active Blobs",      value: fmt(snap?.activeBlobs),          sub: isTestnet ? "From Indexer (testnet)" : "Files stored on-chain", icon: "◈", color: isTestnet ? "#0891b2" : "#2563eb" },
-    { label: "Storage Used",      value: fmtBytes(snap?.totalStorageBytes), sub: snap?.totalStorageGiB ? `${Number(snap.totalStorageGiB).toFixed(2)} GiB` : (isTestnet ? "From Indexer" : ""), icon: "▣", color: "#059669" },
-    { label: "Blob Events",       value: fmt(snap?.totalBlobEvents),      sub: "blob_activities count",       icon: "↯", color: "#9333ea" },
-    { label: "Storage Providers", value: fmt(snap?.storageProviders),     sub: isTestnet ? "Active on testnet" : "Active SPs on-chain", icon: "◎", color: "#0891b2" },
-    { label: "Placement Groups",  value: fmt(snap?.placementGroups),      sub: isTestnet ? "Epoch registry" : "Erasure code groups", icon: "▦", color: "#d97706" },
-    { label: "Slices",            value: fmt(snap?.slices),               sub: "Slice registry count",        icon: "⬡", color: "#7c3aed" },
+    {
+      label: "Total Blobs",
+      value: fmt(snap?.totalBlobs),
+      sub:   isTestnet ? "is_written=1 (Indexer)" : "is_written=1 (matches Explorer)",
+      icon:  "◈",
+      color: isTestnet ? "#0891b2" : "#2563eb",
+    },
+    {
+      label: "Storage Used",
+      value: fmtBytes(snap?.totalStorageBytes),
+      sub:   snap?.totalStorageGiB ? `${Number(snap.totalStorageGiB).toFixed(2)} GiB` : isTestnet ? "From Indexer" : "",
+      icon:  "▣",
+      color: "#059669",
+    },
+    {
+      label: "Active Blobs",
+      value: fmt(snap?.activeBlobs),
+      sub:   "is_written=1, is_deleted=0",
+      icon:  "◎",
+      color: "#22c55e",
+    },
+    {
+      label: "Storage Providers",
+      value: fmt(snap?.storageProviders),
+      sub:   isTestnet ? `+${snap?.waitlistedProviders ?? 0} waitlisted` : "Active SPs on-chain",
+      icon:  "◎",
+      color: "#0891b2",
+    },
+    {
+      label: "Placement Groups",
+      value: fmt(snap?.placementGroups),
+      sub:   isTestnet ? "Epoch registry" : "Erasure code groups",
+      icon:  "▦",
+      color: "#d97706",
+    },
+    {
+      label: "Slices",
+      value: fmt(snap?.slices),
+      sub:   "Slice registry count",
+      icon:  "⬡",
+      color: "#7c3aed",
+    },
   ];
 
-  // Unified 4 sparkline charts — same layout for both networks
+  // === Sparkline charts (4 charts) ===
   const CHARTS = [
-    { title: "Active Blobs",  sub: isTestnet ? "Indexer (testnet)" : `${POLL_MS/1000}s poll`, latest: fmt(snap?.activeBlobs), data: series.map(p => p.activeBlobs ?? 0).filter(Boolean), color: isTestnet ? "#0891b2" : "#2563eb" },
-    { title: "Block Height",  sub: "Chain progress",         latest: snap?.blockHeight ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—", data: series.map(p => p.blockHeight).filter(v => v > 0), color: isTestnet ? accentColor : "#059669" },
-    { title: "Storage Used",  sub: isTestnet ? "Indexer (testnet)" : "Shelby Indexer bytes", latest: fmtBytes(snap?.totalStorageBytes), data: series.map(p => p.totalStorageBytes ?? 0).filter(Boolean), color: "#9333ea" },
-    { title: "Blob Events",   sub: "blob_activities count",  latest: fmt(snap?.totalBlobEvents), data: series.map(p => p.totalBlobEvents ?? 0).filter(Boolean), color: "#d97706" },
+    {
+      title: "Total Blobs",
+      sub:   isTestnet ? "is_written=1 (all ever)" : "is_written=1 — matches Explorer",
+      latest: fmt(snap?.totalBlobs),
+      data:  series.map(p => p.totalBlobs ?? 0).filter(Boolean),
+      color: isTestnet ? "#0891b2" : "#2563eb",
+    },
+    {
+      title: "Block Height",
+      sub:   "Chain progress",
+      latest: snap?.blockHeight ? `#${snap.blockHeight.toLocaleString("en-US")}` : "—",
+      data:  series.map(p => p.blockHeight).filter(v => v > 0),
+      color: isTestnet ? accentColor : "#059669",
+    },
+    {
+      title: "Storage Used",
+      sub:   isTestnet ? "is_written=1 total" : "sum{size} where is_written=1",
+      latest: fmtBytes(snap?.totalStorageBytes),
+      data:  series.map(p => p.totalStorageBytes ?? 0).filter(Boolean),
+      color: "#9333ea",
+    },
+    {
+      title: "Blob Events",
+      sub:   "blob_activities count",
+      latest: fmt(snap?.totalBlobEvents),
+      data:  series.map(p => p.totalBlobEvents ?? 0).filter(Boolean),
+      color: "#d97706",
+    },
   ];
 
   return (
@@ -345,7 +397,6 @@ export default function AnalyticsPage() {
         </div>
       )}
 
-      {/* Error only shown when NO data at all */}
       {showError && (
         <div style={{ background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 8, padding: "10px 14px", marginBottom: 14, fontSize: 13, color: "#d97706", display: "flex", alignItems: "center", gap: 8 }}>
           <span>⚠</span><span>{error}</span>
@@ -375,16 +426,23 @@ export default function AnalyticsPage() {
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
               {[
-                { label: "Active",  v: snap.activeBlobs,     color: "#22c55e" },
-                { label: "Pending", v: snap.pendingOrFailed, color: "#f59e0b" },
-                { label: "Deleted", v: snap.deletedBlobs,    color: "#ef4444" },
-                { label: "Empty",   v: snap.emptyRecords,    color: "#9ca3af" },
-              ].map(({ label, v, color }) => (
+                { label: "Active",   v: snap.activeBlobs,   color: "#22c55e", hint: "is_written=1, is_deleted=0" },
+                { label: "Pending",  v: snap.pendingBlobs,  color: "#f59e0b", hint: "is_written=0, is_deleted=0" },
+                { label: "Deleted",  v: snap.deletedBlobs,  color: "#ef4444", hint: "is_deleted=1" },
+                { label: "Empty",    v: snap.emptyRecords,  color: "#9ca3af", hint: "size=0" },
+              ].map(({ label, v, color, hint }) => (
                 <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 7 }}><div style={{ width: 8, height: 8, borderRadius: 2, background: color, flexShrink: 0 }} /><span style={{ fontSize: 13, color: "var(--text-muted)" }}>{label}</span></div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: 2, background: color, flexShrink: 0 }} />
+                    <span style={{ fontSize: 13, color: "var(--text-muted)" }} title={hint}>{label}</span>
+                  </div>
                   <span style={{ fontSize: 14, fontWeight: 700, color: "var(--text-primary)", fontFamily: "monospace", fontVariantNumeric: "tabular-nums" }}>{fmt(v)}</span>
                 </div>
               ))}
+              <div style={{ marginTop: 4, paddingTop: 6, borderTop: "1px solid var(--border-soft)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: 11, color: "var(--text-dim)" }}>Total (is_written=1)</span>
+                <span style={{ fontSize: 13, fontWeight: 800, color: accentColor, fontFamily: "monospace" }}>{fmt(snap.totalBlobs)}</span>
+              </div>
             </div>
           )}
         </div>
@@ -397,7 +455,9 @@ export default function AnalyticsPage() {
 
       {/* 4 sparkline charts */}
       <div className="ag4" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 22 }}>
-        {CHARTS.map(c => <ChartCard key={c.title} title={c.title} sub={c.sub} latest={c.latest} latestColor={c.color} data={c.data} color={c.color} />)}
+        {CHARTS.map(c => (
+          <ChartCard key={c.title} title={c.title} sub={c.sub} latest={c.latest} latestColor={c.color} data={c.data} color={c.color} />
+        ))}
       </div>
 
       {series.length > 1 && (
@@ -408,8 +468,8 @@ export default function AnalyticsPage() {
 
       <div style={{ background: "var(--bg-card2)", border: "1px solid var(--border)", borderRadius: 10, padding: "12px 16px", fontSize: 12, color: "var(--text-dim)", fontFamily: "monospace" }}>
         {isTestnet
-          ? "Source: Aptos Testnet REST API · storage_provider_registry · placement_group_registry · slice_registry · account_transactions (V3 Indexer)"
-          : "Source: Shelby Dedicated Indexer (blobs_aggregate · blob_activities_aggregate) · On-chain: Aptos RPC resource reads"}
+          ? "Source: Aptos Testnet REST API + Indexer · Total Blobs = is_written=1 (matches Explorer)"
+          : "Source: Shelby Dedicated Indexer · Total Blobs = is_written=1 (matches shelby.xyz Explorer)"}
       </div>
     </div>
   );

@@ -23,8 +23,8 @@ const DASHBOARD_LINKS = [
 
 const COMMUNITY_LINKS = [
   { label: "Discord",  href: "https://discord.com/invite/shelbyserves", external: true },
-  { label: "Twitter",  href: "https://x.com/shelby_xyz",                external: true },
-  { label: "GitHub",   href: "https://github.com/D2VD",                 external: true },
+  { label: "Twitter",  href: "https://x.com/shelbyserves",                external: true },
+  { label: "GitHub",   href: "https://github.com/shelby",                 external: true },
 ] as const;
 
 // ── Sub-components ─────────────────────────────────────────────────────────────

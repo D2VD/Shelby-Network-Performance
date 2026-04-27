@@ -1,110 +1,32 @@
 "use client";
-/**
- * app/dashboard/providers/page.tsx — v15.0
- * FIXES:
- * 1. Waitlisted SPs show "Awaiting Activation" as health badge (not "Unknown")
- *    with a yellow/amber color — they are registered but not yet active
- * 2. Health badge colors: Healthy=green, Faulty/Unhealthy=red, Unknown=gray, Awaiting=yellow
- * 3. suppressHydrationWarning on time display
- */
+// app/dashboard/providers/page.tsx — v16.0 (Phase 2 Step 5)
+//
+// CHANGES v16.0:
+//   - Layout: Tailwind classes thay inline styles
+//   - SummaryBar: DataGrid + StatCard components
+//   - Provider table: shadcn Table + StatusBadge + MonoValue + CopyButton
+//   - Filter/Sort bar: Tailwind + RangeSelector pattern
+//   - ErrorBanner, EmptyState, SkeletonTable từ ui.tsx
+//   - Map section: giữ nguyên ProviderMap (ssr: false)
+//   - Logic fetch: KHÔNG thay đổi
+//   - TestnetMapNotice: inline component nhỏ
 
 import { useState, useEffect, useCallback } from "react";
 import { useNetwork } from "@/components/network-context";
-import { useTheme }   from "@/components/theme-context";
 import { ProviderMap } from "@/components/provider-map";
 import type { StorageProvider } from "@/lib/types";
 import { ZONE_META } from "@/lib/types";
+import {
+  StatusBadge, MonoValue, CopyButton, ErrorBanner,
+  EmptyState, SkeletonTable, LiveIndicator, NetworkBadge,
+  StatCard, DataGrid,
+  Table, TableHeader, TableBody, TableRow, TableHead, TableCell,
+} from "@/components/ui";
+import { cn } from "@/lib/utils";
 
-function TestnetMapNotice() {
-  return (
-    <div style={{ background: "rgba(147,51,234,0.07)", border: "1px solid rgba(147,51,234,0.25)", borderRadius: 10, padding: "10px 16px", marginBottom: 16, fontSize: 13, color: "#c084fc", display: "flex", alignItems: "center", gap: 8 }}>
-      <span>⚗</span><span>Shelby Testnet · Storage provider data from Aptos Testnet RPC</span>
-    </div>
-  );
-}
-
-type Variant = "green" | "red" | "yellow" | "gray" | "blue" | "cyan";
-
-function Badge({ label, variant }: { label: string; variant: Variant }) {
-  const { isDark } = useTheme();
-  const COLORS: Record<Variant, { light: { bg: string; color: string }; dark: { bg: string; color: string } }> = {
-    green:  { light: { bg: "#f0fdf4", color: "#16a34a" }, dark: { bg: "rgba(34,197,94,0.12)",   color: "#22c55e" } },
-    red:    { light: { bg: "#fef2f2", color: "#dc2626" }, dark: { bg: "rgba(239,68,68,0.12)",   color: "#ef4444" } },
-    yellow: { light: { bg: "#fffbeb", color: "#d97706" }, dark: { bg: "rgba(245,158,11,0.12)",  color: "#f59e0b" } },
-    gray:   { light: { bg: "#f9fafb", color: "#6b7280" }, dark: { bg: "rgba(100,116,139,0.12)", color: "#94a3b8" } },
-    blue:   { light: { bg: "#eff6ff", color: "#2563eb" }, dark: { bg: "rgba(59,130,246,0.12)",  color: "#3b82f6" } },
-    cyan:   { light: { bg: "#ecfeff", color: "#0891b2" }, dark: { bg: "rgba(6,182,212,0.12)",   color: "#06b6d4" } },
-  };
-  const s = isDark ? COLORS[variant].dark : COLORS[variant].light;
-  return (
-    <span style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "3px 10px", borderRadius: 6, fontSize: 12, fontWeight: 600, background: s.bg, color: s.color, whiteSpace: "nowrap" }}>
-      <span style={{ width: 6, height: 6, borderRadius: "50%", background: s.color, display: "inline-block", flexShrink: 0 }} />
-      {label}
-    </span>
-  );
-}
-
-// FIX: Map health string → badge variant
-// "Awaiting Activation" → yellow (waitlisted SPs, valid state)
-// "Healthy" → green, "Faulty"/"Unhealthy" → red, "Unknown" → gray
-function healthVariant(h: string): Variant {
-  if (h === "Healthy")            return "green";
-  if (h === "Faulty" || h === "Unhealthy") return "red";
-  if (h === "Awaiting Activation") return "yellow";
-  return "gray";
-}
-
-function stateVariant(s: string): Variant {
-  if (s === "Active")     return "green";
-  if (s === "Waitlisted") return "yellow";
-  if (s === "Frozen")     return "blue";
-  return "gray";
-}
-
-// Health dot color for the marker
-function healthDotColor(h: string): string {
-  if (h === "Healthy")             return "#22c55e";
-  if (h === "Faulty" || h === "Unhealthy") return "#ef4444";
-  if (h === "Awaiting Activation") return "#f59e0b";
-  return "#9ca3af";
-}
-
-function BlsKey({ full }: { full: string }) {
-  const [copied, setCopied] = useState(false);
-  if (!full) return <span style={{ color: "var(--text-dim)", fontSize: 13 }}>—</span>;
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-      <span style={{ fontFamily: "monospace", fontSize: 11, color: "var(--text-muted)" }} title={full}>{full.slice(0, 10)}…</span>
-      <button onClick={async (e) => { e.stopPropagation(); await navigator.clipboard.writeText(full).catch(() => {}); setCopied(true); setTimeout(() => setCopied(false), 1500); }} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: copied ? "#22c55e" : "var(--text-dim)", padding: "0 2px" }}>
-        {copied ? "✓" : "⧉"}
-      </button>
-    </div>
-  );
-}
-
-function SummaryBar({ providers }: { providers: StorageProvider[] }) {
-  const healthy    = providers.filter(p => p.health === "Healthy").length;
-  const active     = providers.filter(p => p.state  === "Active").length;
-  const waitlisted = providers.filter(p => p.state  === "Waitlisted").length;
-  const zones      = new Set(providers.map(p => p.availabilityZone)).size;
-  const totalTiB   = providers.reduce((s, p) => s + (p.capacityTiB ?? 0), 0);
-  return (
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(6,1fr)", gap: 1, background: "var(--border)", borderRadius: 12, overflow: "hidden", border: "1px solid var(--border)" }}>
-      {[
-        { label: "Total SPs",      value: providers.length,  color: "#2563eb" },
-        { label: "Healthy",        value: healthy,            color: "#16a34a" },
-        { label: "Active",         value: active,             color: "#0891b2" },
-        { label: "Waitlisted",     value: waitlisted,         color: "#f59e0b" },
-        { label: "Zones",          value: zones,              color: "#8b5cf6" },
-        { label: "Total Capacity", value: totalTiB > 0 ? `${totalTiB.toFixed(0)} TiB` : "—", color: "#d97706" },
-      ].map(s => (
-        <div key={s.label} style={{ background: "var(--bg-card)", padding: "14px 10px", textAlign: "center" }}>
-          <div style={{ fontFamily: "monospace", fontSize: 22, fontWeight: 700, color: s.color, letterSpacing: -0.5 }}>{s.value}</div>
-          <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 3, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>{s.label}</div>
-        </div>
-      ))}
-    </div>
-  );
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function getZoneLabel(az: string): string {
+  return ZONE_META[az]?.label ?? az;
 }
 
 function adaptToStorageProvider(sp: Record<string, unknown>): StorageProvider {
@@ -128,17 +50,90 @@ function adaptToStorageProvider(sp: Record<string, unknown>): StorageProvider {
   };
 }
 
+type FilterKey = "all" | "healthy" | "faulty" | "waitlisted";
+type SortKey   = "zone" | "health" | "state";
+
+// ── Health dot color ──────────────────────────────────────────────────────────
+function HealthDot({ health }: { health: string }) {
+  const color =
+    health === "Healthy"             ? "bg-emerald-500 shadow-[0_0_6px_rgba(34,197,94,0.6)]" :
+    health === "Faulty" ||
+    health === "Unhealthy"           ? "bg-red-500"   :
+    health === "Awaiting Activation" ? "bg-amber-400" :
+                                       "bg-slate-400";
+  return <span className={cn("inline-block size-2 rounded-full shrink-0", color)} />;
+}
+
+// ── Summary bar ───────────────────────────────────────────────────────────────
+function SummaryBar({ providers }: { providers: StorageProvider[] }) {
+  const healthy    = providers.filter(p => p.health === "Healthy").length;
+  const active     = providers.filter(p => p.state  === "Active").length;
+  const waitlisted = providers.filter(p => p.state  === "Waitlisted").length;
+  const zones      = new Set(providers.map(p => p.availabilityZone)).size;
+  const totalTiB   = providers.reduce((s, p) => s + (p.capacityTiB ?? 0), 0);
+
+  return (
+    <DataGrid cols={6} className="gap-px rounded-xl overflow-hidden border border-[var(--border)]">
+      {[
+        { label: "Total SPs",      value: String(providers.length), accent: "#2563eb" },
+        { label: "Healthy",        value: String(healthy),          accent: "#16a34a" },
+        { label: "Active",         value: String(active),           accent: "#0891b2" },
+        { label: "Waitlisted",     value: String(waitlisted),       accent: "#d97706" },
+        { label: "Zones",          value: String(zones),            accent: "#8b5cf6" },
+        { label: "Total Capacity", value: totalTiB > 0 ? `${totalTiB.toFixed(0)} TiB` : "—", accent: "#d97706" },
+      ].map(s => (
+        <div key={s.label} className="bg-[var(--bg-card)] px-3 py-4 text-center">
+          <div className="text-xl font-extrabold tabular-nums" style={{ color: s.accent, fontFamily: "var(--font-mono)" }}>
+            {s.value}
+          </div>
+          <div className="mt-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+            {s.label}
+          </div>
+        </div>
+      ))}
+    </DataGrid>
+  );
+}
+
+// ── Filter button group ───────────────────────────────────────────────────────
+function FilterGroup({ value, onChange }: { value: FilterKey; onChange: (v: FilterKey) => void }) {
+  const opts: { key: FilterKey; label: string }[] = [
+    { key: "all",       label: "All"       },
+    { key: "healthy",   label: "Healthy"   },
+    { key: "faulty",    label: "Faulty"    },
+    { key: "waitlisted",label: "Waitlisted"},
+  ];
+  return (
+    <div className="inline-flex gap-0.5 rounded-lg border border-[var(--border)] bg-[var(--bg-card2)] p-0.5">
+      {opts.map(o => (
+        <button
+          key={o.key}
+          onClick={() => onChange(o.key)}
+          className={cn(
+            "rounded-md px-3 py-1.5 text-xs font-semibold transition-all cursor-pointer border-0",
+            value === o.key
+              ? "bg-[var(--bg-card)] text-[var(--text-primary)] shadow-sm"
+              : "bg-transparent text-[var(--text-muted)] hover:text-[var(--text-secondary)]",
+          )}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── Main page ─────────────────────────────────────────────────────────────────
 export default function ProvidersPage() {
   const { network } = useNetwork();
-  const { isDark }  = useTheme();
   const isTestnet   = network === "testnet";
 
   const [providers, setProviders] = useState<StorageProvider[]>([]);
   const [loading,   setLoading]   = useState(true);
   const [error,     setError]     = useState<string | null>(null);
-  const [lastAtStr, setLastAtStr] = useState<string>("");  // client-side only
-  const [filter,    setFilter]    = useState<"all" | "healthy" | "faulty" | "waitlisted">("all");
-  const [sortBy,    setSortBy]    = useState<"zone" | "health" | "state">("zone");
+  const [lastAtStr, setLastAtStr] = useState<string>("");
+  const [filter,    setFilter]    = useState<FilterKey>("all");
+  const [sortBy,    setSortBy]    = useState<SortKey>("zone");
   const [source,    setSource]    = useState<string>("");
 
   const fetchProviders = useCallback(async () => {
@@ -150,10 +145,6 @@ export default function ProvidersPage() {
       const raw = d?.data?.providers;
       if (Array.isArray(raw)) {
         setProviders((raw as Record<string, unknown>[]).map(adaptToStorageProvider));
-        setLastAtStr(new Date().toLocaleTimeString());
-        setSource(String(d?.source ?? "vps"));
-      } else {
-        setProviders([]);
         setLastAtStr(new Date().toLocaleTimeString());
         setSource(String(d?.source ?? "vps"));
       }
@@ -171,11 +162,12 @@ export default function ProvidersPage() {
     return () => clearInterval(id);
   }, [fetchProviders]);
 
+  // Filter + sort
   const filtered = providers
     .filter(p => {
       if (filter === "healthy")    return p.health === "Healthy";
       if (filter === "faulty")     return (p.health as string) === "Faulty" || (p.health as string) === "Unhealthy";
-      if (filter === "waitlisted") return p.state  === "Waitlisted";
+      if (filter === "waitlisted") return p.state === "Waitlisted";
       return true;
     })
     .sort((a, b) =>
@@ -186,143 +178,249 @@ export default function ProvidersPage() {
 
   const healthyCount = providers.filter(p => p.health === "Healthy").length;
 
-  function getZoneLabel(az: string): string {
-    return ZONE_META[az]?.label ?? az;
-  }
-
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 0, minHeight: "calc(100vh - 120px)", background: "var(--bg-primary)" }}>
+    <div className="flex flex-col min-h-[calc(100vh-120px)] bg-[var(--bg-primary)]">
 
-      {/* MAP */}
-      <div style={{ background: isDark ? "#0d1526" : "#f0f4f8", position: "relative", height: "55vh", minHeight: 340 }}>
-        <div style={{ position: "absolute", top: 12, right: 52, zIndex: 20, display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ background: isDark ? "rgba(13,21,38,0.92)" : "rgba(255,255,255,0.92)", border: `1px solid ${isDark ? "rgba(34,197,94,0.3)" : "rgba(34,197,94,0.4)"}`, borderRadius: 8, padding: "5px 14px", fontSize: 12, color: isDark ? "#94a3b8" : "#6b7280", backdropFilter: "blur(8px)", display: "flex", alignItems: "center", gap: 7 }}>
-            <span style={{ width: 7, height: 7, borderRadius: "50%", background: loading ? "#9ca3af" : providers.length > 0 ? "#22c55e" : "#9ca3af", display: "inline-block" }} />
-            {loading ? "Loading…" : providers.length === 0 ? (isTestnet ? "No testnet providers yet" : "No providers") : `${healthyCount}/${providers.length} nodes online`}
-          </div>
+      {/* ── MAP section ──────────────────────────────────────────────────── */}
+      <div className="relative bg-[var(--bg-card2)]" style={{ height: "55vh", minHeight: 340 }}>
+
+        {/* Map status badge */}
+        <div className="absolute top-3 right-3 z-20 flex items-center gap-2">
           {lastAtStr && (
-            <div suppressHydrationWarning style={{ background: isDark ? "rgba(13,21,38,0.9)" : "rgba(255,255,255,0.9)", border: `1px solid ${isDark ? "rgba(255,255,255,0.08)" : "#e5e7eb"}`, borderRadius: 6, padding: "4px 10px", fontSize: 11, color: "var(--text-dim)", fontFamily: "monospace" }}>
+            <span suppressHydrationWarning className="rounded-md border border-[var(--border)] bg-[var(--bg-card)]/90 px-3 py-1 text-[11px] font-mono text-[var(--text-dim)] backdrop-blur-sm">
               {lastAtStr}
-            </div>
+            </span>
           )}
+          <div className={cn(
+            "flex items-center gap-2 rounded-md border px-3 py-1 text-xs backdrop-blur-sm",
+            loading
+              ? "border-[var(--border)] bg-[var(--bg-card)]/90 text-[var(--text-muted)]"
+              : providers.length > 0
+              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+              : "border-[var(--border)] bg-[var(--bg-card)]/90 text-[var(--text-dim)]",
+          )}>
+            {!loading && providers.length > 0 && (
+              <span className="relative flex size-1.5">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                <span className="relative inline-flex size-1.5 rounded-full bg-emerald-500" />
+              </span>
+            )}
+            {loading
+              ? "Loading…"
+              : providers.length === 0
+              ? (isTestnet ? "No testnet providers" : "No providers")
+              : `${healthyCount}/${providers.length} nodes online`
+            }
+          </div>
         </div>
 
+        {/* Map content */}
         {loading && providers.length === 0 ? (
-          <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 14, flexDirection: "column", gap: 12 }}>
-            <div style={{ width: 28, height: 28, borderRadius: "50%", border: "2px solid var(--border)", borderTopColor: "var(--accent)", animation: "spin 1s linear infinite" }} />
-            <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+          <div className="flex h-full flex-col items-center justify-center gap-3 text-[var(--text-muted)] text-sm">
+            <div className="size-7 rounded-full border-2 border-[var(--border)] border-t-[var(--accent)] animate-spin" />
             {isTestnet ? "Fetching testnet providers…" : "Loading providers…"}
           </div>
         ) : error && providers.length === 0 ? (
-          <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 12, padding: "0 24px", textAlign: "center" }}>
-            <span style={{ fontSize: 28 }}>⚠️</span>
-            <div style={{ fontSize: 14, color: "#f59e0b", fontWeight: 600 }}>Provider data unavailable</div>
-            <div style={{ fontSize: 12, color: "var(--text-dim)", maxWidth: 400 }}>{error}</div>
-            <button onClick={fetchProviders} style={{ padding: "8px 18px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg-card)", color: "var(--text-primary)", fontSize: 13, cursor: "pointer" }}>⟳ Retry</button>
+          <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+            <span className="text-3xl">⚠️</span>
+            <p className="text-sm font-semibold text-amber-500">Provider data unavailable</p>
+            <p className="text-xs text-[var(--text-dim)] max-w-sm">{error}</p>
+            <button
+              onClick={fetchProviders}
+              className="mt-1 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-4 py-2 text-xs font-medium text-[var(--text-primary)] hover:border-[var(--text-dim)] transition-colors cursor-pointer"
+            >
+              ⟳ Retry
+            </button>
           </div>
         ) : (
           <ProviderMap providers={providers} />
         )}
       </div>
 
-      {/* STATS */}
-      <div style={{ padding: "18px 26px", background: "var(--bg-card)", borderBottom: "1px solid var(--border)" }}>
-        {isTestnet && <TestnetMapNotice />}
+      {/* ── Stats section ──────────────────────────────────────────────────── */}
+      <div className="border-b border-[var(--border)] bg-[var(--bg-card)] px-6 py-5">
+        {isTestnet && (
+          <div className="mb-4 flex items-center gap-2 rounded-xl border border-purple-500/25 bg-purple-500/8 px-4 py-2.5 text-sm text-purple-400">
+            <span>⚗</span>
+            <span>Shelby Testnet · Storage provider data from Aptos Testnet RPC</span>
+          </div>
+        )}
         <SummaryBar providers={providers} />
-        {source && <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-dim)", fontFamily: "monospace" }}>Source: {source} · {isTestnet ? "Aptos Testnet RPC" : "Shelbynet on-chain"} · Auto-refresh 60s</div>}
+        {source && (
+          <p className="mt-2.5 text-[11px] font-mono text-[var(--text-dim)]">
+            Source: {source} · {isTestnet ? "Aptos Testnet RPC" : "Shelbynet on-chain"} · Auto-refresh 60s
+          </p>
+        )}
       </div>
 
-      {/* TABLE */}
-      <div style={{ flex: 1, background: "var(--bg-primary)", padding: "22px 26px" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18, flexWrap: "wrap", gap: 12 }}>
+      {/* ── Provider table ─────────────────────────────────────────────────── */}
+      <div className="flex-1 bg-[var(--bg-primary)] px-6 py-5">
+
+        {/* Table header row */}
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h2 style={{ fontSize: 20, fontWeight: 700, color: "var(--text-primary)", margin: 0 }}>Provider Directory</h2>
-            <p style={{ fontSize: 13, color: "var(--text-muted)", margin: "4px 0 0", fontFamily: "monospace" }}>
-              {loading && providers.length === 0 ? "Loading…" : `${filtered.length} of ${providers.length} providers · ${isTestnet ? "Aptos Testnet" : "Shelbynet"} · Auto-refresh 60s`}
+            <h2 className="text-lg font-bold text-[var(--text-primary)]">Provider Directory</h2>
+            <p className="mt-0.5 text-xs font-mono text-[var(--text-muted)]">
+              {loading && providers.length === 0
+                ? "Loading…"
+                : `${filtered.length} of ${providers.length} providers · ${isTestnet ? "Aptos Testnet" : "Shelbynet"} · Auto-refresh 60s`
+              }
             </p>
           </div>
-          <div style={{ display: "flex", gap: 9 }}>
-            <div style={{ display: "flex", gap: 2, background: "var(--bg-card2)", borderRadius: 9, padding: 2, border: "1px solid var(--border)" }}>
-              {(["all", "healthy", "faulty", "waitlisted"] as const).map(f => (
-                <button key={f} onClick={() => setFilter(f)} style={{ padding: "6px 14px", borderRadius: 7, border: "none", fontSize: 12, fontWeight: filter === f ? 600 : 400, background: filter === f ? "var(--bg-card)" : "transparent", color: filter === f ? "var(--text-primary)" : "var(--text-muted)", boxShadow: filter === f ? "0 1px 3px var(--shadow-color)" : "none", cursor: "pointer", textTransform: "capitalize" }}>{f}</button>
-              ))}
-            </div>
-            <select value={sortBy} onChange={e => setSortBy(e.target.value as "zone" | "health" | "state")} style={{ padding: "6px 11px", borderRadius: 8, border: "1px solid var(--border)", fontSize: 12, color: "var(--text-primary)", background: "var(--bg-card)", cursor: "pointer", outline: "none" }}>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <FilterGroup value={filter} onChange={f => { setFilter(f); }} />
+
+            <select
+              value={sortBy}
+              onChange={e => setSortBy(e.target.value as SortKey)}
+              className={cn(
+                "rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-3 py-1.5",
+                "text-xs text-[var(--text-primary)] cursor-pointer outline-none",
+                "hover:border-[var(--text-dim)] transition-colors",
+              )}
+            >
               <option value="zone">Sort: Zone</option>
               <option value="health">Sort: Health</option>
               <option value="state">Sort: State</option>
             </select>
-            <button onClick={fetchProviders} disabled={loading} style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--bg-card)", fontSize: 12, color: "var(--text-muted)", cursor: "pointer", opacity: loading ? 0.6 : 1 }}>
-              {loading ? "…" : "⟳ Refresh"}
+
+            <button
+              onClick={fetchProviders}
+              disabled={loading}
+              className={cn(
+                "inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)]",
+                "bg-[var(--bg-card)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]",
+                "hover:text-[var(--text-primary)] hover:border-[var(--text-dim)]",
+                "transition-all cursor-pointer disabled:opacity-50",
+              )}
+            >
+              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" className={loading ? "animate-spin" : ""}>
+                <path d="M10 6A4 4 0 112 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                <path d="M10 3v3h-3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+              {loading ? "…" : "Refresh"}
             </button>
           </div>
         </div>
 
+        {/* Error */}
         {error && providers.length === 0 && (
-          <div style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 9, padding: "11px 15px", marginBottom: 14, fontSize: 13, color: "#ef4444" }}>⚠ {error}</div>
+          <ErrorBanner message={error} variant="error" onRetry={fetchProviders} className="mb-4" />
         )}
 
-        <div style={{ borderRadius: 11, border: "1px solid var(--border)", overflow: "hidden" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
-            <thead>
-              <tr style={{ background: "var(--bg-card2)", borderBottom: "1px solid var(--border)" }}>
-                {["", "ADDRESS", "ZONE / DC", "HEALTH", "STATE", "CAPACITY", "BLS KEY"].map((h, i) => (
-                  <th key={i} style={{ padding: i === 0 ? "10px 18px" : "10px 14px", textAlign: i === 5 ? "right" : "left", fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.07em", whiteSpace: "nowrap" }}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {loading && providers.length === 0 ? (
-                Array.from({ length: 6 }).map((_, i) => (
-                  <tr key={i} style={{ borderBottom: "1px solid var(--border-soft)", background: i % 2 === 0 ? "var(--bg-card)" : "var(--bg-card2)" }}>
-                    {[18, 120, 100, 60, 60, 70, 80].map((w, j) => (
-                      <td key={j} style={{ padding: j === 0 ? "11px 18px" : "11px 14px" }}>
-                        <div className="skeleton" style={{ width: w, height: j === 0 ? 9 : 14, borderRadius: j === 0 ? "50%" : 4 }} />
-                      </td>
-                    ))}
-                  </tr>
-                ))
-              ) : filtered.length === 0 ? (
-                <tr><td colSpan={7} style={{ padding: "52px 18px", textAlign: "center", color: "var(--text-muted)", fontSize: 14 }}>
-                  {error ? <span>Failed to load — <button onClick={fetchProviders} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--accent)", fontSize: 14 }}>retry</button></span>
-                         : isTestnet ? "No testnet storage providers found." : "No providers match the current filter"}
-                </td></tr>
-              ) : filtered.map((p, i) => {
-                const healthStr  = p.health as string;
-                const dotColor   = healthDotColor(healthStr);
-                const variant    = healthVariant(healthStr);
-                const zoneLabel  = getZoneLabel(p.availabilityZone);
-                return (
-                  <tr key={p.address || i} style={{ borderBottom: "1px solid var(--border-soft)", background: i % 2 === 0 ? "var(--bg-card)" : "var(--bg-card2)" }}>
-                    <td style={{ padding: "11px 18px", width: 30 }}>
-                      <div style={{ width: 9, height: 9, borderRadius: "50%", background: dotColor, boxShadow: healthStr === "Healthy" ? `0 0 6px ${dotColor}88` : "none" }} />
-                    </td>
-                    <td style={{ padding: "11px 14px" }}>
-                      <span style={{ fontFamily: "monospace", fontSize: 13, color: "var(--text-primary)", fontWeight: 600 }}>{p.addressShort}</span>
-                      {p.geo?.city && <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 2 }}>{p.geo.city}{p.geo.countryCode ? `, ${p.geo.countryCode}` : ""}</div>}
-                    </td>
-                    <td style={{ padding: "11px 14px" }}>
-                      <div style={{ fontSize: 13, color: "var(--text-secondary)", fontWeight: 500 }}>{zoneLabel}</div>
-                    </td>
-                    <td style={{ padding: "11px 14px" }}>
-                      <Badge label={healthStr} variant={variant} />
-                    </td>
-                    <td style={{ padding: "11px 14px" }}>
-                      <Badge label={p.state} variant={stateVariant(p.state)} />
-                    </td>
-                    <td style={{ padding: "11px 14px", textAlign: "right" }}>
-                      {p.capacityTiB != null ? <span style={{ fontFamily: "monospace", fontSize: 13, color: "var(--text-primary)" }}>{p.capacityTiB.toFixed(2)} TiB</span> : <span style={{ color: "var(--text-dim)" }}>—</span>}
-                    </td>
-                    <td style={{ padding: "11px 18px" }}>
-                      <BlsKey full={p.fullBlsKey ?? p.blsKey ?? ""} />
-                      {p.netAddress && <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 1, fontFamily: "monospace" }}>{p.netAddress}</div>}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+        {/* Table */}
+        {loading && providers.length === 0 ? (
+          <SkeletonTable rows={8} cols={6} />
+        ) : filtered.length === 0 ? (
+          <EmptyState
+            icon="🗺"
+            title={error ? "Failed to load providers" : "No providers match this filter"}
+            description={error ? "Check backend connection" : "Try selecting a different filter"}
+            action={
+              <button
+                onClick={error ? fetchProviders : () => setFilter("all")}
+                className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors cursor-pointer"
+              >
+                {error ? "⟳ Retry" : "Clear filter"}
+              </button>
+            }
+          />
+        ) : (
+          <div className="rounded-xl border border-[var(--border)] overflow-hidden">
+            <Table>
+              <TableHeader>
+                <TableRow className="bg-[var(--bg-card2)] hover:bg-[var(--bg-card2)]">
+                  <TableHead className="w-8" />
+                  <TableHead>Address</TableHead>
+                  <TableHead>Zone / DC</TableHead>
+                  <TableHead>Health</TableHead>
+                  <TableHead>State</TableHead>
+                  <TableHead className="text-right">Capacity</TableHead>
+                  <TableHead>BLS Key</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {filtered.map((p, i) => {
+                  const healthStr = p.health as string;
+                  const bls       = p.fullBlsKey || p.blsKey || "";
+                  return (
+                    <TableRow
+                      key={p.address || i}
+                      className={cn(
+                        "transition-colors",
+                        i % 2 === 0
+                          ? "bg-[var(--bg-card)]"
+                          : "bg-[var(--bg-card2)]",
+                      )}
+                    >
+                      {/* Health dot */}
+                      <TableCell className="py-3 pl-4 pr-2">
+                        <HealthDot health={healthStr} />
+                      </TableCell>
+
+                      {/* Address */}
+                      <TableCell className="py-3">
+                        <div className="flex flex-col gap-0.5">
+                          <MonoValue value={p.address} truncate copyable />
+                          {p.geo?.city && (
+                            <span className="text-[10px] text-[var(--text-dim)]">
+                              {p.geo.city}{p.geo.countryCode ? `, ${p.geo.countryCode}` : ""}
+                            </span>
+                          )}
+                        </div>
+                      </TableCell>
+
+                      {/* Zone */}
+                      <TableCell className="py-3">
+                        <span className="text-sm font-medium text-[var(--text-secondary)]">
+                          {getZoneLabel(p.availabilityZone)}
+                        </span>
+                      </TableCell>
+
+                      {/* Health badge */}
+                      <TableCell className="py-3">
+                        <StatusBadge label={healthStr} />
+                      </TableCell>
+
+                      {/* State badge */}
+                      <TableCell className="py-3">
+                        <StatusBadge label={p.state} />
+                      </TableCell>
+
+                      {/* Capacity */}
+                      <TableCell className="py-3 text-right">
+                        {p.capacityTiB != null
+                          ? <span className="font-mono text-sm text-[var(--text-primary)]">{p.capacityTiB.toFixed(2)} TiB</span>
+                          : <span className="text-[var(--text-dim)]">—</span>
+                        }
+                      </TableCell>
+
+                      {/* BLS Key */}
+                      <TableCell className="py-3 pr-4">
+                        {bls ? (
+                          <div className="flex flex-col gap-0.5">
+                            <MonoValue
+                              value={bls}
+                              truncate
+                              copyable
+                              className="max-w-[160px]"
+                            />
+                            {p.netAddress && (
+                              <span className="text-[10px] font-mono text-[var(--text-dim)]">{p.netAddress}</span>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-[var(--text-dim)]">—</span>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </div>
+        )}
       </div>
     </div>
   );

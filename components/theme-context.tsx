@@ -69,13 +69,21 @@ const DARK_VARS: Record<string, string> = {
   "--accent-bg":     "rgba(56,189,248,0.1)",
 };
 
-function applyTheme(theme: AppTheme) {
+function applyTheme(theme: "light" | "dark") {
+  // (giữ nguyên import DARK_VARS, LIGHT_VARS từ file gốc)
   const vars = theme === "dark" ? DARK_VARS : LIGHT_VARS;
   const root = document.documentElement;
   Object.entries(vars).forEach(([k, v]) => root.style.setProperty(k, v));
   root.setAttribute("data-theme", theme);
-  // Override body background directly for instant swap
   document.body.style.background = vars["--bg-primary"];
+ 
+  // ── THÊM MỚI: Sync .dark class cho shadcn/ui ─────────────────────────
+  // shadcn darkMode: ["class"] cần class "dark" trên <html>
+  if (theme === "dark") {
+    root.classList.add("dark");
+  } else {
+    root.classList.remove("dark");
+  }
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {

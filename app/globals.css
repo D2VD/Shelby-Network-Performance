@@ -3,8 +3,12 @@
    Theme-aware: Light (default) + Dark (navy, not too dark)
    CSS Variables driven — ThemeContext controls root vars
    ============================================================ */
-
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
 
 /* ── Design Tokens (Light defaults — overridden by ThemeContext JS) ── */
 :root {
@@ -629,4 +633,238 @@ button { font-family: inherit; }
 /* ── Safe area for notched phones ── */
 @supports (padding: env(safe-area-inset-bottom)) {
   .app-shell main { padding-bottom: calc(20px + env(safe-area-inset-bottom)); }
+}
+
+/* ── shadcn Border Radius Variable ───────────────────────────────────────── */
+:root {
+  --radius: 0.625rem; /* 10px — khớp với --r-md hiện có */
+}
+
+/* ── shadcn HSL Bridge — Light Mode ─────────────────────────────────────── */
+/* shadcn yêu cầu HSL format. Ta bridge từ hex variables hiện có.
+   Giá trị HSL này correspond với light theme values trong LIGHT_VARS. */
+:root {
+  /* Background = --bg-primary (#f9fafb) */
+  --background-hsl: 210 20% 98%;
+  /* Foreground = --text-primary (#111827) */
+  --foreground-hsl: 222 47% 11%;
+
+  /* Card = --bg-card (#ffffff) */
+  --card-hsl: 0 0% 100%;
+  --card-foreground-hsl: 222 47% 11%;
+
+  /* Popover */
+  --popover-hsl: 0 0% 100%;
+  --popover-foreground-hsl: 222 47% 11%;
+
+  /* Primary = --net-color (#2563eb Shelbynet blue) */
+  --primary-hsl: 221 83% 53%;
+  --primary-foreground-hsl: 0 0% 100%;
+
+  /* Secondary = --bg-card2 (#f3f4f6) */
+  --secondary-hsl: 220 14% 96%;
+  --secondary-foreground-hsl: 220 9% 46%;
+
+  /* Muted = --bg-card2 */
+  --muted-hsl: 220 14% 96%;
+  --muted-foreground-hsl: 220 9% 46%;
+
+  /* Accent = --accent (#06b6d4 cyan) */
+  --accent-hsl: 189 94% 43%;
+  --accent-foreground-hsl: 0 0% 100%;
+
+  /* Destructive */
+  --destructive-hsl: 0 84% 60%;
+  --destructive-foreground-hsl: 0 0% 100%;
+
+  /* Border = --border (#e5e7eb) */
+  --border-hsl: 220 13% 91%;
+
+  /* Input = --border */
+  --input-hsl: 220 13% 91%;
+
+  /* Ring = --net-color */
+  --ring-hsl: 221 83% 53%;
+}
+
+/* ── shadcn HSL Bridge — Dark Mode ──────────────────────────────────────── */
+/* Triggered by [data-theme="dark"] (ThemeContext) */
+/* Ta CŨNG set .dark class để shadcn components nhận biết dark mode */
+[data-theme="dark"],
+.dark {
+  /* Background = --bg-primary dark (#0d1526) */
+  --background-hsl: 222 52% 11%;
+  /* Foreground = --text-primary dark (#e2e8f0) */
+  --foreground-hsl: 213 31% 91%;
+
+  /* Card = --bg-card dark (#132038) */
+  --card-hsl: 218 48% 15%;
+  --card-foreground-hsl: 213 31% 91%;
+
+  /* Popover */
+  --popover-hsl: 218 48% 15%;
+  --popover-foreground-hsl: 213 31% 91%;
+
+  /* Primary = --net-color dark (#38bdf8 bright blue) */
+  --primary-hsl: 199 89% 60%;
+  --primary-foreground-hsl: 218 52% 11%;
+
+  /* Secondary = --bg-card2 dark (#0f1a2e) */
+  --secondary-hsl: 220 50% 13%;
+  --secondary-foreground-hsl: 213 24% 79%;
+
+  /* Muted */
+  --muted-hsl: 220 50% 13%;
+  --muted-foreground-hsl: 215 20% 65%;
+
+  /* Accent = --accent dark (#38bdf8) */
+  --accent-hsl: 199 89% 60%;
+  --accent-foreground-hsl: 218 52% 11%;
+
+  /* Destructive */
+  --destructive-hsl: 0 63% 31%;
+  --destructive-foreground-hsl: 213 31% 91%;
+
+  /* Border = --border dark (#1e3a5f) */
+  --border-hsl: 215 51% 24%;
+
+  /* Input */
+  --input-hsl: 215 51% 24%;
+
+  /* Ring */
+  --ring-hsl: 199 89% 60%;
+}
+
+/* ── Testnet override cho Primary color ──────────────────────────────────── */
+/* Khi [data-network="testnet"], primary color → purple */
+[data-network="testnet"] {
+  --primary-hsl: 271 81% 56%;      /* #9333ea */
+  --ring-hsl:    271 81% 56%;
+}
+[data-theme="dark"][data-network="testnet"],
+.dark[data-network="testnet"] {
+  --primary-hsl: 270 67% 74%;      /* #c084fc */
+  --ring-hsl:    270 67% 74%;
+}
+
+/* ── shadcn Base Resets ───────────────────────────────────────────────────── */
+/* Override Tailwind base layer cho border-color */
+@layer base {
+  * {
+    border-color: hsl(var(--border-hsl));
+    @apply border-border outline-ring/50;
+  }
+  body {
+    background-color: hsl(var(--background-hsl));
+    color: hsl(var(--foreground-hsl));
+    @apply bg-background text-foreground;
+  }
+  .theme {
+    --font-heading:        var(--font-sans);
+    --font-sans:        var(--font-sans);
+  }
+  :root {
+    --background:        oklch(1 0 0);
+    --foreground:        oklch(0.145 0 0);
+    --card:        oklch(1 0 0);
+    --card-foreground:        oklch(0.145 0 0);
+    --popover:        oklch(1 0 0);
+    --popover-foreground:        oklch(0.145 0 0);
+    --primary:        oklch(0.205 0 0);
+    --primary-foreground:        oklch(0.985 0 0);
+    --secondary:        oklch(0.97 0 0);
+    --secondary-foreground:        oklch(0.205 0 0);
+    --muted:        oklch(0.97 0 0);
+    --muted-foreground:        oklch(0.556 0 0);
+    --accent:        oklch(0.97 0 0);
+    --accent-foreground:        oklch(0.205 0 0);
+    --destructive:        oklch(0.577 0.245 27.325);
+    --border:        oklch(0.922 0 0);
+    --input:        oklch(0.922 0 0);
+    --ring:        oklch(0.708 0 0);
+    --chart-1:        oklch(0.87 0 0);
+    --chart-2:        oklch(0.556 0 0);
+    --chart-3:        oklch(0.439 0 0);
+    --chart-4:        oklch(0.371 0 0);
+    --chart-5:        oklch(0.269 0 0);
+    --radius:        0.625rem;
+    --sidebar:        oklch(0.985 0 0);
+    --sidebar-foreground:        oklch(0.145 0 0);
+    --sidebar-primary:        oklch(0.205 0 0);
+    --sidebar-primary-foreground:        oklch(0.985 0 0);
+    --sidebar-accent:        oklch(0.97 0 0);
+    --sidebar-accent-foreground:        oklch(0.205 0 0);
+    --sidebar-border:        oklch(0.922 0 0);
+    --sidebar-ring:        oklch(0.708 0 0);
+  }
+  .dark {
+    --background:        oklch(0.145 0 0);
+    --foreground:        oklch(0.985 0 0);
+    --card:        oklch(0.205 0 0);
+    --card-foreground:        oklch(0.985 0 0);
+    --popover:        oklch(0.205 0 0);
+    --popover-foreground:        oklch(0.985 0 0);
+    --primary:        oklch(0.922 0 0);
+    --primary-foreground:        oklch(0.205 0 0);
+    --secondary:        oklch(0.269 0 0);
+    --secondary-foreground:        oklch(0.985 0 0);
+    --muted:        oklch(0.269 0 0);
+    --muted-foreground:        oklch(0.708 0 0);
+    --accent:        oklch(0.269 0 0);
+    --accent-foreground:        oklch(0.985 0 0);
+    --destructive:        oklch(0.704 0.191 22.216);
+    --border:        oklch(1 0 0 / 10%);
+    --input:        oklch(1 0 0 / 15%);
+    --ring:        oklch(0.556 0 0);
+    --chart-1:        oklch(0.87 0 0);
+    --chart-2:        oklch(0.556 0 0);
+    --chart-3:        oklch(0.439 0 0);
+    --chart-4:        oklch(0.371 0 0);
+    --chart-5:        oklch(0.269 0 0);
+    --sidebar:        oklch(0.205 0 0);
+    --sidebar-foreground:        oklch(0.985 0 0);
+    --sidebar-primary:        oklch(0.488 0.243 264.376);
+    --sidebar-primary-foreground:        oklch(0.985 0 0);
+    --sidebar-accent:        oklch(0.269 0 0);
+    --sidebar-accent-foreground:        oklch(0.985 0 0);
+    --sidebar-border:        oklch(1 0 0 / 10%);
+    --sidebar-ring:        oklch(0.556 0 0);
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+/* ── Utility classes dùng với Tailwind ────────────────────────────────────── */
+@layer utilities {
+  /* Network accent colors */
+  .text-network-primary { color: var(--net-color); }
+  .bg-network-primary   { background-color: var(--net-color); }
+  .border-network       { border-color: var(--net-border); }
+
+  /* Skeleton animation */
+  .animate-skeleton {
+    background: linear-gradient(
+      90deg,
+      var(--bg-card2) 25%,
+      var(--border-soft) 50%,
+      var(--bg-card2) 75%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+  }
+
+  /* Live pulse dot */
+  .live-pulse {
+    animation: pulse-dot 2s infinite;
+  }
+
+  /* Card hover lift */
+  .card-hover {
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+  .card-hover:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  }
 }

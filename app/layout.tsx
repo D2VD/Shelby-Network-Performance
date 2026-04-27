@@ -11,6 +11,10 @@ import { SiteFooter } from "@/components/footer";
 import { NetworkProvider } from "@/components/network-context";
 import { ThemeProvider } from "@/components/theme-context";
 import { Suspense } from "react";
+import { Geist } from "next/font/google";
+import { cn } from "@/lib/utils";
+
+const geist = Geist({subsets:['latin'],variable:'--font-sans'});
 
 export const metadata: Metadata = {
   title: "Shelby Analytics — Community Dashboard",
@@ -46,7 +50,7 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning className={cn("font-sans", geist.variable)}>
       <head>
         {/* Explicit favicon link for maximum browser compatibility */}
         <link rel="icon" href="/favicon.ico" sizes="any" />

@@ -124,9 +124,21 @@ const STATUS_CFG: Record<StatusVariant, { cls: string; dot: string }> = {
 };
 
 function toStatusVariant(s: string): StatusVariant {
-  const key = s.toLowerCase().replace(/[\s-]/g, "") as StatusVariant;
-  if (key in STATUS_CFG) return key;
-  if (key === "awaitingactivation") return "waiting";
+  // 1. Chuẩn hóa chuỗi đầu vào (Edge case: null/empty xử lý bởi toLowerCase)
+  const normalized = s?.toLowerCase().replace(/[\s-]/g, "") ?? "";
+
+  // 2. Xử lý Alias mapping (Các giá trị không nằm trong STATUS_CFG)
+  if (normalized === "awaitingactivation") {
+    return "waiting";
+  }
+
+  // 3. Kiểm tra tính hợp lệ trong cấu hình (Happy path)
+  // Sử dụng 'in' để kiểm tra trước khi ép kiểu
+  if (normalized in STATUS_CFG) {
+    return normalized as StatusVariant;
+  }
+
+  // 4. Fallback mặc định cho các giá trị không xác định
   return "neutral";
 }
 

@@ -1,6 +1,6 @@
-// lib/types.ts — Shared TypeScript types (v2.1 — add Unknown health state)
+// lib/types.ts — v2.2
+// CHANGES v2.2: Added "Frozen" to ProviderState (on-chain frozen_providers map)
 
-// ── Network / Node ────────────────────────────────────────────────────────────
 export interface NodeInfo {
   blockHeight: number;
   ledgerVersion: number;
@@ -9,35 +9,20 @@ export interface NodeInfo {
 }
 
 export interface LatencyResult {
-  avg: number;
-  min: number;
-  max: number;
-  samples: number[];
+  avg: number; min: number; max: number; samples: number[];
 }
 
-// ── Geo Location ──────────────────────────────────────────────────────────────
 export interface GeoLocation {
-  lat: number;
-  lng: number;
-  city?: string;
-  region?: string;
-  country?: string;
-  countryCode?: string;
-  isp?: string;
-  source: "geo-ip" | "zone-fallback" | "manual";
+  lat: number; lng: number;
+  city?: string; region?: string; country?: string; countryCode?: string;
+  isp?: string; source: "geo-ip" | "zone-fallback" | "manual";
   geocodedAt?: string;
 }
 
-// ── Storage Provider ──────────────────────────────────────────────────────────
 export type ProviderState  = "Active" | "Waitlisted" | "Frozen" | "Leaving";
-// FIX ts(2367): Added "Unknown" — used for SPs without TCP check or no IP
 export type ProviderHealth = "Healthy" | "Faulty" | "Unhealthy" | "Unknown";
 export type AvailabilityZone =
-  | "dc_asia"
-  | "dc_australia"
-  | "dc_europe"
-  | "dc_us_east"
-  | "dc_us_west"
+  | "dc_asia" | "dc_australia" | "dc_europe" | "dc_us_east" | "dc_us_west"
   | string;
 
 export interface StorageProvider {
@@ -55,7 +40,6 @@ export interface StorageProvider {
   netAddress?:      string;
 }
 
-// ── KV Stored Node Record ─────────────────────────────────────────────────────
 export interface KVNodeRecord {
   address:          string;
   addressShort:     string;
@@ -76,7 +60,6 @@ export interface KVProvidersIndex {
   network:   string;
 }
 
-// ── Network Stats ─────────────────────────────────────────────────────────────
 export interface NetworkStats {
   totalBlobs:            number | null;
   totalStorageUsedBytes: number | null;
@@ -86,41 +69,21 @@ export interface NetworkStats {
   storageProviders:      number | null;
 }
 
-// ── API Response wrappers ─────────────────────────────────────────────────────
-export interface ApiOk<T> {
-  ok: true;
-  data: T;
-  fetchedAt: string;
-}
-
-export interface ApiErr {
-  ok: false;
-  error: string;
-  fetchedAt: string;
-}
-
+export interface ApiOk<T> { ok: true;  data: T; fetchedAt: string; }
+export interface ApiErr    { ok: false; error: string; fetchedAt: string; }
 export type ApiResult<T> = ApiOk<T> | ApiErr;
 
-// ── Benchmark ─────────────────────────────────────────────────────────────────
 export interface BlobUploadResult {
-  bytes:    number;
-  elapsed:  number;
-  speedKbs: number;
-  blobName: string;
-  txHash:   string | null;
-  status?:  string;
+  bytes: number; elapsed: number; speedKbs: number;
+  blobName: string; txHash: string | null; status?: string;
 }
 
 export interface BlobDownloadResult {
-  bytes:    number;
-  elapsed:  number;
-  speedKbs: number;
+  bytes: number; elapsed: number; speedKbs: number;
 }
 
 export interface TxTimeResult {
-  submitTime:  number;
-  confirmTime: number;
-  txHash:      string | null;
+  submitTime: number; confirmTime: number; txHash: string | null;
 }
 
 export interface BenchmarkResult {
@@ -133,7 +96,6 @@ export interface BenchmarkResult {
   score:          number;
 }
 
-// ── Region / Zone metadata ────────────────────────────────────────────────────
 export interface RegionSummary {
   zone:      AvailabilityZone;
   label:     string;
@@ -143,12 +105,9 @@ export interface RegionSummary {
 }
 
 export const ZONE_META: Record<string, {
-  label:       string;
-  shortLabel:  string;
-  mapX:        number;
-  mapY:        number;
-  fallbackLng: number;
-  fallbackLat: number;
+  label: string; shortLabel: string;
+  mapX: number; mapY: number;
+  fallbackLng: number; fallbackLat: number;
 }> = {
   dc_asia:      { label: "Asia (Singapore)",   shortLabel: "AS",  mapX: 78, mapY: 38, fallbackLng:  103.8198, fallbackLat:   1.3521 },
   dc_australia: { label: "Australia (Sydney)", shortLabel: "AU",  mapX: 82, mapY: 70, fallbackLng:  151.2093, fallbackLat: -33.8688 },

@@ -54,10 +54,10 @@ function providerToMarker(p: StorageProvider): GlobeMarker | null {
     : [0.94, 0.26, 0.21];       // #ef4444
 
   return {
-    location: [lat, lng],
-    size:     isHealthy ? 0.07 : 0.05,
-    color,
-  };
+  location: [lat, lng],
+  size: isHealthy ? 0.07 : 0.05,
+  color,
+} as any;
 }
 
 // ── Toggle button ─────────────────────────────────────────────────

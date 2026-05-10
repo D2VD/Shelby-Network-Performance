@@ -1,14 +1,16 @@
 "use client";
-// components/ui/globe.tsx — v5.0
+// components/ui/globe.tsx — v6.0
 //
-// Root cause of "drawArrays: no buffer is bound to enabled attribute":
-//   cobe reads canvas.width / canvas.height (HTML pixel attributes) to
-//   create its WebGL framebuffer. Setting only canvas.style.width/height
-//   (CSS) does NOT resize the WebGL drawing buffer — cobe still sees the
-//   default 300×150 canvas and renders into a mismatched buffer.
+// Root cause of persistent "drawArrays: no buffer" error:
+//   cobe INTERNALLY sets canvas.width / canvas.height from config.width /
+//   config.height. Pre-setting them ourselves caused a race where cobe's
+//   WebGL context was created against a 0-sized buffer.
 //
-// Fix: set canvas.width = size * dpr  AND  canvas.height = size * dpr
-//      as HTML attributes BEFORE calling createGlobe().
+// Correct pattern (from official cobe docs):
+//   1. Pass width/height = 0 initially (or skip — cobe defaults gracefully)
+//   2. In onRender, update state.width and state.height every frame from
+//      the live canvas.offsetWidth * dpr so cobe resizes its own buffer.
+//   3. Never manually set canvas.width or canvas.height.
 //
 // npm install cobe @react-spring/web
 
@@ -54,7 +56,6 @@ export default function Globe({
   markerColor  = [1, 0.47, 0.79],
 }: GlobeProps) {
   const { isDark }   = useTheme();
-  const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef    = useRef<HTMLCanvasElement>(null);
   const phiRef       = useRef(0);
   const isDragging   = useRef(false);
@@ -62,140 +63,79 @@ export default function Globe({
   const globeRef     = useRef<{ destroy: () => void } | null>(null);
   const [ready, setReady] = useState(false);
 
-  // React Spring: smooth 0→1 opacity on first render
   const spring = useSpring({
     opacity: ready ? 1 : 0,
     config:  { tension: 60, friction: 20 },
   });
 
   useEffect(() => {
-    const container = containerRef.current;
-    const canvas    = canvasRef.current;
-    if (!container || !canvas) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
-    // Destroy previous instance
     if (globeRef.current) {
       try { globeRef.current.destroy(); } catch { /* ignore */ }
       globeRef.current = null;
       setReady(false);
     }
 
-    // Wait one frame so the container has its final layout dimensions
-    const raf = requestAnimationFrame(() => {
-      const size = container.getBoundingClientRect().width || container.offsetWidth || 400;
-      const dpr  = Math.min(typeof window !== "undefined" ? window.devicePixelRatio : 2, 2);
-      const px   = Math.round(size * dpr);
+    const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio : 2, 2);
 
-      // ── KEY FIX ───────────────────────────────────────────────────
-      // Set the HTML pixel attributes so WebGL framebuffer matches.
-      // CSS size alone does NOT resize the WebGL drawing buffer.
-      canvas.width  = px;
-      canvas.height = px;
-      // CSS size so it fills the container visually
-      canvas.style.width  = `${size}px`;
-      canvas.style.height = `${size}px`;
+    // ── CORRECT COBE PATTERN ────────────────────────────────────────
+    // Pass an initial size so cobe has something to work with.
+    // Then update width/height every frame inside onRender so cobe's
+    // internal WebGL buffer always matches the live canvas size.
+    // NEVER set canvas.width / canvas.height manually.
+    const initialSize = canvas.offsetWidth || canvas.parentElement?.offsetWidth || 500;
 
-      const baseConfig: COBEOptions = {
-        devicePixelRatio: dpr,
-        width:            px,
-        height:           px,
-        phi:              phiRef.current,
-        theta:            0.15,
-        dark:             isDark ? 1 : 0,
-        diffuse:          isDark ? 1.4 : 1.2,
-        mapSamples:       20_000,
-        mapBrightness:    isDark ? 1.4 : 8,
-        baseColor:        (isDark
-          ? [0.06, 0.04, 0.03]
-          : [0.88, 0.88, 0.90]) as [number, number, number],
-        markerColor,
-        glowColor:        (isDark
-          ? [1, 0.47, 0.79]
-          : [0.90, 0.85, 0.92]) as [number, number, number],
-        markers: markers.map(m => ({ location: m.location, size: m.size })),
-      };
+    const baseConfig: COBEOptions = {
+      devicePixelRatio: dpr,
+      width:            initialSize * dpr,
+      height:           initialSize * dpr,
+      phi:              phiRef.current,
+      theta:            0.15,
+      dark:             isDark ? 1 : 0,
+      diffuse:          isDark ? 1.4 : 1.2,
+      mapSamples:       20_000,
+      mapBrightness:    isDark ? 1.4 : 8,
+      baseColor:        (isDark
+        ? [0.06, 0.04, 0.03]
+        : [0.88, 0.88, 0.90]) as [number, number, number],
+      markerColor,
+      glowColor:        (isDark
+        ? [1, 0.47, 0.79]
+        : [0.90, 0.85, 0.92]) as [number, number, number],
+      markers: markers.map(m => ({ location: m.location, size: m.size })),
+    };
 
-      // onRender absent from some cobe .d.ts versions → cast via any
-      const config = {
-        ...baseConfig,
-        onRender: (state: Record<string, unknown>) => {
-          if (autoRotate && !isDragging.current) phiRef.current += 0.0025;
-          state["phi"] = phiRef.current;
-        },
-      } as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    // onRender absent from some cobe .d.ts → cast via `as any`
+    // state typed as Record<string,unknown> to satisfy TS(7006)
+    const config = {
+      ...baseConfig,
+      onRender: (state: Record<string, unknown>) => {
+        // Live size update every frame — this is what prevents drawArrays errors
+        const w = canvas.offsetWidth || initialSize;
+        state["width"]  = w * dpr;
+        state["height"] = w * dpr;
 
-      try {
-        globeRef.current = createGlobe(canvas, config);
-        setTimeout(() => setReady(true), 100);
-      } catch (err) {
-        console.error("[Globe] init error:", err);
-      }
-    });
+        if (autoRotate && !isDragging.current) phiRef.current += 0.0025;
+        state["phi"] = phiRef.current;
+      },
+    } as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+
+    try {
+      globeRef.current = createGlobe(canvas, config);
+      setTimeout(() => setReady(true), 150);
+    } catch (err) {
+      console.error("[Globe] init error:", err);
+    }
 
     return () => {
-      cancelAnimationFrame(raf);
       if (globeRef.current) {
         try { globeRef.current.destroy(); } catch { /* ignore */ }
         globeRef.current = null;
       }
     };
   }, [isDark, markers, autoRotate, markerColor]);
-
-  // ResizeObserver — re-init when container resizes
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-    let prevW = 0;
-
-    const ro = new ResizeObserver(() => {
-      const w = Math.round(container.getBoundingClientRect().width);
-      if (w > 0 && Math.abs(w - prevW) > 8) {
-        prevW = w;
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        if (globeRef.current) {
-          try { globeRef.current.destroy(); } catch { /* ignore */ }
-          globeRef.current = null;
-        }
-        const dpr  = Math.min(window.devicePixelRatio, 2);
-        const px   = Math.round(w * dpr);
-        const dark = document.documentElement.getAttribute("data-theme") === "dark";
-
-        // Set pixel attributes here too
-        canvas.width  = px;
-        canvas.height = px;
-        canvas.style.width  = `${w}px`;
-        canvas.style.height = `${w}px`;
-
-        try {
-          globeRef.current = createGlobe(canvas, {
-            ...{
-              devicePixelRatio: dpr,
-              width:            px,
-              height:           px,
-              phi:              phiRef.current,
-              theta:            0.15,
-              dark:             dark ? 1 : 0,
-              diffuse:          1.2,
-              mapSamples:       20_000,
-              mapBrightness:    dark ? 1.4 : 8,
-              baseColor:        [0.88, 0.88, 0.90] as [number, number, number],
-              markerColor,
-              glowColor:        [0.90, 0.85, 0.92] as [number, number, number],
-              markers:          markers.map(m => ({ location: m.location, size: m.size })),
-            },
-            onRender: (state: Record<string, unknown>) => {
-              if (autoRotate && !isDragging.current) phiRef.current += 0.0025;
-              state["phi"] = phiRef.current;
-            },
-          } as any); // eslint-disable-line @typescript-eslint/no-explicit-any
-        } catch { /* ignore */ }
-      }
-    });
-
-    ro.observe(container);
-    return () => ro.disconnect();
-  }, [markers, autoRotate, markerColor]);
 
   const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!interactive) return;
@@ -211,7 +151,7 @@ export default function Globe({
   const onPointerUp = () => { isDragging.current = false; };
 
   return (
-    <div ref={containerRef} className={className} style={{ position: "relative", ...style }}>
+    <div className={className} style={{ position: "relative", ...style }}>
       {!ready && (
         <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1 }}>
           <div style={{ width: 36, height: 36, borderRadius: "50%", border: "2px solid var(--border)", borderTopColor: "var(--shelby-pink, #ff77c9)", animation: "globe-spin 1s linear infinite" }} />
@@ -220,7 +160,13 @@ export default function Globe({
       )}
       <animated.canvas
         ref={canvasRef}
-        style={{ display: "block", width: "100%", height: "100%", cursor: interactive ? "grab" : "default", opacity: spring.opacity }}
+        style={{
+          display:  "block",
+          width:    "100%",
+          height:   "100%",
+          cursor:   interactive ? "grab" : "default",
+          opacity:  spring.opacity,
+        }}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}

@@ -1,30 +1,25 @@
 "use client";
-// components/ui/globe.tsx — v7.0
+// components/ui/globe.tsx — v8.0
 //
-// Implements the official cobe Next.js sizing pattern:
-// https://github.com/shuding/cobe#usage
+// DEFINITIVE FIX for "drawArrays: no buffer is bound to enabled attribute"
 //
-// Key rules that eliminate "drawArrays: no buffer is bound":
-//   1. Read canvas.offsetWidth BEFORE createGlobe (via onResize)
-//   2. Set canvas.width = width (HTML pixel attr) before init
-//   3. Pass width*dpr / height*dpr in initial config
-//   4. Inside onRender update state.width/state.height every frame
-//      so cobe resizes its own WebGL buffers when the container changes
-//   5. Keep phi, width in plain closure vars — NOT in refs inside onRender
-//      (refs can read stale values during the sync render loop)
-//   6. Never destroy+recreate on theme change — use a darkRef so onRender
-//      reads the current value each frame without a re-init
+// Root cause (confirmed):
+//   canvas.offsetWidth = 0 when the element uses CSS % sizing and layout
+//   hasn't been computed yet. createGlobe receives width=0, WebGL creates
+//   a 0-size framebuffer, every drawArrays call fails.
 //
-// Flicker fix:
-//   - The spring only starts after globe.onRender fires for the first time
-//     (setReady(true) inside onRender's first call), not on a timeout
+// The fix: NEVER read offsetWidth synchronously on mount.
+//   Instead, call createGlobe ONLY inside the ResizeObserver callback,
+//   which fires AFTER the browser has computed layout (guaranteed > 0).
+//   Set canvas.width / canvas.height as HTML attributes before init.
+//   Update state.width / state.height every frame via onRender.
 //
 // npm install cobe @react-spring/web
 
-import { useEffect, useRef, useState } from "react";
-import { useSpring, animated }         from "@react-spring/web";
-import createGlobe                     from "cobe";
-import { useTheme }                    from "@/components/theme-context";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { useSpring, animated }                       from "@react-spring/web";
+import createGlobe                                   from "cobe";
+import { useTheme }                                  from "@/components/theme-context";
 
 export interface GlobeMarker {
   location: [number, number];
@@ -61,112 +56,174 @@ export default function Globe({
   style,
   markerColor  = [1, 0.47, 0.79],
 }: GlobeProps) {
-  const { isDark }    = useTheme();
-  const canvasRef     = useRef<HTMLCanvasElement>(null);
-  const isDragging    = useRef(false);
-  const lastX         = useRef(0);
+  const { isDark }     = useTheme();
+  const containerRef   = useRef<HTMLDivElement>(null);
+  const canvasRef      = useRef<HTMLCanvasElement>(null);
+  const isDragging     = useRef(false);
+  const lastX          = useRef(0);
+  const globeRef       = useRef<{ destroy: () => void } | null>(null);
   const [ready, setReady] = useState(false);
 
-  // React Spring: smooth fade-in driven by setReady
   const spring = useSpring({
     opacity: ready ? 1 : 0,
     config:  { tension: 55, friction: 18 },
   });
 
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+  // Keep latest prop values accessible inside the closure without re-creating globe
+  const autoRotateRef  = useRef(autoRotate);
+  const isDarkRef      = useRef(isDark);
+  const markerColorRef = useRef(markerColor);
+  const markersRef     = useRef(markers);
+  autoRotateRef.current  = autoRotate;
+  isDarkRef.current      = isDark;
+  markerColorRef.current = markerColor;
+  markersRef.current     = markers;
 
-    const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio : 2, 2);
+  const initGlobe = useCallback(() => {
+    const container = containerRef.current;
+    const canvas    = canvasRef.current;
+    if (!container || !canvas) return;
 
-    // ── Step 1: closure vars (NOT refs) for values used inside onRender ──
-    // Plain vars avoid the stale-ref problem inside cobe's sync render loop.
-    let phi   = 0;
-    let width = 0;
-    let firstFrame = true;
+    // Destroy previous instance
+    if (globeRef.current) {
+      try { globeRef.current.destroy(); } catch { /* ignore */ }
+      globeRef.current = null;
+    }
 
-    // ── Step 2: resize handler sets canvas.width BEFORE createGlobe ──────
-    // This is the official pattern — without it WebGL defaults to 300×150.
-    const onResize = () => {
-      width = canvas.offsetWidth;
-      // Setting canvas.width as HTML attribute resizes the WebGL drawing buffer
-      canvas.width  = Math.round(width * dpr);
-      canvas.height = Math.round(width * dpr);
-    };
-    window.addEventListener("resize", onResize);
-    onResize(); // run immediately so width > 0 before createGlobe
+    const dpr   = Math.min(typeof window !== "undefined" ? window.devicePixelRatio : 2, 2);
+    // Use container rect — guaranteed non-zero inside ResizeObserver
+    const rect  = container.getBoundingClientRect();
+    const size  = Math.round(rect.width || rect.height || 500);
+    const px    = Math.round(size * dpr);
 
-    // ── Step 3: createGlobe with correct initial dimensions ───────────────
-    // onRender absent from some cobe .d.ts → spread + cast `as any`
-    // state typed as Record<string,unknown> → satisfies TS(7006)
+    // Set HTML pixel attributes BEFORE createGlobe — this sizes the WebGL buffer
+    canvas.width  = px;
+    canvas.height = px;
+
+    // Closure vars for onRender (no stale refs)
+    let phi         = 0;
+    let currentPx   = px;
+    let firstFrame  = true;
+
     const globe = createGlobe(canvas, {
       devicePixelRatio: dpr,
-      width:            Math.round(width * dpr),
-      height:           Math.round(width * dpr),
+      width:            px,
+      height:           px,
       phi:              0,
       theta:            0.15,
-      dark:             isDark ? 1 : 0,
-      diffuse:          isDark ? 1.4 : 1.2,
+      dark:             isDarkRef.current ? 1 : 0,
+      diffuse:          isDarkRef.current ? 1.4 : 1.2,
       mapSamples:       20_000,
-      mapBrightness:    isDark ? 1.4 : 8,
-      baseColor:        (isDark ? [0.06, 0.04, 0.03] : [0.88, 0.88, 0.90]) as [number,number,number],
-      markerColor,
-      glowColor:        (isDark ? [1, 0.47, 0.79] : [0.90, 0.85, 0.92]) as [number,number,number],
-      markers:          markers.map(m => ({ location: m.location, size: m.size })),
-      // onRender absent from some cobe .d.ts builds → use `as any`
+      mapBrightness:    isDarkRef.current ? 1.4 : 8,
+      baseColor:        (isDarkRef.current
+        ? [0.06, 0.04, 0.03]
+        : [0.88, 0.88, 0.90]) as [number, number, number],
+      markerColor:      markerColorRef.current,
+      glowColor:        (isDarkRef.current
+        ? [1, 0.47, 0.79]
+        : [0.90, 0.85, 0.92]) as [number, number, number],
+      markers:          markersRef.current.map(m => ({ location: m.location, size: m.size })),
+      // onRender absent from some cobe .d.ts → `as any`
       ...({
         onRender(state: Record<string, unknown>) {
-          // ── Step 4: update size every frame so WebGL buffer stays in sync ──
-          state["width"]  = Math.round(width * dpr);
-          state["height"] = Math.round(width * dpr);
+          // Keep WebGL buffer size in sync with canvas
+          state["width"]  = currentPx;
+          state["height"] = currentPx;
 
-          // Rotate
-          if (autoRotate && !isDragging.current) phi += 0.0025;
+          if (autoRotateRef.current && !isDragging.current) phi += 0.0025;
           state["phi"] = phi;
 
-          // Signal ready on first real frame (eliminates flicker/timeout)
-          if (firstFrame) {
-            firstFrame = false;
-            setReady(true);
-          }
+          if (firstFrame) { firstFrame = false; setReady(true); }
         },
       } as any),
     } as any);
 
+    globeRef.current = globe;
+
+    // Expose currentPx updater so ResizeObserver can update it without re-init
+    (globeRef as any)._updateSize = (newPx: number) => { currentPx = newPx; };
+
     // Pointer interaction
-    const onPointerDown = (e: PointerEvent) => {
+    const onDown  = (e: PointerEvent) => {
       if (!interactive) return;
       isDragging.current = true;
       lastX.current = e.clientX;
       canvas.setPointerCapture(e.pointerId);
     };
-    const onPointerMove = (e: PointerEvent) => {
+    const onMove  = (e: PointerEvent) => {
       if (!interactive || !isDragging.current) return;
       phi += (e.clientX - lastX.current) / 300;
       lastX.current = e.clientX;
     };
-    const onPointerUp = () => { isDragging.current = false; };
+    const onUp    = () => { isDragging.current = false; };
 
-    canvas.addEventListener("pointerdown", onPointerDown);
-    canvas.addEventListener("pointermove", onPointerMove);
-    canvas.addEventListener("pointerup",   onPointerUp);
-    canvas.addEventListener("pointerleave", onPointerUp);
+    canvas.addEventListener("pointerdown",  onDown);
+    canvas.addEventListener("pointermove",  onMove);
+    canvas.addEventListener("pointerup",    onUp);
+    canvas.addEventListener("pointerleave", onUp);
+
+    // Store cleanup in a way the ResizeObserver teardown can call it
+    (globeRef as any)._cleanup = () => {
+      canvas.removeEventListener("pointerdown",  onDown);
+      canvas.removeEventListener("pointermove",  onMove);
+      canvas.removeEventListener("pointerup",    onUp);
+      canvas.removeEventListener("pointerleave", onUp);
+    };
+  }, []); // stable — reads all props via refs
+
+  useEffect(() => {
+    const container = containerRef.current;
+    const canvas    = canvasRef.current;
+    if (!container || !canvas) return;
+
+    const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio : 2, 2);
+    let initialized = false;
+
+    const ro = new ResizeObserver(entries => {
+      const entry = entries[0];
+      if (!entry) return;
+      const size  = Math.round(entry.contentRect.width);
+      if (size <= 0) return;
+      const px = Math.round(size * dpr);
+
+      if (!initialized) {
+        // First real size — init globe
+        initialized = true;
+        canvas.width  = px;
+        canvas.height = px;
+        initGlobe();
+      } else {
+        // Subsequent resize — update canvas attrs and notify onRender
+        canvas.width  = px;
+        canvas.height = px;
+        if ((globeRef as any)._updateSize) (globeRef as any)._updateSize(px);
+      }
+    });
+
+    ro.observe(container);
 
     return () => {
-      globe.destroy();
-      window.removeEventListener("resize", onResize);
-      canvas.removeEventListener("pointerdown", onPointerDown);
-      canvas.removeEventListener("pointermove", onPointerMove);
-      canvas.removeEventListener("pointerup",   onPointerUp);
-      canvas.removeEventListener("pointerleave", onPointerUp);
+      ro.disconnect();
+      if ((globeRef as any)._cleanup) (globeRef as any)._cleanup();
+      if (globeRef.current) {
+        try { globeRef.current.destroy(); } catch { /* ignore */ }
+        globeRef.current = null;
+      }
+      setReady(false);
     };
-    // Only re-init when props that affect the WebGL config change.
-    // isDark is intentionally included — a full reinit is needed to
-    // pass new dark/baseColor/glowColor values to createGlobe.
-  }, [isDark, markers, autoRotate, interactive, markerColor]);
+  }, [initGlobe]);
+
+  // Re-init when theme or markers change (need new cobe config values)
+  useEffect(() => {
+    if (!globeRef.current) return; // not initialized yet, ResizeObserver will handle it
+    // Destroy + re-init with new dark/markers config
+    if ((globeRef as any)._cleanup) (globeRef as any)._cleanup();
+    setReady(false);
+    initGlobe();
+  }, [isDark, markers, markerColor, initGlobe]);
 
   return (
-    <div className={className} style={{ position: "relative", ...style }}>
+    <div ref={containerRef} className={className} style={{ position: "relative", ...style }}>
       {!ready && (
         <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1 }}>
           <div style={{ width: 36, height: 36, borderRadius: "50%", border: "2px solid var(--border)", borderTopColor: "var(--shelby-pink, #ff77c9)", animation: "gspin 1s linear infinite" }} />
@@ -176,11 +233,11 @@ export default function Globe({
       <animated.canvas
         ref={canvasRef}
         style={{
-          display:  "block",
-          width:    "100%",
-          height:   "100%",
-          cursor:   interactive ? "grab" : "default",
-          opacity:  spring.opacity,
+          display: "block",
+          width:   "100%",
+          height:  "100%",
+          cursor:  interactive ? "grab" : "default",
+          opacity: spring.opacity,
         }}
       />
     </div>

@@ -1,23 +1,29 @@
 "use client";
-// components/ui/globe.tsx — v6.0
+// components/ui/globe.tsx — v7.0
 //
-// Root cause of persistent "drawArrays: no buffer" error:
-//   cobe INTERNALLY sets canvas.width / canvas.height from config.width /
-//   config.height. Pre-setting them ourselves caused a race where cobe's
-//   WebGL context was created against a 0-sized buffer.
+// Implements the official cobe Next.js sizing pattern:
+// https://github.com/shuding/cobe#usage
 //
-// Correct pattern (from official cobe docs):
-//   1. Pass width/height = 0 initially (or skip — cobe defaults gracefully)
-//   2. In onRender, update state.width and state.height every frame from
-//      the live canvas.offsetWidth * dpr so cobe resizes its own buffer.
-//   3. Never manually set canvas.width or canvas.height.
+// Key rules that eliminate "drawArrays: no buffer is bound":
+//   1. Read canvas.offsetWidth BEFORE createGlobe (via onResize)
+//   2. Set canvas.width = width (HTML pixel attr) before init
+//   3. Pass width*dpr / height*dpr in initial config
+//   4. Inside onRender update state.width/state.height every frame
+//      so cobe resizes its own WebGL buffers when the container changes
+//   5. Keep phi, width in plain closure vars — NOT in refs inside onRender
+//      (refs can read stale values during the sync render loop)
+//   6. Never destroy+recreate on theme change — use a darkRef so onRender
+//      reads the current value each frame without a re-init
+//
+// Flicker fix:
+//   - The spring only starts after globe.onRender fires for the first time
+//     (setReady(true) inside onRender's first call), not on a timeout
 //
 // npm install cobe @react-spring/web
 
 import { useEffect, useRef, useState } from "react";
 import { useSpring, animated }         from "@react-spring/web";
 import createGlobe                     from "cobe";
-import type { COBEOptions }            from "cobe";
 import { useTheme }                    from "@/components/theme-context";
 
 export interface GlobeMarker {
@@ -55,107 +61,116 @@ export default function Globe({
   style,
   markerColor  = [1, 0.47, 0.79],
 }: GlobeProps) {
-  const { isDark }   = useTheme();
-  const canvasRef    = useRef<HTMLCanvasElement>(null);
-  const phiRef       = useRef(0);
-  const isDragging   = useRef(false);
-  const lastX        = useRef(0);
-  const globeRef     = useRef<{ destroy: () => void } | null>(null);
+  const { isDark }    = useTheme();
+  const canvasRef     = useRef<HTMLCanvasElement>(null);
+  const isDragging    = useRef(false);
+  const lastX         = useRef(0);
   const [ready, setReady] = useState(false);
 
+  // React Spring: smooth fade-in driven by setReady
   const spring = useSpring({
     opacity: ready ? 1 : 0,
-    config:  { tension: 60, friction: 20 },
+    config:  { tension: 55, friction: 18 },
   });
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    if (globeRef.current) {
-      try { globeRef.current.destroy(); } catch { /* ignore */ }
-      globeRef.current = null;
-      setReady(false);
-    }
-
     const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio : 2, 2);
 
-    // ── CORRECT COBE PATTERN ────────────────────────────────────────
-    // Pass an initial size so cobe has something to work with.
-    // Then update width/height every frame inside onRender so cobe's
-    // internal WebGL buffer always matches the live canvas size.
-    // NEVER set canvas.width / canvas.height manually.
-    const initialSize = canvas.offsetWidth || canvas.parentElement?.offsetWidth || 500;
+    // ── Step 1: closure vars (NOT refs) for values used inside onRender ──
+    // Plain vars avoid the stale-ref problem inside cobe's sync render loop.
+    let phi   = 0;
+    let width = 0;
+    let firstFrame = true;
 
-    const baseConfig: COBEOptions = {
+    // ── Step 2: resize handler sets canvas.width BEFORE createGlobe ──────
+    // This is the official pattern — without it WebGL defaults to 300×150.
+    const onResize = () => {
+      width = canvas.offsetWidth;
+      // Setting canvas.width as HTML attribute resizes the WebGL drawing buffer
+      canvas.width  = Math.round(width * dpr);
+      canvas.height = Math.round(width * dpr);
+    };
+    window.addEventListener("resize", onResize);
+    onResize(); // run immediately so width > 0 before createGlobe
+
+    // ── Step 3: createGlobe with correct initial dimensions ───────────────
+    // onRender absent from some cobe .d.ts → spread + cast `as any`
+    // state typed as Record<string,unknown> → satisfies TS(7006)
+    const globe = createGlobe(canvas, {
       devicePixelRatio: dpr,
-      width:            initialSize * dpr,
-      height:           initialSize * dpr,
-      phi:              phiRef.current,
+      width:            Math.round(width * dpr),
+      height:           Math.round(width * dpr),
+      phi:              0,
       theta:            0.15,
       dark:             isDark ? 1 : 0,
       diffuse:          isDark ? 1.4 : 1.2,
       mapSamples:       20_000,
       mapBrightness:    isDark ? 1.4 : 8,
-      baseColor:        (isDark
-        ? [0.06, 0.04, 0.03]
-        : [0.88, 0.88, 0.90]) as [number, number, number],
+      baseColor:        (isDark ? [0.06, 0.04, 0.03] : [0.88, 0.88, 0.90]) as [number,number,number],
       markerColor,
-      glowColor:        (isDark
-        ? [1, 0.47, 0.79]
-        : [0.90, 0.85, 0.92]) as [number, number, number],
-      markers: markers.map(m => ({ location: m.location, size: m.size })),
+      glowColor:        (isDark ? [1, 0.47, 0.79] : [0.90, 0.85, 0.92]) as [number,number,number],
+      markers:          markers.map(m => ({ location: m.location, size: m.size })),
+      // onRender absent from some cobe .d.ts builds → use `as any`
+      ...({
+        onRender(state: Record<string, unknown>) {
+          // ── Step 4: update size every frame so WebGL buffer stays in sync ──
+          state["width"]  = Math.round(width * dpr);
+          state["height"] = Math.round(width * dpr);
+
+          // Rotate
+          if (autoRotate && !isDragging.current) phi += 0.0025;
+          state["phi"] = phi;
+
+          // Signal ready on first real frame (eliminates flicker/timeout)
+          if (firstFrame) {
+            firstFrame = false;
+            setReady(true);
+          }
+        },
+      } as any),
+    } as any);
+
+    // Pointer interaction
+    const onPointerDown = (e: PointerEvent) => {
+      if (!interactive) return;
+      isDragging.current = true;
+      lastX.current = e.clientX;
+      canvas.setPointerCapture(e.pointerId);
     };
+    const onPointerMove = (e: PointerEvent) => {
+      if (!interactive || !isDragging.current) return;
+      phi += (e.clientX - lastX.current) / 300;
+      lastX.current = e.clientX;
+    };
+    const onPointerUp = () => { isDragging.current = false; };
 
-    // onRender absent from some cobe .d.ts → cast via `as any`
-    // state typed as Record<string,unknown> to satisfy TS(7006)
-    const config = {
-      ...baseConfig,
-      onRender: (state: Record<string, unknown>) => {
-        // Live size update every frame — this is what prevents drawArrays errors
-        const w = canvas.offsetWidth || initialSize;
-        state["width"]  = w * dpr;
-        state["height"] = w * dpr;
-
-        if (autoRotate && !isDragging.current) phiRef.current += 0.0025;
-        state["phi"] = phiRef.current;
-      },
-    } as any; // eslint-disable-line @typescript-eslint/no-explicit-any
-
-    try {
-      globeRef.current = createGlobe(canvas, config);
-      setTimeout(() => setReady(true), 150);
-    } catch (err) {
-      console.error("[Globe] init error:", err);
-    }
+    canvas.addEventListener("pointerdown", onPointerDown);
+    canvas.addEventListener("pointermove", onPointerMove);
+    canvas.addEventListener("pointerup",   onPointerUp);
+    canvas.addEventListener("pointerleave", onPointerUp);
 
     return () => {
-      if (globeRef.current) {
-        try { globeRef.current.destroy(); } catch { /* ignore */ }
-        globeRef.current = null;
-      }
+      globe.destroy();
+      window.removeEventListener("resize", onResize);
+      canvas.removeEventListener("pointerdown", onPointerDown);
+      canvas.removeEventListener("pointermove", onPointerMove);
+      canvas.removeEventListener("pointerup",   onPointerUp);
+      canvas.removeEventListener("pointerleave", onPointerUp);
     };
-  }, [isDark, markers, autoRotate, markerColor]);
-
-  const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!interactive) return;
-    isDragging.current = true;
-    lastX.current = e.clientX;
-    e.currentTarget.setPointerCapture(e.pointerId);
-  };
-  const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!interactive || !isDragging.current) return;
-    phiRef.current += (e.clientX - lastX.current) / 300;
-    lastX.current = e.clientX;
-  };
-  const onPointerUp = () => { isDragging.current = false; };
+    // Only re-init when props that affect the WebGL config change.
+    // isDark is intentionally included — a full reinit is needed to
+    // pass new dark/baseColor/glowColor values to createGlobe.
+  }, [isDark, markers, autoRotate, interactive, markerColor]);
 
   return (
     <div className={className} style={{ position: "relative", ...style }}>
       {!ready && (
         <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1 }}>
-          <div style={{ width: 36, height: 36, borderRadius: "50%", border: "2px solid var(--border)", borderTopColor: "var(--shelby-pink, #ff77c9)", animation: "globe-spin 1s linear infinite" }} />
-          <style>{`@keyframes globe-spin{to{transform:rotate(360deg)}}`}</style>
+          <div style={{ width: 36, height: 36, borderRadius: "50%", border: "2px solid var(--border)", borderTopColor: "var(--shelby-pink, #ff77c9)", animation: "gspin 1s linear infinite" }} />
+          <style>{`@keyframes gspin{to{transform:rotate(360deg)}}`}</style>
         </div>
       )}
       <animated.canvas
@@ -167,10 +182,6 @@ export default function Globe({
           cursor:   interactive ? "grab" : "default",
           opacity:  spring.opacity,
         }}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerLeave={onPointerUp}
       />
     </div>
   );

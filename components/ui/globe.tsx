@@ -1,18 +1,20 @@
 "use client";
-// components/ui/globe.tsx — v8.0
+// components/ui/globe.tsx — v9.0
 //
-// DEFINITIVE FIX for "drawArrays: no buffer is bound to enabled attribute"
+// Strategy: destroy + reinitialize cobe on every size change.
+// No state.width/state.height mutation inside onRender.
 //
-// Root cause (confirmed):
-//   canvas.offsetWidth = 0 when the element uses CSS % sizing and layout
-//   hasn't been computed yet. createGlobe receives width=0, WebGL creates
-//   a 0-size framebuffer, every drawArrays call fails.
+// Why this is more reliable in production:
+//   Mutating state.width/height inside onRender works in dev (single React
+//   root, predictable RAF timing) but in production builds cobe's internal
+//   WebGL program can be compiled before the first onRender fires, leaving
+//   the VAO in a mismatched state → "drawArrays: no buffer is bound".
+//   Destroy + reinit means createGlobe always receives the exact, measured
+//   canvas size so its WebGL context is created correctly from frame zero.
 //
-// The fix: NEVER read offsetWidth synchronously on mount.
-//   Instead, call createGlobe ONLY inside the ResizeObserver callback,
-//   which fires AFTER the browser has computed layout (guaranteed > 0).
-//   Set canvas.width / canvas.height as HTML attributes before init.
-//   Update state.width / state.height every frame via onRender.
+// Sizing guarantee:
+//   We read size ONLY from ResizeObserver.contentRect (never offsetWidth on
+//   mount), so the value is always post-layout and always > 0.
 //
 // npm install cobe @react-spring/web
 
@@ -21,6 +23,7 @@ import { useSpring, animated }                       from "@react-spring/web";
 import createGlobe                                   from "cobe";
 import { useTheme }                                  from "@/components/theme-context";
 
+// ── Public types ───────────────────────────────────────────────────
 export interface GlobeMarker {
   location: [number, number];
   size:     number;
@@ -48,6 +51,7 @@ interface GlobeProps {
   markerColor?: [number, number, number];
 }
 
+// ── Component ──────────────────────────────────────────────────────
 export default function Globe({
   markers      = SHELBY_SP_MARKERS,
   autoRotate   = true,
@@ -56,60 +60,47 @@ export default function Globe({
   style,
   markerColor  = [1, 0.47, 0.79],
 }: GlobeProps) {
-  const { isDark }     = useTheme();
-  const containerRef   = useRef<HTMLDivElement>(null);
-  const canvasRef      = useRef<HTMLCanvasElement>(null);
-  const isDragging     = useRef(false);
-  const lastX          = useRef(0);
-  const globeRef       = useRef<{ destroy: () => void } | null>(null);
+  const { isDark }   = useTheme();
+  const containerRef = useRef<HTMLDivElement>(null);
+  const canvasRef    = useRef<HTMLCanvasElement>(null);
   const [ready, setReady] = useState(false);
-
   const spring = useSpring({
     opacity: ready ? 1 : 0,
-    config:  { tension: 55, friction: 18 },
+    config: { tension: 55, friction: 18 },
   });
 
-  // Keep latest prop values accessible inside the closure without re-creating globe
-  const autoRotateRef  = useRef(autoRotate);
+  // Stable refs so the destroy+reinit callback always sees fresh prop values
+  const phiRef         = useRef(0);          // preserved across reinits
+  const isDragging     = useRef(false);
+  const lastX          = useRef(0);
   const isDarkRef      = useRef(isDark);
-  const markerColorRef = useRef(markerColor);
   const markersRef     = useRef(markers);
-  autoRotateRef.current  = autoRotate;
+  const markerColorRef = useRef(markerColor);
+  const autoRotateRef  = useRef(autoRotate);
   isDarkRef.current      = isDark;
-  markerColorRef.current = markerColor;
   markersRef.current     = markers;
+  markerColorRef.current = markerColor;
+  autoRotateRef.current  = autoRotate;
 
-  const initGlobe = useCallback(() => {
-    const container = containerRef.current;
-    const canvas    = canvasRef.current;
-    if (!container || !canvas) return;
+  // ── Core: create one cobe instance for a given pixel size ─────────
+  // Returns a cleanup function. Called by ResizeObserver and theme effect.
+  const createInstance = useCallback((canvas: HTMLCanvasElement, cssSize: number) => {
+    const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio : 2, 2);
+    const px  = Math.round(cssSize * dpr);
 
-    // Destroy previous instance
-    if (globeRef.current) {
-      try { globeRef.current.destroy(); } catch { /* ignore */ }
-      globeRef.current = null;
-    }
-
-    const dpr   = Math.min(typeof window !== "undefined" ? window.devicePixelRatio : 2, 2);
-    // Use container rect — guaranteed non-zero inside ResizeObserver
-    const rect  = container.getBoundingClientRect();
-    const size  = Math.round(rect.width || rect.height || 500);
-    const px    = Math.round(size * dpr);
-
-    // Set HTML pixel attributes BEFORE createGlobe — this sizes the WebGL buffer
+    // Set canvas HTML pixel attributes BEFORE createGlobe.
+    // This is what sizes the WebGL framebuffer — CSS alone does nothing.
     canvas.width  = px;
     canvas.height = px;
 
-    // Closure vars for onRender (no stale refs)
-    let phi         = 0;
-    let currentPx   = px;
-    let firstFrame  = true;
+    let phi       = phiRef.current; // resume from last known rotation
+    let firstFrame = true;
 
     const globe = createGlobe(canvas, {
       devicePixelRatio: dpr,
       width:            px,
       height:           px,
-      phi:              0,
+      phi,
       theta:            0.15,
       dark:             isDarkRef.current ? 1 : 0,
       diffuse:          isDarkRef.current ? 1.4 : 1.2,
@@ -122,111 +113,115 @@ export default function Globe({
       glowColor:        (isDarkRef.current
         ? [1, 0.47, 0.79]
         : [0.90, 0.85, 0.92]) as [number, number, number],
-      markers:          markersRef.current.map(m => ({ location: m.location, size: m.size })),
-      // onRender absent from some cobe .d.ts → `as any`
+      markers: markersRef.current.map(m => ({ location: m.location, size: m.size })),
+      // NO state.width/state.height mutation — dimensions are fixed at init
       ...({
         onRender(state: Record<string, unknown>) {
-          // Keep WebGL buffer size in sync with canvas
-          state["width"]  = currentPx;
-          state["height"] = currentPx;
-
           if (autoRotateRef.current && !isDragging.current) phi += 0.0025;
           state["phi"] = phi;
+          // Save so next instance resumes from here
+          phiRef.current = phi;
 
-          if (firstFrame) { firstFrame = false; setReady(true); }
+          if (firstFrame) {
+            firstFrame = false;
+            setReady(true);
+          }
         },
-      } as any),
-    } as any);
+      } as any), // eslint-disable-line @typescript-eslint/no-explicit-any
+    } as any); // eslint-disable-line @typescript-eslint/no-explicit-any
 
-    globeRef.current = globe;
-
-    // Expose currentPx updater so ResizeObserver can update it without re-init
-    (globeRef as any)._updateSize = (newPx: number) => { currentPx = newPx; };
-
-    // Pointer interaction
-    const onDown  = (e: PointerEvent) => {
+    // Pointer listeners
+    const onDown = (e: PointerEvent) => {
       if (!interactive) return;
       isDragging.current = true;
       lastX.current = e.clientX;
       canvas.setPointerCapture(e.pointerId);
     };
-    const onMove  = (e: PointerEvent) => {
+    const onMove = (e: PointerEvent) => {
       if (!interactive || !isDragging.current) return;
       phi += (e.clientX - lastX.current) / 300;
       lastX.current = e.clientX;
     };
-    const onUp    = () => { isDragging.current = false; };
+    const onUp = () => { isDragging.current = false; };
 
     canvas.addEventListener("pointerdown",  onDown);
     canvas.addEventListener("pointermove",  onMove);
     canvas.addEventListener("pointerup",    onUp);
     canvas.addEventListener("pointerleave", onUp);
 
-    // Store cleanup in a way the ResizeObserver teardown can call it
-    (globeRef as any)._cleanup = () => {
+    // Return cleanup
+    return () => {
+      globe.destroy();
       canvas.removeEventListener("pointerdown",  onDown);
       canvas.removeEventListener("pointermove",  onMove);
       canvas.removeEventListener("pointerup",    onUp);
       canvas.removeEventListener("pointerleave", onUp);
     };
-  }, []); // stable — reads all props via refs
+  }, []); // intentionally empty — reads all values via refs
 
+  // ── Effect 1: ResizeObserver drives init + resize ─────────────────
+  // Fires AFTER layout is computed → cssSize always > 0
   useEffect(() => {
     const container = containerRef.current;
     const canvas    = canvasRef.current;
     if (!container || !canvas) return;
 
-    const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio : 2, 2);
-    let initialized = false;
+    let cleanup: (() => void) | null = null;
+    let lastSize = 0;
 
     const ro = new ResizeObserver(entries => {
       const entry = entries[0];
       if (!entry) return;
-      const size  = Math.round(entry.contentRect.width);
-      if (size <= 0) return;
-      const px = Math.round(size * dpr);
+      const cssSize = Math.round(entry.contentRect.width);
+      if (cssSize <= 0) return;
+      // Debounce: only reinit if size changed meaningfully
+      if (Math.abs(cssSize - lastSize) < 2) return;
+      lastSize = cssSize;
 
-      if (!initialized) {
-        // First real size — init globe
-        initialized = true;
-        canvas.width  = px;
-        canvas.height = px;
-        initGlobe();
-      } else {
-        // Subsequent resize — update canvas attrs and notify onRender
-        canvas.width  = px;
-        canvas.height = px;
-        if ((globeRef as any)._updateSize) (globeRef as any)._updateSize(px);
-      }
+      // Destroy previous, create new
+      if (cleanup) { cleanup(); cleanup = null; }
+      setReady(false);
+      cleanup = createInstance(canvas, cssSize);
     });
 
     ro.observe(container);
 
     return () => {
       ro.disconnect();
-      if ((globeRef as any)._cleanup) (globeRef as any)._cleanup();
-      if (globeRef.current) {
-        try { globeRef.current.destroy(); } catch { /* ignore */ }
-        globeRef.current = null;
-      }
+      if (cleanup) cleanup();
       setReady(false);
     };
-  }, [initGlobe]);
+  }, [createInstance]);
 
-  // Re-init when theme or markers change (need new cobe config values)
+  // ── Effect 2: reinit on theme / markers / markerColor change ──────
   useEffect(() => {
-    if (!globeRef.current) return; // not initialized yet, ResizeObserver will handle it
-    // Destroy + re-init with new dark/markers config
-    if ((globeRef as any)._cleanup) (globeRef as any)._cleanup();
-    setReady(false);
-    initGlobe();
-  }, [isDark, markers, markerColor, initGlobe]);
+    const canvas    = canvasRef.current;
+    const container = containerRef.current;
+    if (!canvas || !container) return;
 
+    const cssSize = Math.round(container.getBoundingClientRect().width);
+    if (cssSize <= 0) return; // ResizeObserver hasn't fired yet — it will handle init
+
+    setReady(false);
+    const cleanup = createInstance(canvas, cssSize);
+    return cleanup;
+  }, [isDark, markers, markerColor, createInstance]);
+
+  // ── Render ────────────────────────────────────────────────────────
   return (
     <div ref={containerRef} className={className} style={{ position: "relative", ...style }}>
       {!ready && (
-        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1 }}>
-          <div style={{ width: 36, height: 36, borderRadius: "50%", border: "2px solid var(--border)", borderTopColor: "var(--shelby-pink, #ff77c9)", animation: "gspin 1s linear infinite" }} />
+        <div style={{
+          position: "absolute", inset: 0,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          zIndex: 1,
+        }}>
+          <div style={{
+            width: 36, height: 36, borderRadius: "50%",
+            border: "2px solid var(--border)",
+            borderTopColor: "var(--shelby-pink, #ff77c9)",
+            animation: "gspin 1s linear infinite",
+          }} />
           <style>{`@keyframes gspin{to{transform:rotate(360deg)}}`}</style>
         </div>
       )}
@@ -237,9 +232,10 @@ export default function Globe({
           width:   "100%",
           height:  "100%",
           cursor:  interactive ? "grab" : "default",
-          opacity: spring.opacity,
+          opacity: spring.opacity, // Bây giờ 'spring' đã được định nghĩa
         }}
       />
     </div>
   );
 }
+

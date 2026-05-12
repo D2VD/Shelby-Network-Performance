@@ -1,30 +1,22 @@
 "use client";
-// components/ui/globe.tsx — v10.0
+// components/ui/globe.tsx — v11.0
 //
-// BUG FOUND (v8/v9): `spring` was referenced in JSX but `useSpring` was called
-// inside `useLocalSpring()` which was defined AFTER the `return` statement.
-// Hooks after `return` never execute → `spring` = undefined → runtime crash
-// in production → globe never renders, spinner stays forever.
+// Drops cobe/WebGL entirely.
+// Pure Canvas 2D dot-sphere — identical visual, zero WebGL errors.
+// Uses requestAnimationFrame for rotation and react-spring for fade-in.
 //
-// Fix: `useSpring` called at the top level of the component, before `return`.
-//
-// Architecture:
-//   - ResizeObserver fires after layout (guarantees cssSize > 0)
-//   - On first fire: createGlobe with measured size
-//   - On resize: destroy + recreate (no frame-level state mutation)
-//   - On theme/markers change: destroy + recreate via separate effect
-//   - phi preserved across recreations so globe doesn't snap
-//
-// npm install cobe @react-spring/web
+// No extra npm installs needed beyond @react-spring/web.
 
-import { useEffect, useRef, useState, useCallback } from "react";
-import { useSpring, animated }                       from "@react-spring/web";
-import createGlobe                                   from "cobe";
-import { useTheme }                                  from "@/components/theme-context";
+import {
+  useEffect, useRef, useState, useCallback,
+} from "react";
+import { useSpring, animated } from "@react-spring/web";
+import { useTheme }            from "@/components/theme-context";
 
+// ── Public types ───────────────────────────────────────────────────
 export interface GlobeMarker {
-  location: [number, number];
-  size:     number;
+  location: [number, number]; // [lat, lng] degrees
+  size:     number;           // 0.02–0.12 (scaled to canvas radius)
 }
 
 export const SHELBY_SP_MARKERS: GlobeMarker[] = [
@@ -46,9 +38,49 @@ interface GlobeProps {
   interactive?: boolean;
   className?:   string;
   style?:       React.CSSProperties;
-  markerColor?: [number, number, number];
+  markerColor?: [number, number, number]; // 0-1 RGB, kept for API compat
 }
 
+// ── Math helpers ───────────────────────────────────────────────────
+const DEG = Math.PI / 180;
+
+function latLngToVec3(lat: number, lng: number): [number, number, number] {
+  const phi   = (90 - lat)  * DEG;
+  const theta = (lng + 180) * DEG;
+  return [
+     Math.sin(phi) * Math.cos(theta),
+     Math.cos(phi),
+    -Math.sin(phi) * Math.sin(theta),
+  ];
+}
+
+function rotateY(x: number, y: number, z: number, angle: number): [number, number, number] {
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  return [x * cos + z * sin, y, -x * sin + z * cos];
+}
+
+// ── Pre-generate dot grid ──────────────────────────────────────────
+interface Dot { x: number; y: number; z: number; }
+
+function generateDots(spacing = 4): Dot[] {
+  const dots: Dot[] = [];
+  for (let lat = -90; lat <= 90; lat += spacing) {
+    const ringR  = Math.cos(lat * DEG);
+    const nDots  = Math.max(1, Math.round((360 * ringR) / spacing));
+    const step   = 360 / nDots;
+    for (let i = 0; i < nDots; i++) {
+      const lng = i * step - 180;
+      const [x, y, z] = latLngToVec3(lat, lng);
+      dots.push({ x, y, z });
+    }
+  }
+  return dots;
+}
+
+const DOTS = generateDots(4);
+
+// ── Component ──────────────────────────────────────────────────────
 export default function Globe({
   markers      = SHELBY_SP_MARKERS,
   autoRotate   = true,
@@ -58,181 +90,189 @@ export default function Globe({
   markerColor  = [1, 0.47, 0.79],
 }: GlobeProps) {
   const { isDark }   = useTheme();
-  const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef    = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const phiRef       = useRef(0);
+  const rafRef       = useRef<number>(0);
   const isDragging   = useRef(false);
   const lastX        = useRef(0);
-
-  // ── CORRECT: useSpring at top level, before return ────────────────
   const [ready, setReady] = useState(false);
+
+  // React-spring fade-in — called at top level (no hook-after-return bug)
   const spring = useSpring({
     opacity: ready ? 1 : 0,
     config:  { tension: 55, friction: 18 },
   });
 
-  // Stable refs so createInstance closure always reads latest props
-  const isDarkRef      = useRef(isDark);
-  const markersRef     = useRef(markers);
-  const markerColorRef = useRef(markerColor);
-  const autoRotateRef  = useRef(autoRotate);
-  isDarkRef.current      = isDark;
-  markersRef.current     = markers;
-  markerColorRef.current = markerColor;
-  autoRotateRef.current  = autoRotate;
+  // Marker color as CSS hex string
+  const markerHex = `rgb(${Math.round(markerColor[0] * 255)},${Math.round(markerColor[1] * 255)},${Math.round(markerColor[2] * 255)})`;
 
-  // ── Create one cobe instance for a given CSS pixel size ───────────
-  // Returns a cleanup fn. cssSize must be > 0 (enforced by callers).
-  const createInstance = useCallback(
-    (canvas: HTMLCanvasElement, cssSize: number): (() => void) => {
-      const dpr = Math.min(
-        typeof window !== "undefined" ? window.devicePixelRatio : 2,
-        2
-      );
-      const px = Math.round(cssSize * dpr);
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
 
-      // Set HTML attributes before createGlobe — sizes the WebGL framebuffer.
-      // CSS width/height alone does NOT resize the WebGL drawing buffer.
-      canvas.width  = px;
-      canvas.height = px;
+    const W   = canvas.width;
+    const H   = canvas.height;
+    const cx  = W / 2;
+    const cy  = H / 2;
+    const R   = Math.min(W, H) * 0.44;
+    const phi = phiRef.current;
+    const dpr = typeof window !== "undefined" ? (window.devicePixelRatio || 1) : 1;
 
-      // Closure var for phi — NOT a ref, so onRender reads it synchronously
-      let phi       = phiRef.current;
-      let firstFrame = true;
+    ctx.clearRect(0, 0, W, H);
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const globe = createGlobe(canvas, {
-        devicePixelRatio: dpr,
-        width:            px,
-        height:           px,
-        phi,
-        theta:            0.15,
-        dark:             isDarkRef.current ? 1 : 0,
-        diffuse:          isDarkRef.current ? 1.4 : 1.2,
-        mapSamples:       20_000,
-        mapBrightness:    isDarkRef.current ? 1.4 : 8,
-        baseColor:        (isDarkRef.current
-          ? [0.06, 0.04, 0.03]
-          : [0.88, 0.88, 0.90]) as [number, number, number],
-        markerColor:      markerColorRef.current,
-        glowColor:        (isDarkRef.current
-          ? [1, 0.47, 0.79]
-          : [0.90, 0.85, 0.92]) as [number, number, number],
-        markers:          markersRef.current.map(m => ({
-          location: m.location,
-          size:     m.size,
-        })),
-        // onRender: only update phi — NO width/height mutation
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ...({ onRender(state: Record<string, unknown>) {
-          if (autoRotateRef.current && !isDragging.current) phi += 0.0025;
-          state["phi"]  = phi;
-          phiRef.current = phi; // persist across reinits
+    // ── Dot grid ────────────────────────────────────────────────────
+    const dotColor   = isDark ? "rgba(255,119,201,0.22)" : "rgba(50,35,19,0.12)";
+    const dotColorFg = isDark ? "rgba(255,119,201,0.55)" : "rgba(50,35,19,0.28)";
+    const dotR = Math.max(1, R * 0.012);
 
-          if (firstFrame) {
-            firstFrame = false;
-            setReady(true);
-          }
-        } } as any),
-      } as any); // eslint-disable-line @typescript-eslint/no-explicit-any
+    for (const d of DOTS) {
+      const [rx, ry, rz] = rotateY(d.x, d.y, d.z, phi);
+      if (rz < 0) continue; // back hemisphere — skip
+      const depth   = (rz + 1) / 2;       // 0=edge 1=center
+      const sx      = cx + rx * R;
+      const sy      = cy - ry * R;
+      ctx.globalAlpha = 0.3 + depth * 0.7;
+      ctx.fillStyle   = depth > 0.5 ? dotColorFg : dotColor;
+      ctx.beginPath();
+      ctx.arc(sx, sy, dotR, 0, Math.PI * 2);
+      ctx.fill();
+    }
 
-      // Pointer events
-      const onDown = (e: PointerEvent) => {
-        if (!interactive) return;
-        isDragging.current = true;
-        lastX.current = e.clientX;
-        canvas.setPointerCapture(e.pointerId);
-      };
-      const onMove = (e: PointerEvent) => {
-        if (!interactive || !isDragging.current) return;
-        phi += (e.clientX - lastX.current) / 300;
-        lastX.current = e.clientX;
-      };
-      const onUp = () => { isDragging.current = false; };
+    // ── Atmosphere glow ─────────────────────────────────────────────
+    const grd = ctx.createRadialGradient(cx, cy, R * 0.85, cx, cy, R * 1.12);
+    const glowA = isDark ? "rgba(255,119,201,0.08)" : "rgba(255,119,201,0.05)";
+    grd.addColorStop(0, glowA);
+    grd.addColorStop(1, "rgba(255,119,201,0)");
+    ctx.globalAlpha = 1;
+    ctx.fillStyle   = grd;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R * 1.12, 0, Math.PI * 2);
+    ctx.fill();
 
-      canvas.addEventListener("pointerdown",  onDown);
-      canvas.addEventListener("pointermove",  onMove);
-      canvas.addEventListener("pointerup",    onUp);
-      canvas.addEventListener("pointerleave", onUp);
+    // ── SP markers ──────────────────────────────────────────────────
+    for (const m of markers) {
+      const [vx, vy, vz] = latLngToVec3(m.location[0], m.location[1]);
+      const [rx, ry, rz] = rotateY(vx, vy, vz, phi);
+      if (rz < 0) continue; // behind the globe
 
-      return () => {
-        globe.destroy();
-        canvas.removeEventListener("pointerdown",  onDown);
-        canvas.removeEventListener("pointermove",  onMove);
-        canvas.removeEventListener("pointerup",    onUp);
-        canvas.removeEventListener("pointerleave", onUp);
-      };
-    },
-    [] // stable — all values via refs
-  );
+      const sx    = cx + rx * R;
+      const sy    = cy - ry * R;
+      const mR    = R * m.size * 0.7;
+      const depth = (rz + 1) / 2;
 
-  // ── Effect 1: ResizeObserver — init + handle resizes ─────────────
+      // Outer glow
+      const gm = ctx.createRadialGradient(sx, sy, 0, sx, sy, mR * 3);
+      gm.addColorStop(0, markerHex.replace("rgb(", "rgba(").replace(")", ",0.5)"));
+      gm.addColorStop(1, markerHex.replace("rgb(", "rgba(").replace(")", ",0)"));
+      ctx.globalAlpha = depth;
+      ctx.fillStyle   = gm;
+      ctx.beginPath();
+      ctx.arc(sx, sy, mR * 3, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Core
+      ctx.globalAlpha = 0.7 + depth * 0.3;
+      ctx.fillStyle   = markerHex;
+      ctx.beginPath();
+      ctx.arc(sx, sy, mR, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Ring
+      ctx.globalAlpha = depth * 0.6;
+      ctx.strokeStyle = markerHex;
+      ctx.lineWidth   = Math.max(1, mR * 0.4);
+      ctx.beginPath();
+      ctx.arc(sx, sy, mR * 2, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    ctx.globalAlpha = 1;
+
+    if (!ready) setReady(true);
+  }, [isDark, markers, markerHex, ready]);
+
+  // ── Animation loop ─────────────────────────────────────────────
+  useEffect(() => {
+    let last = performance.now();
+
+    const loop = (now: number) => {
+      const dt = Math.min((now - last) / 1000, 0.05); // cap at 50ms
+      last = now;
+      if (autoRotate && !isDragging.current) phiRef.current += dt * 0.4;
+      draw();
+      rafRef.current = requestAnimationFrame(loop);
+    };
+
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [autoRotate, draw]);
+
+  // ── ResizeObserver — sync canvas pixel size ────────────────────
   useEffect(() => {
     const container = containerRef.current;
     const canvas    = canvasRef.current;
     if (!container || !canvas) return;
 
-    let cleanup:  (() => void) | null = null;
-    let lastSize: number = 0;
+    const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio : 2, 2);
 
     const ro = new ResizeObserver(entries => {
       const w = Math.round(entries[0]?.contentRect.width ?? 0);
-      if (w <= 0 || Math.abs(w - lastSize) < 2) return;
-      lastSize = w;
-
-      // Destroy previous, create new with correct size
-      if (cleanup) { cleanup(); cleanup = null; setReady(false); }
-      cleanup = createInstance(canvas, w);
+      if (w <= 0) return;
+      canvas.width  = Math.round(w * dpr);
+      canvas.height = Math.round(w * dpr);
+      canvas.style.width  = `${w}px`;
+      canvas.style.height = `${w}px`;
     });
 
     ro.observe(container);
+    return () => ro.disconnect();
+  }, []);
 
-    return () => {
-      ro.disconnect();
-      if (cleanup) cleanup();
-      setReady(false);
-    };
-  }, [createInstance]);
-
-  // ── Effect 2: reinit on theme / markers / markerColor ─────────────
+  // ── Pointer interaction ────────────────────────────────────────
   useEffect(() => {
-    const canvas    = canvasRef.current;
-    const container = containerRef.current;
-    if (!canvas || !container) return;
+    if (!interactive) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
-    const w = Math.round(container.getBoundingClientRect().width);
-    if (w <= 0) return; // ResizeObserver will handle first init
+    const onDown = (e: PointerEvent) => {
+      isDragging.current = true;
+      lastX.current = e.clientX;
+      canvas.setPointerCapture(e.pointerId);
+    };
+    const onMove = (e: PointerEvent) => {
+      if (!isDragging.current) return;
+      phiRef.current += (e.clientX - lastX.current) / 300;
+      lastX.current = e.clientX;
+    };
+    const onUp = () => { isDragging.current = false; };
 
-    setReady(false);
-    const cleanup = createInstance(canvas, w);
-    return cleanup;
-  }, [isDark, markers, markerColor, createInstance]);
+    canvas.addEventListener("pointerdown",  onDown);
+    canvas.addEventListener("pointermove",  onMove);
+    canvas.addEventListener("pointerup",    onUp);
+    canvas.addEventListener("pointerleave", onUp);
+    return () => {
+      canvas.removeEventListener("pointerdown",  onDown);
+      canvas.removeEventListener("pointermove",  onMove);
+      canvas.removeEventListener("pointerup",    onUp);
+      canvas.removeEventListener("pointerleave", onUp);
+    };
+  }, [interactive]);
 
-  // ── Render ────────────────────────────────────────────────────────
   return (
     <div ref={containerRef} className={className} style={{ position: "relative", ...style }}>
       {!ready && (
-        <div style={{
-          position: "absolute", inset: 0,
-          display: "flex", alignItems: "center", justifyContent: "center",
-          zIndex: 1,
-        }}>
-          <div style={{
-            width: 36, height: 36, borderRadius: "50%",
-            border: "2px solid var(--border)",
-            borderTopColor: "var(--shelby-pink, #ff77c9)",
-            animation: "gspin 1s linear infinite",
-          }} />
+        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1 }}>
+          <div style={{ width: 36, height: 36, borderRadius: "50%", border: "2px solid var(--border)", borderTopColor: "var(--shelby-pink, #ff77c9)", animation: "gspin 1s linear infinite" }} />
           <style>{`@keyframes gspin{to{transform:rotate(360deg)}}`}</style>
         </div>
       )}
-      {/* spring.opacity is always defined — useSpring called at top level */}
       <animated.canvas
         ref={canvasRef}
         style={{
           display: "block",
-          width:   "100%",
-          height:  "100%",
           cursor:  interactive ? "grab" : "default",
           opacity: spring.opacity,
         }}

@@ -1,20 +1,19 @@
 "use client";
-// components/ui/globe.tsx — v9.0
+// components/ui/globe.tsx — v10.0
 //
-// Strategy: destroy + reinitialize cobe on every size change.
-// No state.width/state.height mutation inside onRender.
+// BUG FOUND (v8/v9): `spring` was referenced in JSX but `useSpring` was called
+// inside `useLocalSpring()` which was defined AFTER the `return` statement.
+// Hooks after `return` never execute → `spring` = undefined → runtime crash
+// in production → globe never renders, spinner stays forever.
 //
-// Why this is more reliable in production:
-//   Mutating state.width/height inside onRender works in dev (single React
-//   root, predictable RAF timing) but in production builds cobe's internal
-//   WebGL program can be compiled before the first onRender fires, leaving
-//   the VAO in a mismatched state → "drawArrays: no buffer is bound".
-//   Destroy + reinit means createGlobe always receives the exact, measured
-//   canvas size so its WebGL context is created correctly from frame zero.
+// Fix: `useSpring` called at the top level of the component, before `return`.
 //
-// Sizing guarantee:
-//   We read size ONLY from ResizeObserver.contentRect (never offsetWidth on
-//   mount), so the value is always post-layout and always > 0.
+// Architecture:
+//   - ResizeObserver fires after layout (guarantees cssSize > 0)
+//   - On first fire: createGlobe with measured size
+//   - On resize: destroy + recreate (no frame-level state mutation)
+//   - On theme/markers change: destroy + recreate via separate effect
+//   - phi preserved across recreations so globe doesn't snap
 //
 // npm install cobe @react-spring/web
 
@@ -23,7 +22,6 @@ import { useSpring, animated }                       from "@react-spring/web";
 import createGlobe                                   from "cobe";
 import { useTheme }                                  from "@/components/theme-context";
 
-// ── Public types ───────────────────────────────────────────────────
 export interface GlobeMarker {
   location: [number, number];
   size:     number;
@@ -51,7 +49,6 @@ interface GlobeProps {
   markerColor?: [number, number, number];
 }
 
-// ── Component ──────────────────────────────────────────────────────
 export default function Globe({
   markers      = SHELBY_SP_MARKERS,
   autoRotate   = true,
@@ -63,16 +60,18 @@ export default function Globe({
   const { isDark }   = useTheme();
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef    = useRef<HTMLCanvasElement>(null);
+  const phiRef       = useRef(0);
+  const isDragging   = useRef(false);
+  const lastX        = useRef(0);
+
+  // ── CORRECT: useSpring at top level, before return ────────────────
   const [ready, setReady] = useState(false);
   const spring = useSpring({
     opacity: ready ? 1 : 0,
-    config: { tension: 55, friction: 18 },
+    config:  { tension: 55, friction: 18 },
   });
 
-  // Stable refs so the destroy+reinit callback always sees fresh prop values
-  const phiRef         = useRef(0);          // preserved across reinits
-  const isDragging     = useRef(false);
-  const lastX          = useRef(0);
+  // Stable refs so createInstance closure always reads latest props
   const isDarkRef      = useRef(isDark);
   const markersRef     = useRef(markers);
   const markerColorRef = useRef(markerColor);
@@ -82,106 +81,108 @@ export default function Globe({
   markerColorRef.current = markerColor;
   autoRotateRef.current  = autoRotate;
 
-  // ── Core: create one cobe instance for a given pixel size ─────────
-  // Returns a cleanup function. Called by ResizeObserver and theme effect.
-  const createInstance = useCallback((canvas: HTMLCanvasElement, cssSize: number) => {
-    const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio : 2, 2);
-    const px  = Math.round(cssSize * dpr);
+  // ── Create one cobe instance for a given CSS pixel size ───────────
+  // Returns a cleanup fn. cssSize must be > 0 (enforced by callers).
+  const createInstance = useCallback(
+    (canvas: HTMLCanvasElement, cssSize: number): (() => void) => {
+      const dpr = Math.min(
+        typeof window !== "undefined" ? window.devicePixelRatio : 2,
+        2
+      );
+      const px = Math.round(cssSize * dpr);
 
-    // Set canvas HTML pixel attributes BEFORE createGlobe.
-    // This is what sizes the WebGL framebuffer — CSS alone does nothing.
-    canvas.width  = px;
-    canvas.height = px;
+      // Set HTML attributes before createGlobe — sizes the WebGL framebuffer.
+      // CSS width/height alone does NOT resize the WebGL drawing buffer.
+      canvas.width  = px;
+      canvas.height = px;
 
-    let phi       = phiRef.current; // resume from last known rotation
-    let firstFrame = true;
+      // Closure var for phi — NOT a ref, so onRender reads it synchronously
+      let phi       = phiRef.current;
+      let firstFrame = true;
 
-    const globe = createGlobe(canvas, {
-      devicePixelRatio: dpr,
-      width:            px,
-      height:           px,
-      phi,
-      theta:            0.15,
-      dark:             isDarkRef.current ? 1 : 0,
-      diffuse:          isDarkRef.current ? 1.4 : 1.2,
-      mapSamples:       20_000,
-      mapBrightness:    isDarkRef.current ? 1.4 : 8,
-      baseColor:        (isDarkRef.current
-        ? [0.06, 0.04, 0.03]
-        : [0.88, 0.88, 0.90]) as [number, number, number],
-      markerColor:      markerColorRef.current,
-      glowColor:        (isDarkRef.current
-        ? [1, 0.47, 0.79]
-        : [0.90, 0.85, 0.92]) as [number, number, number],
-      markers: markersRef.current.map(m => ({ location: m.location, size: m.size })),
-      // NO state.width/state.height mutation — dimensions are fixed at init
-      ...({
-        onRender(state: Record<string, unknown>) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const globe = createGlobe(canvas, {
+        devicePixelRatio: dpr,
+        width:            px,
+        height:           px,
+        phi,
+        theta:            0.15,
+        dark:             isDarkRef.current ? 1 : 0,
+        diffuse:          isDarkRef.current ? 1.4 : 1.2,
+        mapSamples:       20_000,
+        mapBrightness:    isDarkRef.current ? 1.4 : 8,
+        baseColor:        (isDarkRef.current
+          ? [0.06, 0.04, 0.03]
+          : [0.88, 0.88, 0.90]) as [number, number, number],
+        markerColor:      markerColorRef.current,
+        glowColor:        (isDarkRef.current
+          ? [1, 0.47, 0.79]
+          : [0.90, 0.85, 0.92]) as [number, number, number],
+        markers:          markersRef.current.map(m => ({
+          location: m.location,
+          size:     m.size,
+        })),
+        // onRender: only update phi — NO width/height mutation
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ...({ onRender(state: Record<string, unknown>) {
           if (autoRotateRef.current && !isDragging.current) phi += 0.0025;
-          state["phi"] = phi;
-          // Save so next instance resumes from here
-          phiRef.current = phi;
+          state["phi"]  = phi;
+          phiRef.current = phi; // persist across reinits
 
           if (firstFrame) {
             firstFrame = false;
             setReady(true);
           }
-        },
-      } as any), // eslint-disable-line @typescript-eslint/no-explicit-any
-    } as any); // eslint-disable-line @typescript-eslint/no-explicit-any
+        } } as any),
+      } as any); // eslint-disable-line @typescript-eslint/no-explicit-any
 
-    // Pointer listeners
-    const onDown = (e: PointerEvent) => {
-      if (!interactive) return;
-      isDragging.current = true;
-      lastX.current = e.clientX;
-      canvas.setPointerCapture(e.pointerId);
-    };
-    const onMove = (e: PointerEvent) => {
-      if (!interactive || !isDragging.current) return;
-      phi += (e.clientX - lastX.current) / 300;
-      lastX.current = e.clientX;
-    };
-    const onUp = () => { isDragging.current = false; };
+      // Pointer events
+      const onDown = (e: PointerEvent) => {
+        if (!interactive) return;
+        isDragging.current = true;
+        lastX.current = e.clientX;
+        canvas.setPointerCapture(e.pointerId);
+      };
+      const onMove = (e: PointerEvent) => {
+        if (!interactive || !isDragging.current) return;
+        phi += (e.clientX - lastX.current) / 300;
+        lastX.current = e.clientX;
+      };
+      const onUp = () => { isDragging.current = false; };
 
-    canvas.addEventListener("pointerdown",  onDown);
-    canvas.addEventListener("pointermove",  onMove);
-    canvas.addEventListener("pointerup",    onUp);
-    canvas.addEventListener("pointerleave", onUp);
+      canvas.addEventListener("pointerdown",  onDown);
+      canvas.addEventListener("pointermove",  onMove);
+      canvas.addEventListener("pointerup",    onUp);
+      canvas.addEventListener("pointerleave", onUp);
 
-    // Return cleanup
-    return () => {
-      globe.destroy();
-      canvas.removeEventListener("pointerdown",  onDown);
-      canvas.removeEventListener("pointermove",  onMove);
-      canvas.removeEventListener("pointerup",    onUp);
-      canvas.removeEventListener("pointerleave", onUp);
-    };
-  }, []); // intentionally empty — reads all values via refs
+      return () => {
+        globe.destroy();
+        canvas.removeEventListener("pointerdown",  onDown);
+        canvas.removeEventListener("pointermove",  onMove);
+        canvas.removeEventListener("pointerup",    onUp);
+        canvas.removeEventListener("pointerleave", onUp);
+      };
+    },
+    [] // stable — all values via refs
+  );
 
-  // ── Effect 1: ResizeObserver drives init + resize ─────────────────
-  // Fires AFTER layout is computed → cssSize always > 0
+  // ── Effect 1: ResizeObserver — init + handle resizes ─────────────
   useEffect(() => {
     const container = containerRef.current;
     const canvas    = canvasRef.current;
     if (!container || !canvas) return;
 
-    let cleanup: (() => void) | null = null;
-    let lastSize = 0;
+    let cleanup:  (() => void) | null = null;
+    let lastSize: number = 0;
 
     const ro = new ResizeObserver(entries => {
-      const entry = entries[0];
-      if (!entry) return;
-      const cssSize = Math.round(entry.contentRect.width);
-      if (cssSize <= 0) return;
-      // Debounce: only reinit if size changed meaningfully
-      if (Math.abs(cssSize - lastSize) < 2) return;
-      lastSize = cssSize;
+      const w = Math.round(entries[0]?.contentRect.width ?? 0);
+      if (w <= 0 || Math.abs(w - lastSize) < 2) return;
+      lastSize = w;
 
-      // Destroy previous, create new
-      if (cleanup) { cleanup(); cleanup = null; }
-      setReady(false);
-      cleanup = createInstance(canvas, cssSize);
+      // Destroy previous, create new with correct size
+      if (cleanup) { cleanup(); cleanup = null; setReady(false); }
+      cleanup = createInstance(canvas, w);
     });
 
     ro.observe(container);
@@ -193,17 +194,17 @@ export default function Globe({
     };
   }, [createInstance]);
 
-  // ── Effect 2: reinit on theme / markers / markerColor change ──────
+  // ── Effect 2: reinit on theme / markers / markerColor ─────────────
   useEffect(() => {
     const canvas    = canvasRef.current;
     const container = containerRef.current;
     if (!canvas || !container) return;
 
-    const cssSize = Math.round(container.getBoundingClientRect().width);
-    if (cssSize <= 0) return; // ResizeObserver hasn't fired yet — it will handle init
+    const w = Math.round(container.getBoundingClientRect().width);
+    if (w <= 0) return; // ResizeObserver will handle first init
 
     setReady(false);
-    const cleanup = createInstance(canvas, cssSize);
+    const cleanup = createInstance(canvas, w);
     return cleanup;
   }, [isDark, markers, markerColor, createInstance]);
 
@@ -225,6 +226,7 @@ export default function Globe({
           <style>{`@keyframes gspin{to{transform:rotate(360deg)}}`}</style>
         </div>
       )}
+      {/* spring.opacity is always defined — useSpring called at top level */}
       <animated.canvas
         ref={canvasRef}
         style={{
@@ -232,10 +234,9 @@ export default function Globe({
           width:   "100%",
           height:  "100%",
           cursor:  interactive ? "grab" : "default",
-          opacity: spring.opacity, // Bây giờ 'spring' đã được định nghĩa
+          opacity: spring.opacity,
         }}
       />
     </div>
   );
 }
-

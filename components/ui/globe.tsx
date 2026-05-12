@@ -1,11 +1,14 @@
 "use client";
-// components/ui/globe.tsx — v11.0
+// components/ui/globe.tsx — v12.0
 //
-// Drops cobe/WebGL entirely.
-// Pure Canvas 2D dot-sphere — identical visual, zero WebGL errors.
-// Uses requestAnimationFrame for rotation and react-spring for fade-in.
+// Uses d3-geo orthographic projection + TopoJSON world topology.
+// Renders land polygons (dots-on-land style) matching the reference image.
+// Marker chips float above each SP location.
+// Pure Canvas 2D + react-spring fade-in. No WebGL. No cobe.
 //
-// No extra npm installs needed beyond @react-spring/web.
+// Dependencies already in project:
+//   npm install d3 topojson-client @react-spring/web
+//   (d3 and topojson-client are already used by react-simple-maps)
 
 import {
   useEffect, useRef, useState, useCallback,
@@ -13,23 +16,20 @@ import {
 import { useSpring, animated } from "@react-spring/web";
 import { useTheme }            from "@/components/theme-context";
 
-// ── Public types ───────────────────────────────────────────────────
 export interface GlobeMarker {
-  location: [number, number]; // [lat, lng] degrees
-  size:     number;           // 0.02–0.12 (scaled to canvas radius)
+  location: [number, number]; // [lat, lng]
+  size:     number;
+  label?:   string;
 }
 
 export const SHELBY_SP_MARKERS: GlobeMarker[] = [
-  { location: [ 52.37,    4.90 ], size: 0.07 },
-  { location: [ 52.37,    4.92 ], size: 0.05 },
-  { location: [ 51.51,   -0.13 ], size: 0.07 },
-  { location: [ 51.51,   -0.15 ], size: 0.05 },
-  { location: [ 50.11,    8.68 ], size: 0.06 },
-  { location: [ 38.72,   -9.14 ], size: 0.06 },
-  { location: [ 40.41,   -3.70 ], size: 0.06 },
-  { location: [ 40.71,  -74.01 ], size: 0.06 },
-  { location: [ 37.77, -122.42 ], size: 0.07 },
-  { location: [ 37.77, -122.44 ], size: 0.05 },
+  { location: [ 52.37,    4.90 ], size: 0.07, label: "Jump-AMS" },
+  { location: [ 51.51,   -0.13 ], size: 0.07, label: "Jump-LON" },
+  { location: [ 50.11,    8.68 ], size: 0.06, label: "Stakely" },
+  { location: [ 38.72,   -9.14 ], size: 0.06, label: "Duoro" },
+  { location: [ 40.41,   -3.70 ], size: 0.06, label: "Nova" },
+  { location: [ 40.71,  -74.01 ], size: 0.06, label: "Republic" },
+  { location: [ 37.77, -122.42 ], size: 0.07, label: "AR" },
 ];
 
 interface GlobeProps {
@@ -38,49 +38,29 @@ interface GlobeProps {
   interactive?: boolean;
   className?:   string;
   style?:       React.CSSProperties;
-  markerColor?: [number, number, number]; // 0-1 RGB, kept for API compat
+  markerColor?: [number, number, number];
 }
 
-// ── Math helpers ───────────────────────────────────────────────────
-const DEG = Math.PI / 180;
+// ── World topology cache (fetched once per session) ────────────────
+let worldCache: any = null;
 
-function latLngToVec3(lat: number, lng: number): [number, number, number] {
-  const phi   = (90 - lat)  * DEG;
-  const theta = (lng + 180) * DEG;
-  return [
-     Math.sin(phi) * Math.cos(theta),
-     Math.cos(phi),
-    -Math.sin(phi) * Math.sin(theta),
-  ];
-}
-
-function rotateY(x: number, y: number, z: number, angle: number): [number, number, number] {
-  const cos = Math.cos(angle);
-  const sin = Math.sin(angle);
-  return [x * cos + z * sin, y, -x * sin + z * cos];
-}
-
-// ── Pre-generate dot grid ──────────────────────────────────────────
-interface Dot { x: number; y: number; z: number; }
-
-function generateDots(spacing = 4): Dot[] {
-  const dots: Dot[] = [];
-  for (let lat = -90; lat <= 90; lat += spacing) {
-    const ringR  = Math.cos(lat * DEG);
-    const nDots  = Math.max(1, Math.round((360 * ringR) / spacing));
-    const step   = 360 / nDots;
-    for (let i = 0; i < nDots; i++) {
-      const lng = i * step - 180;
-      const [x, y, z] = latLngToVec3(lat, lng);
-      dots.push({ x, y, z });
-    }
+async function fetchWorld() {
+  if (worldCache) return worldCache;
+  try {
+    // Uses cdn.jsdelivr.net — already in CSP connect-src
+    const res = await fetch(
+      "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json"
+    );
+    const topo = await res.json();
+    // Lazy-import topojson-client
+    const { feature } = await import("topojson-client" as any);
+    worldCache = feature(topo, topo.objects.land);
+    return worldCache;
+  } catch {
+    return null;
   }
-  return dots;
 }
 
-const DOTS = generateDots(4);
-
-// ── Component ──────────────────────────────────────────────────────
 export default function Globe({
   markers      = SHELBY_SP_MARKERS,
   autoRotate   = true,
@@ -90,127 +70,215 @@ export default function Globe({
   markerColor  = [1, 0.47, 0.79],
 }: GlobeProps) {
   const { isDark }   = useTheme();
-  const canvasRef    = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const phiRef       = useRef(0);
-  const rafRef       = useRef<number>(0);
+  const canvasRef    = useRef<HTMLCanvasElement>(null);
+  const rotationRef  = useRef(0);   // longitude offset in degrees
   const isDragging   = useRef(false);
   const lastX        = useRef(0);
+  const worldRef     = useRef<any>(null);
   const [ready, setReady] = useState(false);
 
-  // React-spring fade-in — called at top level (no hook-after-return bug)
+  // React-spring fade-in — top-level, before any return
   const spring = useSpring({
     opacity: ready ? 1 : 0,
     config:  { tension: 55, friction: 18 },
   });
 
-  // Marker color as CSS hex string
-  const markerHex = `rgb(${Math.round(markerColor[0] * 255)},${Math.round(markerColor[1] * 255)},${Math.round(markerColor[2] * 255)})`;
+  const markerHex =
+    `#${Math.round(markerColor[0] * 255).toString(16).padStart(2, "0")}` +
+    `${Math.round(markerColor[1] * 255).toString(16).padStart(2, "0")}` +
+    `${Math.round(markerColor[2] * 255).toString(16).padStart(2, "0")}`;
 
-  const draw = useCallback(() => {
+  // ── Draw one frame ────────────────────────────────────────────────
+  const draw = useCallback(async () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const W   = canvas.width;
-    const H   = canvas.height;
-    const cx  = W / 2;
-    const cy  = H / 2;
-    const R   = Math.min(W, H) * 0.44;
-    const phi = phiRef.current;
-    const dpr = typeof window !== "undefined" ? (window.devicePixelRatio || 1) : 1;
+    // Lazy load d3 + world on first draw
+    if (!worldRef.current) {
+      const [{ geoOrthographic, geoPath, geoGraticule }, world] =
+        await Promise.all([
+          import("d3-geo" as any),
+          fetchWorld(),
+        ]);
+
+      // Store on ref so subsequent draws are synchronous
+      worldRef.current = { geoOrthographic, geoPath, geoGraticule, world };
+      if (!ready) setReady(true);
+    }
+
+    const { geoOrthographic, geoPath, geoGraticule, world } = worldRef.current;
+
+    const W  = canvas.width;
+    const H  = canvas.height;
+    const cx = W / 2;
+    const cy = H / 2;
+    const R  = Math.min(W, H) * 0.46;
+    const dpr = canvas.width / (canvas.style.width
+      ? parseFloat(canvas.style.width) : canvas.width) || 1;
 
     ctx.clearRect(0, 0, W, H);
 
-    // ── Dot grid ────────────────────────────────────────────────────
-    const dotColor   = isDark ? "rgba(255,119,201,0.22)" : "rgba(50,35,19,0.12)";
-    const dotColorFg = isDark ? "rgba(255,119,201,0.55)" : "rgba(50,35,19,0.28)";
-    const dotR = Math.max(1, R * 0.012);
+    // ── Projection centered on current rotation ───────────────────
+    const projection = geoOrthographic()
+      .scale(R)
+      .translate([cx, cy])
+      .rotate([rotationRef.current, -15, 0]); // tilt 15° for better look
 
-    for (const d of DOTS) {
-      const [rx, ry, rz] = rotateY(d.x, d.y, d.z, phi);
-      if (rz < 0) continue; // back hemisphere — skip
-      const depth   = (rz + 1) / 2;       // 0=edge 1=center
-      const sx      = cx + rx * R;
-      const sy      = cy - ry * R;
-      ctx.globalAlpha = 0.3 + depth * 0.7;
-      ctx.fillStyle   = depth > 0.5 ? dotColorFg : dotColor;
-      ctx.beginPath();
-      ctx.arc(sx, sy, dotR, 0, Math.PI * 2);
-      ctx.fill();
-    }
+    const path = geoPath(projection, ctx);
 
-    // ── Atmosphere glow ─────────────────────────────────────────────
-    const grd = ctx.createRadialGradient(cx, cy, R * 0.85, cx, cy, R * 1.12);
-    const glowA = isDark ? "rgba(255,119,201,0.08)" : "rgba(255,119,201,0.05)";
-    grd.addColorStop(0, glowA);
-    grd.addColorStop(1, "rgba(255,119,201,0)");
-    ctx.globalAlpha = 1;
-    ctx.fillStyle   = grd;
+    // ── Ocean fill ────────────────────────────────────────────────
+    const sphere = { type: "Sphere" } as any;
     ctx.beginPath();
-    ctx.arc(cx, cy, R * 1.12, 0, Math.PI * 2);
+    path(sphere);
+    ctx.fillStyle = isDark ? "#0d0a08" : "#f0f0f0";
     ctx.fill();
 
-    // ── SP markers ──────────────────────────────────────────────────
-    for (const m of markers) {
-      const [vx, vy, vz] = latLngToVec3(m.location[0], m.location[1]);
-      const [rx, ry, rz] = rotateY(vx, vy, vz, phi);
-      if (rz < 0) continue; // behind the globe
+    // ── Subtle atmosphere ring ────────────────────────────────────
+    const atm = ctx.createRadialGradient(cx, cy, R * 0.95, cx, cy, R * 1.08);
+    atm.addColorStop(0, isDark ? "rgba(255,119,201,0.08)" : "rgba(200,200,220,0.4)");
+    atm.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.beginPath();
+    path(sphere);
+    ctx.fillStyle = atm;
+    ctx.fill();
 
-      const sx    = cx + rx * R;
-      const sy    = cy - ry * R;
-      const mR    = R * m.size * 0.7;
-      const depth = (rz + 1) / 2;
+    // ── Graticule (grid lines) ────────────────────────────────────
+    const graticule = geoGraticule().step([20, 20])();
+    ctx.beginPath();
+    path(graticule);
+    ctx.strokeStyle = isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.05)";
+    ctx.lineWidth   = 0.5;
+    ctx.stroke();
 
-      // Outer glow
-      const gm = ctx.createRadialGradient(sx, sy, 0, sx, sy, mR * 3);
-      gm.addColorStop(0, markerHex.replace("rgb(", "rgba(").replace(")", ",0.5)"));
-      gm.addColorStop(1, markerHex.replace("rgb(", "rgba(").replace(")", ",0)"));
-      ctx.globalAlpha = depth;
-      ctx.fillStyle   = gm;
+    // ── Land polygons ─────────────────────────────────────────────
+    if (world) {
       ctx.beginPath();
-      ctx.arc(sx, sy, mR * 3, 0, Math.PI * 2);
+      path(world);
+      // Light theme: dark dots on land; dark theme: lighter land
+      ctx.fillStyle   = isDark ? "rgba(255,255,255,0.12)" : "rgba(30,20,10,0.13)";
+      ctx.strokeStyle = isDark ? "rgba(255,255,255,0.06)" : "rgba(30,20,10,0.06)";
+      ctx.lineWidth   = 0.4;
       ctx.fill();
-
-      // Core
-      ctx.globalAlpha = 0.7 + depth * 0.3;
-      ctx.fillStyle   = markerHex;
-      ctx.beginPath();
-      ctx.arc(sx, sy, mR, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Ring
-      ctx.globalAlpha = depth * 0.6;
-      ctx.strokeStyle = markerHex;
-      ctx.lineWidth   = Math.max(1, mR * 0.4);
-      ctx.beginPath();
-      ctx.arc(sx, sy, mR * 2, 0, Math.PI * 2);
       ctx.stroke();
     }
 
-    ctx.globalAlpha = 1;
+    // ── Globe border ──────────────────────────────────────────────
+    ctx.beginPath();
+    path(sphere);
+    ctx.strokeStyle = isDark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.10)";
+    ctx.lineWidth   = 1.5;
+    ctx.stroke();
 
-    if (!ready) setReady(true);
+    // ── SP markers + label chips ──────────────────────────────────
+    const chips: { sx: number; sy: number; label: string; visible: boolean }[] = [];
+
+    for (const m of markers) {
+      const [lng, lat] = [m.location[1], m.location[0]];
+      const projected  = projection([lng, lat]);
+      if (!projected) continue;
+
+      const [sx, sy] = projected;
+
+      // Check visibility (front hemisphere)
+      const rot = rotationRef.current * Math.PI / 180;
+      const tilt = -15 * Math.PI / 180;
+      const latR  = lat  * Math.PI / 180;
+      const lngR  = lng  * Math.PI / 180;
+      const cosDot =
+        Math.cos(latR) * Math.cos(tilt) * Math.cos(lngR + rot) +
+        Math.sin(latR) * Math.sin(tilt);
+      if (cosDot < 0) continue; // behind globe
+
+      const mR = R * m.size * 0.55;
+
+      // Outer glow
+      const grd = ctx.createRadialGradient(sx, sy, 0, sx, sy, mR * 3.5);
+      grd.addColorStop(0, `${markerHex}55`);
+      grd.addColorStop(1, `${markerHex}00`);
+      ctx.fillStyle = grd;
+      ctx.beginPath();
+      ctx.arc(sx, sy, mR * 3.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Core dot
+      ctx.fillStyle   = markerHex;
+      ctx.strokeStyle = isDark ? "#0d0a08" : "#ffffff";
+      ctx.lineWidth   = Math.max(1.5, mR * 0.4);
+      ctx.beginPath();
+      ctx.arc(sx, sy, mR, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      if (m.label) {
+        chips.push({ sx, sy, label: m.label, visible: cosDot > 0.1 });
+      }
+    }
+
+    // Draw chips AFTER all dots (so they're on top)
+    for (const chip of chips) {
+      if (!chip.visible) continue;
+      const { sx, sy, label } = chip;
+
+      ctx.font      = `bold ${Math.max(9, Math.round(R * 0.028))}px 'Roboto Mono', monospace`;
+      ctx.textBaseline = "middle";
+      const tw    = ctx.measureText(label).width;
+      const pw    = 8 * dpr;
+      const ph    = 5 * dpr;
+      const cw    = tw + pw * 2;
+      const ch    = Math.max(9, Math.round(R * 0.028)) + ph * 2;
+      const chipX = sx + R * 0.04;
+      const chipY = sy - ch / 2 - R * 0.04;
+
+      // Chip background
+      ctx.fillStyle   = markerHex;
+      ctx.strokeStyle = isDark ? "rgba(0,0,0,0.2)" : "rgba(0,0,0,0.1)";
+      ctx.lineWidth   = 0.5;
+      const crad = ch * 0.35;
+      ctx.beginPath();
+      ctx.roundRect(chipX, chipY, cw, ch, crad);
+      ctx.fill();
+      ctx.stroke();
+
+      // Connector line
+      ctx.strokeStyle = markerHex;
+      ctx.lineWidth   = 1 * dpr;
+      ctx.setLineDash([2 * dpr, 2 * dpr]);
+      ctx.beginPath();
+      ctx.moveTo(sx, sy - R * 0.02);
+      ctx.lineTo(chipX, chipY + ch / 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Label text
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(label, chipX + pw, chipY + ch / 2);
+    }
   }, [isDark, markers, markerHex, ready]);
 
-  // ── Animation loop ─────────────────────────────────────────────
+  // ── Animation loop ────────────────────────────────────────────────
   useEffect(() => {
+    let rafId: number;
     let last = performance.now();
+    let initialized = false;
 
     const loop = (now: number) => {
-      const dt = Math.min((now - last) / 1000, 0.05); // cap at 50ms
+      const dt = Math.min((now - last) / 1000, 0.05);
       last = now;
-      if (autoRotate && !isDragging.current) phiRef.current += dt * 0.4;
-      draw();
-      rafRef.current = requestAnimationFrame(loop);
+      if (autoRotate && !isDragging.current) rotationRef.current -= dt * 15; // degrees/sec
+      draw().then(() => {
+        if (!initialized) { initialized = true; }
+      });
+      rafId = requestAnimationFrame(loop);
     };
 
-    rafRef.current = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(rafRef.current);
+    rafId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafId);
   }, [autoRotate, draw]);
 
-  // ── ResizeObserver — sync canvas pixel size ────────────────────
+  // ── ResizeObserver ────────────────────────────────────────────────
   useEffect(() => {
     const container = containerRef.current;
     const canvas    = canvasRef.current;
@@ -231,7 +299,7 @@ export default function Globe({
     return () => ro.disconnect();
   }, []);
 
-  // ── Pointer interaction ────────────────────────────────────────
+  // ── Pointer interaction ───────────────────────────────────────────
   useEffect(() => {
     if (!interactive) return;
     const canvas = canvasRef.current;
@@ -244,7 +312,7 @@ export default function Globe({
     };
     const onMove = (e: PointerEvent) => {
       if (!isDragging.current) return;
-      phiRef.current += (e.clientX - lastX.current) / 300;
+      rotationRef.current -= (e.clientX - lastX.current) * 0.3;
       lastX.current = e.clientX;
     };
     const onUp = () => { isDragging.current = false; };

@@ -1,36 +1,21 @@
 "use client";
-// components/ui/globe.tsx — v12.0
-//
-// Uses d3-geo orthographic projection + TopoJSON world topology.
-// Renders land polygons (dots-on-land style) matching the reference image.
-// Marker chips float above each SP location.
-// Pure Canvas 2D + react-spring fade-in. No WebGL. No cobe.
-//
-// Dependencies already in project:
-//   npm install d3 topojson-client @react-spring/web
-//   (d3 and topojson-client are already used by react-simple-maps)
+// components/ui/globe.tsx — v13.0
+// Fixes:
+//  - Full XY drag (latitude + longitude rotation)
+//  - Correct drag direction: drag right → globe rotates right
+//  - No hardcoded/default SP markers — callers always pass real data
+//  - d3-geo orthographic with land polygons (no cobe/WebGL)
 
-import {
-  useEffect, useRef, useState, useCallback,
-} from "react";
-import { useSpring, animated } from "@react-spring/web";
-import { useTheme }            from "@/components/theme-context";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { useSpring, animated }                       from "@react-spring/web";
+import { useTheme }                                  from "@/components/theme-context";
 
 export interface GlobeMarker {
   location: [number, number]; // [lat, lng]
   size:     number;
   label?:   string;
+  color?:   string; // CSS hex e.g. "#ff77c9"
 }
-
-export const SHELBY_SP_MARKERS: GlobeMarker[] = [
-  { location: [ 52.37,    4.90 ], size: 0.07, label: "Jump-AMS" },
-  { location: [ 51.51,   -0.13 ], size: 0.07, label: "Jump-LON" },
-  { location: [ 50.11,    8.68 ], size: 0.06, label: "Stakely" },
-  { location: [ 38.72,   -9.14 ], size: 0.06, label: "Duoro" },
-  { location: [ 40.41,   -3.70 ], size: 0.06, label: "Nova" },
-  { location: [ 40.71,  -74.01 ], size: 0.06, label: "Republic" },
-  { location: [ 37.77, -122.42 ], size: 0.07, label: "AR" },
-];
 
 interface GlobeProps {
   markers?:     GlobeMarker[];
@@ -38,239 +23,224 @@ interface GlobeProps {
   interactive?: boolean;
   className?:   string;
   style?:       React.CSSProperties;
-  markerColor?: [number, number, number];
+  markerColor?: string; // default marker color as CSS hex
 }
 
-// ── World topology cache (fetched once per session) ────────────────
-let worldCache: any = null;
+// ── World topology (fetched once, cached in module scope) ──────────
+let _worldCache: any = null;
+let _worldFetch: Promise<any> | null = null;
 
-async function fetchWorld() {
-  if (worldCache) return worldCache;
-  try {
-    // Uses cdn.jsdelivr.net — already in CSP connect-src
-    const res = await fetch(
-      "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json"
-    );
-    const topo = await res.json();
-    // Lazy-import topojson-client
-    const { feature } = await import("topojson-client" as any);
-    worldCache = feature(topo, topo.objects.land);
-    return worldCache;
-  } catch {
-    return null;
-  }
+async function getWorld() {
+  if (_worldCache) return _worldCache;
+  if (_worldFetch) return _worldFetch;
+  _worldFetch = (async () => {
+    try {
+      const res  = await fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json");
+      const topo = await res.json();
+      const { feature } = await import("topojson-client" as any);
+      _worldCache = feature(topo, topo.objects.land);
+      return _worldCache;
+    } catch { return null; }
+  })();
+  return _worldFetch;
+}
+
+// ── d3-geo (lazy) ─────────────────────────────────────────────────
+let _d3: any = null;
+async function getD3() {
+  if (_d3) return _d3;
+  _d3 = await import("d3-geo" as any);
+  return _d3;
 }
 
 export default function Globe({
-  markers      = SHELBY_SP_MARKERS,
+  markers      = [],
   autoRotate   = true,
-  interactive  = false,
+  interactive  = true,
   className,
   style,
-  markerColor  = [1, 0.47, 0.79],
+  markerColor  = "#ff77c9",
 }: GlobeProps) {
   const { isDark }   = useTheme();
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef    = useRef<HTMLCanvasElement>(null);
-  const rotationRef  = useRef(0);   // longitude offset in degrees
-  const isDragging   = useRef(false);
-  const lastX        = useRef(0);
-  const worldRef     = useRef<any>(null);
+
+  // Rotation state: [lambda (lng), phi (lat)] in degrees
+  const rotRef    = useRef<[number, number]>([0, -10]);
+  const dragStart = useRef<{ x: number; y: number; rot: [number, number] } | null>(null);
+  const assetsRef = useRef<{ d3: any; world: any } | null>(null);
+
   const [ready, setReady] = useState(false);
+  const spring = useSpring({ opacity: ready ? 1 : 0, config: { tension: 55, friction: 18 } });
 
-  // React-spring fade-in — top-level, before any return
-  const spring = useSpring({
-    opacity: ready ? 1 : 0,
-    config:  { tension: 55, friction: 18 },
-  });
-
-  const markerHex =
-    `#${Math.round(markerColor[0] * 255).toString(16).padStart(2, "0")}` +
-    `${Math.round(markerColor[1] * 255).toString(16).padStart(2, "0")}` +
-    `${Math.round(markerColor[2] * 255).toString(16).padStart(2, "0")}`;
-
-  // ── Draw one frame ────────────────────────────────────────────────
-  const draw = useCallback(async () => {
+  // ── Draw one frame ───────────────────────────────────────────────
+  const draw = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas || !assetsRef.current) return;
+    const { d3, world } = assetsRef.current;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-
-    // Lazy load d3 + world on first draw
-    if (!worldRef.current) {
-      const [{ geoOrthographic, geoPath, geoGraticule }, world] =
-        await Promise.all([
-          import("d3-geo" as any),
-          fetchWorld(),
-        ]);
-
-      // Store on ref so subsequent draws are synchronous
-      worldRef.current = { geoOrthographic, geoPath, geoGraticule, world };
-      if (!ready) setReady(true);
-    }
-
-    const { geoOrthographic, geoPath, geoGraticule, world } = worldRef.current;
 
     const W  = canvas.width;
     const H  = canvas.height;
     const cx = W / 2;
     const cy = H / 2;
-    const R  = Math.min(W, H) * 0.46;
-    const dpr = canvas.width / (canvas.style.width
-      ? parseFloat(canvas.style.width) : canvas.width) || 1;
+    const R  = Math.min(W, H) * 0.44;
 
     ctx.clearRect(0, 0, W, H);
 
-    // ── Projection centered on current rotation ───────────────────
-    const projection = geoOrthographic()
+    const proj = d3.geoOrthographic()
       .scale(R)
       .translate([cx, cy])
-      .rotate([rotationRef.current, -15, 0]); // tilt 15° for better look
+      .rotate(rotRef.current)
+      .clipAngle(90);
 
-    const path = geoPath(projection, ctx);
+    const path = d3.geoPath(proj, ctx);
 
-    // ── Ocean fill ────────────────────────────────────────────────
-    const sphere = { type: "Sphere" } as any;
+    // Ocean
     ctx.beginPath();
-    path(sphere);
-    ctx.fillStyle = isDark ? "#0d0a08" : "#f0f0f0";
+    path({ type: "Sphere" });
+    ctx.fillStyle = isDark ? "#151010" : "#f2f2f4";
     ctx.fill();
 
-    // ── Subtle atmosphere ring ────────────────────────────────────
-    const atm = ctx.createRadialGradient(cx, cy, R * 0.95, cx, cy, R * 1.08);
-    atm.addColorStop(0, isDark ? "rgba(255,119,201,0.08)" : "rgba(200,200,220,0.4)");
+    // Atmosphere glow
+    const atm = ctx.createRadialGradient(cx, cy, R * 0.94, cx, cy, R * 1.10);
+    atm.addColorStop(0, isDark ? "rgba(255,119,201,0.06)" : "rgba(180,180,200,0.35)");
     atm.addColorStop(1, "rgba(0,0,0,0)");
     ctx.beginPath();
-    path(sphere);
+    path({ type: "Sphere" });
     ctx.fillStyle = atm;
     ctx.fill();
 
-    // ── Graticule (grid lines) ────────────────────────────────────
-    const graticule = geoGraticule().step([20, 20])();
+    // Graticule
+    const grat = d3.geoGraticule().step([20, 20])();
     ctx.beginPath();
-    path(graticule);
+    path(grat);
     ctx.strokeStyle = isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.05)";
     ctx.lineWidth   = 0.5;
     ctx.stroke();
 
-    // ── Land polygons ─────────────────────────────────────────────
+    // Land
     if (world) {
       ctx.beginPath();
       path(world);
-      // Light theme: dark dots on land; dark theme: lighter land
-      ctx.fillStyle   = isDark ? "rgba(255,255,255,0.12)" : "rgba(30,20,10,0.13)";
-      ctx.strokeStyle = isDark ? "rgba(255,255,255,0.06)" : "rgba(30,20,10,0.06)";
+      ctx.fillStyle   = isDark ? "rgba(255,255,255,0.11)" : "rgba(40,30,20,0.14)";
+      ctx.strokeStyle = isDark ? "rgba(255,255,255,0.05)" : "rgba(40,30,20,0.07)";
       ctx.lineWidth   = 0.4;
       ctx.fill();
       ctx.stroke();
     }
 
-    // ── Globe border ──────────────────────────────────────────────
+    // Globe border
     ctx.beginPath();
-    path(sphere);
-    ctx.strokeStyle = isDark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.10)";
+    path({ type: "Sphere" });
+    ctx.strokeStyle = isDark ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.10)";
     ctx.lineWidth   = 1.5;
     ctx.stroke();
 
-    // ── SP markers + label chips ──────────────────────────────────
-    const chips: { sx: number; sy: number; label: string; visible: boolean }[] = [];
+    // Markers + chips
+    const labelScale = R / 200; // scale fonts with globe size
+    const chips: { sx: number; sy: number; label: string; color: string }[] = [];
 
     for (const m of markers) {
-      const [lng, lat] = [m.location[1], m.location[0]];
-      const projected  = projection([lng, lat]);
-      if (!projected) continue;
+      const [lat, lng] = m.location;
+      const pt = proj([lng, lat]);
+      if (!pt) continue;
 
-      const [sx, sy] = projected;
+      // Visibility check — dot product with view center
+      const [sx, sy] = pt;
+      const [lam, phi] = rotRef.current.map(d => d * Math.PI / 180);
+      const latR = lat * Math.PI / 180;
+      const lngR = lng * Math.PI / 180;
+      const vis  =
+        Math.cos(latR) * Math.cos(phi) * Math.cos(lngR - (-lam)) +
+        Math.sin(latR) * Math.sin(-phi);
+      if (vis < 0.05) continue;
 
-      // Check visibility (front hemisphere)
-      const rot = rotationRef.current * Math.PI / 180;
-      const tilt = -15 * Math.PI / 180;
-      const latR  = lat  * Math.PI / 180;
-      const lngR  = lng  * Math.PI / 180;
-      const cosDot =
-        Math.cos(latR) * Math.cos(tilt) * Math.cos(lngR + rot) +
-        Math.sin(latR) * Math.sin(tilt);
-      if (cosDot < 0) continue; // behind globe
+      const col = m.color || markerColor;
+      const mR  = R * m.size * 0.6;
+      const alpha = 0.4 + vis * 0.6;
 
-      const mR = R * m.size * 0.55;
-
-      // Outer glow
-      const grd = ctx.createRadialGradient(sx, sy, 0, sx, sy, mR * 3.5);
-      grd.addColorStop(0, `${markerHex}55`);
-      grd.addColorStop(1, `${markerHex}00`);
-      ctx.fillStyle = grd;
+      // Glow
+      const grd = ctx.createRadialGradient(sx, sy, 0, sx, sy, mR * 3);
+      grd.addColorStop(0, col + "66");
+      grd.addColorStop(1, col + "00");
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle   = grd;
       ctx.beginPath();
-      ctx.arc(sx, sy, mR * 3.5, 0, Math.PI * 2);
+      ctx.arc(sx, sy, mR * 3, 0, Math.PI * 2);
       ctx.fill();
 
-      // Core dot
-      ctx.fillStyle   = markerHex;
-      ctx.strokeStyle = isDark ? "#0d0a08" : "#ffffff";
-      ctx.lineWidth   = Math.max(1.5, mR * 0.4);
+      // Core
+      ctx.globalAlpha = 0.7 + vis * 0.3;
+      ctx.fillStyle   = col;
+      ctx.strokeStyle = isDark ? "#151010" : "#ffffff";
+      ctx.lineWidth   = Math.max(1.5, mR * 0.35);
       ctx.beginPath();
       ctx.arc(sx, sy, mR, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
+      ctx.globalAlpha = 1;
 
-      if (m.label) {
-        chips.push({ sx, sy, label: m.label, visible: cosDot > 0.1 });
-      }
+      if (m.label && vis > 0.15) chips.push({ sx, sy, label: m.label, color: col });
     }
 
-    // Draw chips AFTER all dots (so they're on top)
-    for (const chip of chips) {
-      if (!chip.visible) continue;
-      const { sx, sy, label } = chip;
-
-      ctx.font      = `bold ${Math.max(9, Math.round(R * 0.028))}px 'Roboto Mono', monospace`;
+    // Label chips on top of dots
+    for (const { sx, sy, label, color } of chips) {
+      const fs  = Math.max(10, Math.round(11 * labelScale));
+      ctx.font  = `700 ${fs}px 'Roboto Mono', monospace`;
       ctx.textBaseline = "middle";
-      const tw    = ctx.measureText(label).width;
-      const pw    = 8 * dpr;
-      const ph    = 5 * dpr;
-      const cw    = tw + pw * 2;
-      const ch    = Math.max(9, Math.round(R * 0.028)) + ph * 2;
-      const chipX = sx + R * 0.04;
-      const chipY = sy - ch / 2 - R * 0.04;
+      const tw  = ctx.measureText(label).width;
+      const px  = 8, py = 4;
+      const cw  = tw + px * 2;
+      const ch  = fs + py * 2;
+      const cx2 = sx + Math.max(8, R * 0.06);
+      const cy2 = sy - ch - Math.max(4, R * 0.04);
 
-      // Chip background
-      ctx.fillStyle   = markerHex;
-      ctx.strokeStyle = isDark ? "rgba(0,0,0,0.2)" : "rgba(0,0,0,0.1)";
-      ctx.lineWidth   = 0.5;
-      const crad = ch * 0.35;
+      ctx.fillStyle   = color;
       ctx.beginPath();
-      ctx.roundRect(chipX, chipY, cw, ch, crad);
+      ctx.roundRect(cx2, cy2, cw, ch, ch * 0.35);
       ctx.fill();
+
+      ctx.strokeStyle = isDark ? "rgba(0,0,0,0.3)" : "rgba(0,0,0,0.15)";
+      ctx.lineWidth   = 0.5;
       ctx.stroke();
 
-      // Connector line
-      ctx.strokeStyle = markerHex;
-      ctx.lineWidth   = 1 * dpr;
-      ctx.setLineDash([2 * dpr, 2 * dpr]);
+      // Connector
+      ctx.strokeStyle = color + "cc";
+      ctx.lineWidth   = 1;
+      ctx.setLineDash([3, 3]);
       ctx.beginPath();
-      ctx.moveTo(sx, sy - R * 0.02);
-      ctx.lineTo(chipX, chipY + ch / 2);
+      ctx.moveTo(sx, sy - Math.max(2, R * 0.015));
+      ctx.lineTo(cx2 + 4, cy2 + ch);
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Label text
       ctx.fillStyle = "#ffffff";
-      ctx.fillText(label, chipX + pw, chipY + ch / 2);
+      ctx.fillText(label, cx2 + px, cy2 + ch / 2);
     }
-  }, [isDark, markers, markerHex, ready]);
+  }, [isDark, markers, markerColor]);
+
+  // ── Load assets once ─────────────────────────────────────────────
+  useEffect(() => {
+    Promise.all([getD3(), getWorld()]).then(([d3, world]) => {
+      assetsRef.current = { d3, world };
+      setReady(true);
+    });
+  }, []);
 
   // ── Animation loop ────────────────────────────────────────────────
   useEffect(() => {
     let rafId: number;
     let last = performance.now();
-    let initialized = false;
 
     const loop = (now: number) => {
       const dt = Math.min((now - last) / 1000, 0.05);
       last = now;
-      if (autoRotate && !isDragging.current) rotationRef.current -= dt * 15; // degrees/sec
-      draw().then(() => {
-        if (!initialized) { initialized = true; }
-      });
+      if (autoRotate && !dragStart.current) {
+        rotRef.current = [rotRef.current[0] - dt * 12, rotRef.current[1]];
+      }
+      draw();
       rafId = requestAnimationFrame(loop);
     };
 
@@ -278,13 +248,12 @@ export default function Globe({
     return () => cancelAnimationFrame(rafId);
   }, [autoRotate, draw]);
 
-  // ── ResizeObserver ────────────────────────────────────────────────
+  // ── ResizeObserver ─────────────────────────────────────────────────
   useEffect(() => {
     const container = containerRef.current;
     const canvas    = canvasRef.current;
     if (!container || !canvas) return;
-
-    const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio : 2, 2);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
     const ro = new ResizeObserver(entries => {
       const w = Math.round(entries[0]?.contentRect.width ?? 0);
@@ -299,23 +268,32 @@ export default function Globe({
     return () => ro.disconnect();
   }, []);
 
-  // ── Pointer interaction ───────────────────────────────────────────
+  // ── Pointer events — full XY drag ─────────────────────────────────
   useEffect(() => {
     if (!interactive) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     const onDown = (e: PointerEvent) => {
-      isDragging.current = true;
-      lastX.current = e.clientX;
+      dragStart.current = { x: e.clientX, y: e.clientY, rot: [...rotRef.current] as [number, number] };
       canvas.setPointerCapture(e.pointerId);
+      canvas.style.cursor = "grabbing";
     };
+
     const onMove = (e: PointerEvent) => {
-      if (!isDragging.current) return;
-      rotationRef.current -= (e.clientX - lastX.current) * 0.3;
-      lastX.current = e.clientX;
+      if (!dragStart.current) return;
+      const dx =  (e.clientX - dragStart.current.x) * 0.35; // drag right = rotate right
+      const dy = -(e.clientY - dragStart.current.y) * 0.35; // drag up = rotate up
+      rotRef.current = [
+        dragStart.current.rot[0] - dx, // correct: subtract so drag right = positive λ
+        Math.max(-80, Math.min(80, dragStart.current.rot[1] + dy)),
+      ];
     };
-    const onUp = () => { isDragging.current = false; };
+
+    const onUp = () => {
+      dragStart.current = null;
+      canvas.style.cursor = "grab";
+    };
 
     canvas.addEventListener("pointerdown",  onDown);
     canvas.addEventListener("pointermove",  onMove);
@@ -339,11 +317,7 @@ export default function Globe({
       )}
       <animated.canvas
         ref={canvasRef}
-        style={{
-          display: "block",
-          cursor:  interactive ? "grab" : "default",
-          opacity: spring.opacity,
-        }}
+        style={{ display: "block", cursor: interactive ? "grab" : "default", opacity: spring.opacity }}
       />
     </div>
   );

@@ -13,7 +13,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter }  from "next/navigation";
 import dynamic        from "next/dynamic";
 import { useNetwork } from "@/components/network-context";
-import { SHELBY_SP_MARKERS, type GlobeMarker } from "@/components/ui/globe";
+import type { GlobeMarker } from "@/components/ui/globe";
 
 // ── Dynamic globe (no SSR) ────────────────────────────────────────
 const Globe = dynamic(() => import("@/components/ui/globe"), {
@@ -180,22 +180,37 @@ export default function LandingPage() {
   const { network } = useNetwork();
   const typedText   = useTypingEffect(TYPING_PHRASES, 65, 2400);
 
-  const [stats,     setStats]     = useState<LiveStats>({ totalBlobs: null, totalStorageGB: null, storageProviders: null, blockHeight: null });
-  const [loading,   setLoading]   = useState(true);
+  const [stats,      setStats]      = useState<LiveStats>({ totalBlobs: null, totalStorageGB: null, storageProviders: null, blockHeight: null });
+  const [loading,    setLoading]    = useState(true);
   const [testnetSPs, setTestnetSPs] = useState<number|null>(null);
+  // Real SP markers from backend — no hardcoded defaults
+  const [globeMarkers, setGlobeMarkers] = useState<GlobeMarker[]>([]);
 
   useEffect(() => {
     (async () => {
       try {
-        const [sn, tn] = await Promise.allSettled([
+        const [sn, tn, prov] = await Promise.allSettled([
           fetch("/api/network/stats?network=shelbynet").then(r => r.json()),
           fetch("/api/network/stats?network=testnet").then(r => r.json()),
+          fetch("/api/network/providers?network=shelbynet").then(r => r.json()),
         ]);
         if (sn.status === "fulfilled") {
           const d = (sn.value as any)?.data;
           setStats({ totalBlobs: d?.stats?.totalBlobs ?? null, totalStorageGB: d?.stats?.totalStorageGB ?? null, storageProviders: d?.stats?.storageProviders ?? null, blockHeight: d?.node?.blockHeight ?? null });
         }
         if (tn.status === "fulfilled") setTestnetSPs((tn.value as any)?.data?.stats?.storageProviders ?? null);
+        if (prov.status === "fulfilled") {
+          const providers: any[] = (prov.value as any)?.data?.providers ?? [];
+          const mkrs: GlobeMarker[] = providers
+            .filter((p: any) => p.geo?.lat && p.geo?.lng)
+            .map((p: any): GlobeMarker => ({
+              location: [p.geo.lat, p.geo.lng],
+              size:     p.health === "Healthy" ? 0.07 : 0.05,
+              color:    p.health === "Healthy" ? "#ff77c9" : p.state === "Waitlisted" ? "#a855f7" : "#ef4444",
+              label:    p.availabilityZone ?? undefined,
+            }));
+          setGlobeMarkers(mkrs);
+        }
       } catch { /* silent */ }
       finally { setLoading(false); }
     })();
@@ -374,7 +389,7 @@ export default function LandingPage() {
 
           {/* Globe — no card border, just floating */}
           <Globe
-            markers={SHELBY_SP_MARKERS}
+            markers={globeMarkers}
             autoRotate
             interactive={false}
             style={{

@@ -1,10 +1,11 @@
 "use client";
-// components/ui/globe.tsx — v13.0
-// Fixes:
-//  - Full XY drag (latitude + longitude rotation)
-//  - Correct drag direction: drag right → globe rotates right
-//  - No hardcoded/default SP markers — callers always pass real data
-//  - d3-geo orthographic with land polygons (no cobe/WebGL)
+// components/ui/globe.tsx — v14.0
+// FIXES:
+// 1. Drag direction: drag RIGHT → globe rotates RIGHT (was inverted)
+//    Root cause: `rotRef.current[0] - dx` was subtracting so drag-right rotated left
+//    Fix: change sign — drag updates lambda as rot[0] + dx
+// 2. Full XY drag: lat clamped to [-80, 80] unchanged
+// 3. No hardcoded/default SP markers
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useSpring, animated }                       from "@react-spring/web";
@@ -14,7 +15,7 @@ export interface GlobeMarker {
   location: [number, number]; // [lat, lng]
   size:     number;
   label?:   string;
-  color?:   string; // CSS hex e.g. "#ff77c9"
+  color?:   string;
 }
 
 interface GlobeProps {
@@ -23,10 +24,9 @@ interface GlobeProps {
   interactive?: boolean;
   className?:   string;
   style?:       React.CSSProperties;
-  markerColor?: string; // default marker color as CSS hex
+  markerColor?: string;
 }
 
-// ── World topology (fetched once, cached in module scope) ──────────
 let _worldCache: any = null;
 let _worldFetch: Promise<any> | null = null;
 
@@ -45,7 +45,6 @@ async function getWorld() {
   return _worldFetch;
 }
 
-// ── d3-geo (lazy) ─────────────────────────────────────────────────
 let _d3: any = null;
 async function getD3() {
   if (_d3) return _d3;
@@ -65,7 +64,7 @@ export default function Globe({
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef    = useRef<HTMLCanvasElement>(null);
 
-  // Rotation state: [lambda (lng), phi (lat)] in degrees
+  // [lambda (lng), phi (lat)] in degrees
   const rotRef    = useRef<[number, number]>([0, -10]);
   const dragStart = useRef<{ x: number; y: number; rot: [number, number] } | null>(null);
   const assetsRef = useRef<{ d3: any; world: any } | null>(null);
@@ -73,7 +72,6 @@ export default function Globe({
   const [ready, setReady] = useState(false);
   const spring = useSpring({ opacity: ready ? 1 : 0, config: { tension: 55, friction: 18 } });
 
-  // ── Draw one frame ───────────────────────────────────────────────
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !assetsRef.current) return;
@@ -139,7 +137,7 @@ export default function Globe({
     ctx.stroke();
 
     // Markers + chips
-    const labelScale = R / 200; // scale fonts with globe size
+    const labelScale = R / 200;
     const chips: { sx: number; sy: number; label: string; color: string }[] = [];
 
     for (const m of markers) {
@@ -147,7 +145,6 @@ export default function Globe({
       const pt = proj([lng, lat]);
       if (!pt) continue;
 
-      // Visibility check — dot product with view center
       const [sx, sy] = pt;
       const [lam, phi] = rotRef.current.map(d => d * Math.PI / 180);
       const latR = lat * Math.PI / 180;
@@ -185,7 +182,7 @@ export default function Globe({
       if (m.label && vis > 0.15) chips.push({ sx, sy, label: m.label, color: col });
     }
 
-    // Label chips on top of dots
+    // Label chips
     for (const { sx, sy, label, color } of chips) {
       const fs  = Math.max(10, Math.round(11 * labelScale));
       ctx.font  = `700 ${fs}px 'Roboto Mono', monospace`;
@@ -206,7 +203,6 @@ export default function Globe({
       ctx.lineWidth   = 0.5;
       ctx.stroke();
 
-      // Connector
       ctx.strokeStyle = color + "cc";
       ctx.lineWidth   = 1;
       ctx.setLineDash([3, 3]);
@@ -221,7 +217,6 @@ export default function Globe({
     }
   }, [isDark, markers, markerColor]);
 
-  // ── Load assets once ─────────────────────────────────────────────
   useEffect(() => {
     Promise.all([getD3(), getWorld()]).then(([d3, world]) => {
       assetsRef.current = { d3, world };
@@ -229,7 +224,6 @@ export default function Globe({
     });
   }, []);
 
-  // ── Animation loop ────────────────────────────────────────────────
   useEffect(() => {
     let rafId: number;
     let last = performance.now();
@@ -238,7 +232,8 @@ export default function Globe({
       const dt = Math.min((now - last) / 1000, 0.05);
       last = now;
       if (autoRotate && !dragStart.current) {
-        rotRef.current = [rotRef.current[0] - dt * 12, rotRef.current[1]];
+        // Auto-rotate: longitude increases = rotates eastward (natural)
+        rotRef.current = [rotRef.current[0] + dt * 12, rotRef.current[1]];
       }
       draw();
       rafId = requestAnimationFrame(loop);
@@ -248,7 +243,6 @@ export default function Globe({
     return () => cancelAnimationFrame(rafId);
   }, [autoRotate, draw]);
 
-  // ── ResizeObserver ─────────────────────────────────────────────────
   useEffect(() => {
     const container = containerRef.current;
     const canvas    = canvasRef.current;
@@ -268,7 +262,10 @@ export default function Globe({
     return () => ro.disconnect();
   }, []);
 
-  // ── Pointer events — full XY drag ─────────────────────────────────
+  // FIX: Drag direction
+  // drag right (positive dx) → lambda increases → globe rotates right (correct)
+  // drag up   (positive dy) → phi increases    → globe tilts up (correct)
+  // Previous bug: used `rot[0] - dx` which inverted horizontal direction
   useEffect(() => {
     if (!interactive) return;
     const canvas = canvasRef.current;
@@ -282,10 +279,11 @@ export default function Globe({
 
     const onMove = (e: PointerEvent) => {
       if (!dragStart.current) return;
-      const dx =  (e.clientX - dragStart.current.x) * 0.35; // drag right = rotate right
-      const dy = -(e.clientY - dragStart.current.y) * 0.35; // drag up = rotate up
+      // FIX: positive dx → positive lambda delta → rotates right (natural)
+      const dx =  (e.clientX - dragStart.current.x) * 0.35;
+      const dy = -(e.clientY - dragStart.current.y) * 0.35;
       rotRef.current = [
-        dragStart.current.rot[0] - dx, // correct: subtract so drag right = positive λ
+        dragStart.current.rot[0] + dx,  // FIX: + dx (was - dx, inverted)
         Math.max(-80, Math.min(80, dragStart.current.rot[1] + dy)),
       ];
     };

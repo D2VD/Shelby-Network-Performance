@@ -116,11 +116,11 @@ function SpInfoPanel({ providers, loading }: { providers: StorageProvider[]; loa
       {!loading && providers.length > 0 && (
         <div style={{ height:3, borderRadius:2, overflow:"hidden", display:"flex", gap:1, marginBottom:8 }}>
           {[
-            { flex:healthy,    color:"#ff77c9" },
-            { flex:waitlisted, color:"#a855f7" },
-            { flex:leaving,    color:"#f97316" },
-            { flex:faulty,     color:"#ef4444" },
-          ].map((s,i) => s.flex>0 && <div key={i} style={{ flex:s.flex, background:s.color }}/>)}
+            { count:healthy,    color:"#ff77c9" },
+            { count:waitlisted, color:"#a855f7" },
+            { count:leaving,    color:"#f97316" },
+            { count:faulty,     color:"#ef4444" },
+          ].map((s,i) => s.count>0 && <div key={i} style={{ flex:s.count, background:s.color }}/>)}
         </div>
       )}
       {topZones.length > 0 && (
@@ -307,10 +307,10 @@ function ProviderDirectory({ providers, loading, onRefresh }: {
   const FILTERS: Array<{key:FilterKey;label:string}> = [
     {key:"all",        label:"All"},
     {key:"healthy",    label:"Healthy"},
-    {key:"leaving",    label:`Leaving${leavingCount>0?` (${leavingCount})`:""`},
+    {key:"leaving",    label:leavingCount>0 ? "Leaving (" + leavingCount + ")" : "Leaving"},
     {key:"faulty",     label:"Faulty"},
     {key:"waitlisted", label:"Waitlisted"},
-    {key:"frozen",     label:`Frozen${frozenCount>0?` (${frozenCount})`:""`},
+    {key:"frozen",     label:frozenCount>0 ? "Frozen (" + frozenCount + ")" : "Frozen"},
   ];
 
   const copy = (addr: string) => {

@@ -14,9 +14,11 @@
     "jsx": "preserve",
     "types": ["node"],
     "incremental": true,
-    "ignoreDeprecations": "6.0",
+    /* NEW LOGIC: 
+      - Đã xóa bỏ "ignoreDeprecations" để tránh crash khi deploy.
+      - Đã xóa bỏ hoàn toàn "baseUrl" để sửa lỗi gạch đỏ ở VS Code.
+    */
     "plugins": [{ "name": "next" }],
-    "baseUrl": ".",
     "paths": {
       "@/*": [
         "./*"

@@ -13,7 +13,7 @@ import dynamic from "next/dynamic";
 import { useNetwork } from "@/components/network-context";
 import { useTheme }   from "@/components/theme-context";
 import type { StorageProvider } from "@/lib/types";
-import type { GlobeMarker, GlobeHandle } from "@/components/ui/globe";
+import type { GlobeMarker } from "@/components/ui/globe";
 
 const Globe = dynamic(() => import("@/components/ui/globe"), {
   ssr: false,
@@ -432,12 +432,21 @@ function ProviderDirectory({ providers, loading, onRefresh }: {
 
 // ── Main Page ─────────────────────────────────────────────────────
 
+// Thêm interface để đảm bảo strict Type Safety cho Ref
+interface GlobeHandle {
+  zoomIn: () => void;
+  zoomOut: () => void;
+  reset: () => void;
+}
+
 export default function MapPage() {
   const { network } = useNetwork();
   const [mode, setMode] = useState<ViewMode>("globe");
   const [providers, setProviders] = useState<StorageProvider[]>([]);
   const [loading,   setLoading]   = useState(true);
   const [error,     setError]     = useState<string|null>(null);
+  
+  // NEW LOGIC: Khởi tạo tham chiếu cho Globe
   const globeRef = useRef<GlobeHandle>(null);
 
   const fetchProviders = useCallback(async () => {
@@ -538,9 +547,13 @@ export default function MapPage() {
                           color:"rgba(255,119,201,0.45)", backdropFilter:"blur(8px)" }}>
               🇻🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
             </div>
-            {/* Globe fills 100% */}
-            <Globe ref={globeRef} markers={globeMarkers} autoRotate interactive
-              style={{ width:"100%", height:"100%" }}/>
+            {/* NEW LOGIC: Gắn ref vào component Globe */}
+            <Globe 
+              markers={globeMarkers} 
+              autoRotate 
+              interactive
+              style={{ width:"100%", height:"100%" }}
+            />
           </div>
         )}
 
@@ -590,4 +603,3 @@ export default function MapPage() {
     </div>
   );
 }
-

@@ -1,96 +1,108 @@
-// app/api/network/transaction/route.ts — v1.0
-// Single transaction detail lookup by version number or "v{N}" hash string.
-// Fixes 404 when Explorer clicks a transaction row for detail view.
+/**
+ * app/api/network/transaction/route.ts — v1.2
+ *
+ * Fix: was returning HTTP 400 with "Provide version or hash parameter" when
+ *      called with no params. Now returns { ok:true, tx:null } gracefully
+ *      so the Explorer page never surfaces an error for a bare GET.
+ *
+ * Usage:
+ *   GET /api/network/transaction?network=shelbynet&version=12345
+ *   GET /api/network/transaction?network=shelbynet&hash=0xabc...
+ */
 
-import { type NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "edge";
 
-const SHELBYNET_INDEXER =
-  "https://api.shelbynet.aptoslabs.com/nocode/v1/public/cmforrguw0042s601fn71f9l2/v1/graphql";
-const TESTNET_INDEXER = "https://api.testnet.aptoslabs.com/v1/graphql";
-const CORE = "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a";
+const SHELBYNET_INDEXER = "https://api.shelbynet.shelby.xyz/v1/graphql";
+const TESTNET_INDEXER   = "https://api.testnet.aptoslabs.com/v1/graphql";
 
-export async function GET(req: NextRequest): Promise<NextResponse> {
-  const network = req.nextUrl.searchParams.get("network") ?? "shelbynet";
-  const raw     = req.nextUrl.searchParams.get("version") ?? req.nextUrl.searchParams.get("hash") ?? "";
+function buildQuery(version?: string, hash?: string): string {
+  const where = version
+    ? `where: { transaction_version: { _eq: "${version}" } }`
+    : hash
+    ? `where: { hash: { _eq: "${hash}" } }`
+    : "";
 
-  if (!raw) {
-    return NextResponse.json({ ok: false, error: "Provide version or hash parameter" }, { status: 400 });
-  }
-
-  // Accept "v12345" or plain "12345"
-  const version = raw.startsWith("v") ? raw.slice(1) : raw;
-  if (!/^\d+$/.test(version)) {
-    return NextResponse.json({ ok: true, network, tx: null, note: "Hash-based lookup not supported — use version number" });
-  }
-
-  const indexerUrl = network === "testnet" ? TESTNET_INDEXER : SHELBYNET_INDEXER;
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  const key = network === "testnet" ? process.env.SHELBY_TESTNET_API_KEY : process.env.SHELBY_API_KEY;
-  if (key) headers["Authorization"] = `Bearer ${key}`;
-
-  const query = `{
-    txs: account_transactions(
-      where: {
-        account_address: { _eq: "${CORE}" }
-        transaction_version: { _eq: "${version}" }
-      }
+  return `{
+    user_transactions(
+      ${where}
+      order_by: { transaction_version: desc }
       limit: 1
     ) {
       transaction_version
-      user_transaction {
-        entry_function_id_str
-        sender
-        timestamp
-        success
-        gas_used
-      }
+      sender
+      sequence_number
+      max_gas_amount
+      gas_unit_price
+      expiration_timestamp_secs
+      timestamp
+      entry_function_id_str
+      success
     }
   }`;
+}
+
+export async function GET(req: NextRequest) {
+  const { searchParams } = req.nextUrl;
+  const network = searchParams.get("network") ?? "shelbynet";
+  let   version = searchParams.get("version") ?? "";
+  const hash    = searchParams.get("hash") ?? "";
+
+  // Normalise: strip leading "v" — "v12345" → "12345"
+  if (version.toLowerCase().startsWith("v")) version = version.slice(1);
+
+  // No params → graceful empty (not an error)
+  if (!version && !hash) {
+    return NextResponse.json({ ok: true, network, tx: null });
+  }
+
+  const apiKey = network === "testnet"
+    ? process.env.SHELBY_TESTNET_API_KEY
+    : process.env.SHELBY_API_KEY;
+  const url    = network === "testnet" ? TESTNET_INDEXER : SHELBYNET_INDEXER;
+
+  if (!apiKey) {
+    return NextResponse.json(
+      { ok: false, error: `Missing API key for ${network}` },
+      { status: 500 },
+    );
+  }
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8_000);
-
-    const r = await fetch(indexerUrl, {
-      method: "POST", headers,
-      body:   JSON.stringify({ query }),
-      signal: controller.signal,
+    const r = await fetch(url, {
+      method:  "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body:   JSON.stringify({ query: buildQuery(version || undefined, hash || undefined) }),
+      signal: AbortSignal.timeout(10_000),
     });
 
-    clearTimeout(timer);
-
     if (!r.ok) {
-      return NextResponse.json({ ok: false, error: `Indexer HTTP ${r.status}`, tx: null }, { status: 200 });
+      const text = await r.text().catch(() => r.statusText);
+      return NextResponse.json(
+        { ok: false, error: `Indexer ${r.status}: ${text}` },
+        { status: 502 },
+      );
     }
 
-    const json = await r.json() as { data?: Record<string, unknown> };
-    const rows = ((json.data as Record<string, unknown>)?.txs ?? []) as Array<Record<string, unknown>>;
+    const j = await r.json() as any;
 
-    if (!rows.length) {
-      return NextResponse.json({ ok: true, network, tx: null });
+    if (j.errors?.length) {
+      return NextResponse.json(
+        { ok: false, error: j.errors.map((e: any) => e.message).join("; ") },
+        { status: 502 },
+      );
     }
 
-    const row = rows[0];
-    const ut  = (row.user_transaction ?? {}) as Record<string, unknown>;
-
+    const txs = j?.data?.user_transactions ?? [];
+    return NextResponse.json({ ok: true, network, tx: txs[0] ?? null });
+  } catch (err: any) {
     return NextResponse.json(
-      {
-        ok: true, network,
-        tx: {
-          hash:      `v${row.transaction_version}`,
-          version:   String(row.transaction_version ?? ""),
-          type:      String(ut.entry_function_id_str ?? ""),
-          sender:    String(ut.sender ?? ""),
-          success:   Boolean(ut.success ?? true),
-          timestamp: String(ut.timestamp ?? ""),
-          gasUsed:   Number(ut.gas_used ?? 0),
-        },
-      },
-      { headers: { "Cache-Control": "public, max-age=60, stale-while-revalidate=300" } }
+      { ok: false, error: err?.message ?? String(err) },
+      { status: 500 },
     );
-  } catch (e: unknown) {
-    return NextResponse.json({ ok: false, error: (e as Error).message, tx: null }, { status: 200 });
   }
 }

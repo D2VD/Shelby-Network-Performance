@@ -1,43 +1,48 @@
 "use client";
 /**
- * components/globe-engine.tsx — v8.0
+ * components/globe-engine.tsx — v9.0
  *
- * CHANGES vs v7.0:
- *  1. Switch from pointsData → htmlElementsData for square diamond markers
- *  2. Starfield CSS background (dark mode) — no WebGL dependency
- *  3. Combined SP + sovereignty markers in one htmlElementsData array
- *  4. Hover detail panel showing SP address, AZ, health, geo city
- *  5. Arc fan-out preserved from v7 (real blob events → multiple SPs)
+ * Fixes vs v8:
+ *  1. Globe fully visible — wrapper is position:absolute inset:0
+ *  2. Pink continents — polygonsData with TopoJSON (no hex texture)
+ *  3. Starfield — injected via CSS radial-gradients on .globe-engine-wrap
+ *  4. SP marker animation — scale-in overshoot on appear, via CSS keyframes
+ *  5. Sovereignty markers — text label only on globe (no gold squares)
+ *  6. Drag direction — ctrl.rotateSpeed = -0.7 (right drag → globe right)
+ *  7. Arc fan-out preserved, pink arc color #ff77c9
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { StorageProvider } from "@/lib/types";
-import { ZONE_META } from "@/lib/types";
 
 interface GlobeEngineProps {
-  providers:        StorageProvider[];
-  network:          "shelbynet" | "testnet";
-  accentColor:      string;
+  providers: StorageProvider[];
+  network: "shelbynet" | "testnet";
+  accentColor: string;
   onProviderClick?: (provider: StorageProvider) => void;
 }
 
 interface BlobEventArc {
-  id: string; startLat: number; startLng: number; endLat: number; endLng: number;
-  color: string[]; stroke: number; arcAlt: number; dashAnimTime: number; isReal: boolean;
+  id: string;
+  startLat: number; startLng: number;
+  endLat: number;   endLng: number;
+  color: string[];
+  stroke: number;
+  arcAlt: number;
+  dashAnimTime: number;
 }
 
-// ── Sovereignty markers ────────────────────────────────────────────────────────
-const SOVEREIGNTY = [
-  { lat: 16.5,  lng: 112.0,  label: "Hoàng Sa (VN)", flag: "🇻🇳" },
-  { lat: 10.0,  lng: 114.17, label: "Trường Sa (VN)", flag: "🇻🇳" },
+const SOVEREIGNTY_LABELS = [
+  { lat: 16.5,  lng: 112.0,  text: "🇻🇳 Hoàng Sa (VN)" },
+  { lat: 10.0,  lng: 114.17, text: "🇻🇳 Trường Sa (VN)" },
 ];
 
 const ZONE_ANCHORS: Record<string, { lat: number; lng: number }> = {
-  dc_asia:      { lat:   1.35, lng: 103.82 },
+  dc_asia:      { lat:  1.35, lng: 103.82 },
   dc_australia: { lat: -33.87, lng: 151.21 },
-  dc_europe:    { lat:  50.11, lng:   8.68 },
-  dc_us_east:   { lat:  39.04, lng: -77.44 },
-  dc_us_west:   { lat:  37.34, lng:-121.89 },
+  dc_europe:    { lat: 50.11, lng:   8.68 },
+  dc_us_east:   { lat: 39.04, lng: -77.44 },
+  dc_us_west:   { lat: 37.34, lng:-121.89 },
 };
 
 const FALLBACK_ORIGINS = [
@@ -51,26 +56,17 @@ const FALLBACK_ORIGINS = [
   { lat:  1.35,  lng: 103.82 },
 ];
 
-const CORE_SHELBYNET = "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a";
-const INDEXER_URL    = "https://api.shelbynet.shelby.xyz/v1/graphql";
+const CORE_CONTRACT =
+  "0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a";
 
-async function fetchRecentBlobEvents(): Promise<Array<{ owner: string; ts: string }>> {
+async function fetchRecentBlobEvents() {
   try {
-    const r = await fetch(INDEXER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: `{
-        account_transactions(
-          where: { account_address: { _eq: "${CORE_SHELBYNET}" } }
-          order_by: { transaction_version: desc }
-          limit: 20
-        ) { account_address transaction_version }
-      }` }),
+    const r = await fetch("/api/network/transactions?network=shelbynet&cursor=0", {
       signal: AbortSignal.timeout(6_000),
     });
     if (!r.ok) return [];
     const j = await r.json() as any;
-    return (j?.data?.account_transactions ?? []).map((t: any) => ({ owner: t.account_address, ts: String(t.transaction_version) }));
+    return (j?.txs ?? []).slice(0, 20) as Array<{ sender: string; version: string }>;
   } catch { return []; }
 }
 
@@ -95,16 +91,18 @@ function clusterProviders(providers: StorageProvider[]) {
     byZone.get(z)!.push(p);
   });
   const result: Array<StorageProvider & { clLat: number; clLng: number }> = [];
-  byZone.forEach((zProviders, zone) => {
+  byZone.forEach((list, zone) => {
     const anchor = ZONE_ANCHORS[zone];
-    zProviders.forEach((p, idx) => {
+    list.forEach((p, idx) => {
       let lat = p.geo?.lat ?? anchor?.lat ?? 0;
       let lng = p.geo?.lng ?? anchor?.lng ?? 0;
-      const sameCoord = zProviders.filter(
-        o => Math.abs((o.geo?.lat ?? 0) - lat) < 0.01 && Math.abs((o.geo?.lng ?? 0) - lng) < 0.01
+      const dupes = list.filter(
+        o =>
+          Math.abs((o.geo?.lat ?? 0) - lat) < 0.01 &&
+          Math.abs((o.geo?.lng ?? 0) - lng) < 0.01
       );
-      if (sameCoord.length > 1 && anchor) {
-        const j = jitter(anchor.lat, anchor.lng, idx, zProviders.length);
+      if (dupes.length > 1 && anchor) {
+        const j = jitter(anchor.lat, anchor.lng, idx, list.length);
         lat = j.lat; lng = j.lng;
       }
       result.push({ ...p, clLat: lat, clLng: lng });
@@ -113,9 +111,11 @@ function clusterProviders(providers: StorageProvider[]) {
   return result;
 }
 
-// ── CDN loader ────────────────────────────────────────────────────────────────
-const GLOBE_CDN = "https://cdn.jsdelivr.net/npm/globe.gl@2.34.2/dist/globe.gl.min.js";
-let _loaded = false, _loading = false;
+// ── CDN loader ─────────────────────────────────────────────────────────────
+const GLOBE_CDN =
+  "https://cdn.jsdelivr.net/npm/globe.gl@2.34.2/dist/globe.gl.min.js";
+let _loaded = false;
+let _loading = false;
 const _cbs: Array<() => void> = [];
 function loadGlobe(): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -126,221 +126,221 @@ function loadGlobe(): Promise<void> {
     const s = document.createElement("script");
     s.src = GLOBE_CDN; s.async = true;
     s.onload  = () => { _loaded = true; _cbs.forEach(cb => cb()); _cbs.length = 0; };
-    s.onerror = () => reject(new Error("CDN load failed"));
+    s.onerror = () => reject(new Error("globe.gl CDN load failed"));
     document.head.appendChild(s);
   });
 }
 
-// ── Build hex dot texture ─────────────────────────────────────────────────────
-function buildHexDotTexture(): string {
-  const W = 2048, H = 1024;
-  const canvas = document.createElement("canvas");
-  canvas.width = W; canvas.height = H;
-  const ctx = canvas.getContext("2d")!;
-  ctx.fillStyle = "#0c1a2e";
-  ctx.fillRect(0, 0, W, H);
-  const hexR = 9, spacing = hexR * 3.2, rowH = spacing * Math.sqrt(3) / 2, dotR = hexR * 0.55;
-  let row = 0;
-  for (let y = 0; y < H + rowH; y += rowH) {
-    const xOffset = (row % 2) * (spacing / 2);
-    for (let x = xOffset; x < W + spacing; x += spacing) {
-      ctx.beginPath();
-      for (let i = 0; i < 6; i++) {
-        const angle = (Math.PI / 3) * i;
-        const px = x + dotR * Math.cos(angle), py = y + dotR * Math.sin(angle);
-        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-      }
-      ctx.closePath();
-      ctx.fillStyle = "#2060c0";
-      ctx.fill();
-    }
-    row++;
-  }
-  return canvas.toDataURL("image/png");
+// ── World TopoJSON countries (cached) ──────────────────────────────────────
+let _worldFeatures: any[] | null = null;
+async function loadWorldCountries(): Promise<any[]> {
+  if (_worldFeatures) return _worldFeatures;
+  try {
+    const topo = await fetch(
+      "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json"
+    ).then(r => r.json()) as any;
+    // topojson-client is bundled with globe.gl; access via window
+    const topojson = (window as any).topojson;
+    const geo = topojson
+      ? topojson.feature(topo, topo.objects.countries).features
+      : [];
+    _worldFeatures = geo;
+    return geo;
+  } catch { return []; }
 }
 
-// ── Starfield CSS (dark mode background) ─────────────────────────────────────
-function injectStarfieldStyles(containerId: string) {
-  const id = "globe-engine-stars";
-  if (document.getElementById(id)) return;
-  const style = document.createElement("style");
-  style.id = id;
-  style.textContent = `
-    #${containerId} { position: relative; overflow: hidden; }
-    #${containerId}::before {
-      content: '';
-      position: absolute; inset: 0; z-index: 0; pointer-events: none;
-      background-image:
-        radial-gradient(1px 1px at 10% 15%, rgba(255,255,255,0.55) 0%, transparent 100%),
-        radial-gradient(1px 1px at 25% 40%, rgba(255,255,255,0.45) 0%, transparent 100%),
-        radial-gradient(1.5px 1.5px at 40% 20%, rgba(255,255,255,0.6)  0%, transparent 100%),
-        radial-gradient(1px 1px at 55% 60%, rgba(255,255,255,0.4)  0%, transparent 100%),
-        radial-gradient(1px 1px at 70% 30%, rgba(255,255,255,0.5)  0%, transparent 100%),
-        radial-gradient(1.5px 1.5px at 80% 75%, rgba(255,255,255,0.55) 0%, transparent 100%),
-        radial-gradient(1px 1px at 90% 10%, rgba(255,255,255,0.4)  0%, transparent 100%),
-        radial-gradient(1px 1px at 15% 80%, rgba(255,255,255,0.45) 0%, transparent 100%),
-        radial-gradient(1px 1px at 60% 90%, rgba(255,255,255,0.35) 0%, transparent 100%),
-        radial-gradient(1px 1px at 35% 65%, rgba(255,255,255,0.5)  0%, transparent 100%);
-    }
-  `;
-  document.head.appendChild(style);
+// ── Inject CSS once ────────────────────────────────────────────────────────
+const STYLE_ID = "globe-engine-v9";
+function injectStyles() {
+  if (document.getElementById(STYLE_ID)) return;
+  const s = document.createElement("style");
+  s.id = STYLE_ID;
+  s.textContent = `
+.globe-engine-wrap {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(1px 1px at  7% 11%, rgba(255,255,255,.70) 0%, transparent 100%),
+    radial-gradient(1px 1px at 14% 48%, rgba(255,255,255,.50) 0%, transparent 100%),
+    radial-gradient(2px 2px at 23% 19%, rgba(255,255,255,.65) 0%, transparent 100%),
+    radial-gradient(1px 1px at 31% 72%, rgba(255,255,255,.45) 0%, transparent 100%),
+    radial-gradient(1px 1px at 42% 36%, rgba(255,255,255,.55) 0%, transparent 100%),
+    radial-gradient(2px 2px at 55% 82%, rgba(255,255,255,.60) 0%, transparent 100%),
+    radial-gradient(1px 1px at 63% 27%, rgba(255,255,255,.48) 0%, transparent 100%),
+    radial-gradient(1px 1px at 71% 61%, rgba(255,255,255,.52) 0%, transparent 100%),
+    radial-gradient(2px 2px at 78% 14%, rgba(255,255,255,.65) 0%, transparent 100%),
+    radial-gradient(1px 1px at 85% 79%, rgba(255,255,255,.45) 0%, transparent 100%),
+    radial-gradient(1px 1px at 91% 43%, rgba(255,255,255,.55) 0%, transparent 100%),
+    radial-gradient(1px 1px at 96% 91%, rgba(255,255,255,.40) 0%, transparent 100%),
+    radial-gradient(1px 1px at  4% 87%, rgba(255,255,255,.48) 0%, transparent 100%),
+    radial-gradient(1px 1px at 48% 95%, rgba(255,255,255,.42) 0%, transparent 100%),
+    radial-gradient(1px 1px at 17% 33%, rgba(255,255,255,.38) 0%, transparent 100%),
+    radial-gradient(1px 1px at 37% 58%, rgba(255,255,255,.35) 0%, transparent 100%),
+    radial-gradient(1px 1px at 66% 47%, rgba(255,255,255,.38) 0%, transparent 100%),
+    radial-gradient(1px 1px at 83% 23%, rgba(255,255,255,.40) 0%, transparent 100%),
+    #070e1a;
+}
+@keyframes markerScaleIn {
+  0%   { transform: scale(0);    opacity: 0; }
+  60%  { transform: scale(1.35); opacity: 1; }
+  100% { transform: scale(1);    opacity: 1; }
+}
+.globe-sp-marker {
+  animation: markerScaleIn 0.38s cubic-bezier(0.34,1.56,0.64,1) forwards;
+  cursor: pointer;
+  will-change: transform, opacity;
+}
+.globe-sp-marker:hover .sp-diamond {
+  transform: rotate(45deg) scale(1.5) !important;
+  filter: brightness(1.4);
+}
+@keyframes sovFadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.globe-sov-label {
+  animation: sovFadeIn 0.5s ease forwards;
+  pointer-events: none;
+}
+`;
+  document.head.appendChild(s);
 }
 
-// ── Hover detail panel data ───────────────────────────────────────────────────
-interface HoveredSP {
-  addressShort: string;
-  az:           string;
-  health:       string;
-  city:         string;
-  country:      string;
-}
+// ── Component ──────────────────────────────────────────────────────────────
+export default function GlobeEngine({
+  providers, network, accentColor, onProviderClick,
+}: GlobeEngineProps) {
+  const mountRef  = useRef<HTMLDivElement>(null);
+  const globeRef  = useRef<any>(null);
 
-// ── Component ─────────────────────────────────────────────────────────────────
-export default function GlobeEngine({ providers, network, accentColor, onProviderClick }: GlobeEngineProps) {
-  const mountRef    = useRef<HTMLDivElement>(null);
-  const globeRef    = useRef<any>(null);
-  const containerId = useRef(`globe-engine-${Math.random().toString(36).slice(2, 7)}`);
+  const [status,    setStatus]    = useState<"loading" | "ready" | "error">("loading");
+  const [errMsg,    setErrMsg]    = useState("");
+  const [arcs,      setArcs]      = useState<BlobEventArc[]>([]);
+  const [liveCount, setLiveCount] = useState(0);
+  const [hovered,   setHovered]   = useState<{
+    addr: string; az: string; health: string; city: string;
+  } | null>(null);
 
-  const [status,         setStatus]         = useState<"loading" | "ready" | "error">("loading");
-  const [errorMsg,       setErrorMsg]        = useState("");
-  const [eventArcs,      setEventArcs]       = useState<BlobEventArc[]>([]);
-  const [lastEventCount, setLastEventCount]  = useState(0);
-  const [hoveredSP,      setHoveredSP]       = useState<HoveredSP | null>(null);
-
-  // ── Arc builder ─────────────────────────────────────────────────────────────
-  const buildRealArcs = useCallback(async (clustered: ReturnType<typeof clusterProviders>) => {
-    if (clustered.length === 0) return;
-    const events = await fetchRecentBlobEvents();
+  // Arc builder
+  const buildArcs = useCallback(async (clustered: ReturnType<typeof clusterProviders>) => {
+    if (!clustered.length) return;
+    const events  = await fetchRecentBlobEvents();
     const healthy = clustered.filter(p => p.health === "Healthy");
-    if (healthy.length === 0) return;
+    if (!healthy.length) return;
 
-    let arcs: BlobEventArc[];
+    let built: BlobEventArc[];
     if (events.length > 0) {
-      arcs = events.slice(0, 12).flatMap((ev, evIdx) => {
-        const origin      = ownerToLatLng(ev.owner);
-        const targetCount = Math.min(3, healthy.length);
-        return Array.from({ length: targetCount }, (_, fanIdx) => {
-          const spIdx  = (evIdx * 7 + fanIdx * 3) % healthy.length;
-          const sp     = healthy[spIdx];
-          const isData = fanIdx < 2;
+      built = events.slice(0, 12).flatMap((ev: any, ei: number) => {
+        const origin = ownerToLatLng(ev.sender ?? "");
+        return [0, 1, 2].map(fi => {
+          const sp = healthy[(ei * 7 + fi * 3) % healthy.length];
           return {
-            id:           `${ev.ts}_${fanIdx}`,
+            id:           `${ev.version}_${fi}`,
             startLat:     origin.lat, startLng: origin.lng,
-            endLat:       sp.clLat,  endLng:   sp.clLng,
-            color:        isData ? ["#2563eb88","#2563ebcc"] : ["#93c5fd44","#93c5fd77"],
-            stroke:       isData ? 0.5 : 0.25,
-            arcAlt:       0.15 + (evIdx % 5) * 0.05 + fanIdx * 0.02,
-            dashAnimTime: 1500 + evIdx * 80 + fanIdx * 40,
-            isReal:       true,
+            endLat:       sp.clLat,   endLng:   sp.clLng,
+            color:        fi < 2 ? ["#ff77c977","#ff77c9cc"] : ["#ffb3e044","#ffb3e077"],
+            stroke:       fi < 2 ? 0.5 : 0.25,
+            arcAlt:       0.15 + (ei % 5) * 0.05 + fi * 0.02,
+            dashAnimTime: 1500 + ei * 80 + fi * 40,
           };
         });
       });
-      setLastEventCount(events.length);
+      setLiveCount(events.length);
     } else {
-      arcs = FALLBACK_ORIGINS.slice(0, 4).flatMap((origin, oi) =>
-        healthy.slice(0, Math.min(healthy.length, 16)).map((sp, si) => ({
-          id:           `sim_${oi}_${si}`,
-          startLat:     origin.lat, startLng: origin.lng,
-          endLat:       sp.clLat,  endLng:   sp.clLng,
-          color:        si < 10 ? ["#2563eb55","#2563ebaa"] : ["#93c5fd22","#93c5fd66"],
-          stroke:       si < 10 ? 0.4 : 0.2,
-          arcAlt:       0.14 + (si % 5) * 0.04,
+      built = FALLBACK_ORIGINS.slice(0, 4).flatMap((o, oi) =>
+        healthy.slice(0, 16).map((sp, si) => ({
+          id: `sim_${oi}_${si}`,
+          startLat: o.lat, startLng: o.lng,
+          endLat: sp.clLat, endLng: sp.clLng,
+          color:  si < 10 ? ["#ff77c955","#ff77c9aa"] : ["#ffb3e022","#ffb3e066"],
+          stroke: si < 10 ? 0.4 : 0.2,
+          arcAlt: 0.14 + (si % 5) * 0.04,
           dashAnimTime: 1800 + oi * 150,
-          isReal:       false,
         }))
       );
     }
-    setEventArcs(arcs);
+    setArcs(built);
   }, []);
 
   useEffect(() => {
-    const clustered = clusterProviders(providers);
-    buildRealArcs(clustered);
-    const id = setInterval(() => buildRealArcs(clusterProviders(providers)), 10_000);
+    const cl = clusterProviders(providers);
+    buildArcs(cl);
+    const id = setInterval(() => buildArcs(clusterProviders(providers)), 10_000);
     return () => clearInterval(id);
-  }, [providers, buildRealArcs]);
+  }, [providers, buildArcs]);
 
-  // ── Build HTML element for each SP (square diamond marker) ────────────────
-  const buildHtmlElements = useCallback(() => {
-    const clustered = clusterProviders(providers);
-
-    // SP markers
-    const spMarkers = clustered.filter(p => p.clLat !== 0 || p.clLng !== 0).map(p => ({
-      lat:      p.clLat,
-      lng:      p.clLng,
-      type:     "sp" as const,
-      provider: p,
+  // Build HTML element data array
+  const buildHtmlData = useCallback(() => {
+    const cl = clusterProviders(providers);
+    const spItems = cl
+      .filter(p => p.clLat !== 0 || p.clLng !== 0)
+      .map(p => ({ lat: p.clLat, lng: p.clLng, type: "sp", provider: p }));
+    const sovItems = SOVEREIGNTY_LABELS.map(s => ({
+      lat: s.lat, lng: s.lng, type: "sovereignty", text: s.text, provider: null,
     }));
-
-    // Sovereignty markers
-    const sovMarkers = SOVEREIGNTY.map(s => ({
-      lat:      s.lat,
-      lng:      s.lng,
-      type:     "sovereignty" as const,
-      label:    s.label,
-      flag:     s.flag,
-      provider: null,
-    }));
-
-    return [...spMarkers, ...sovMarkers];
+    return [...spItems, ...sovItems];
   }, [providers]);
 
-  const makeHtmlEl = useCallback((d: any): HTMLElement => {
+  // Create HTML element for each datum
+  const makeEl = useCallback((d: any): HTMLElement => {
     const el = document.createElement("div");
-    el.style.cssText = "pointer-events: auto; cursor: pointer; position: relative;";
 
     if (d.type === "sovereignty") {
+      // Text-only: no square marker on globe
+      el.className = "globe-sov-label";
       el.innerHTML = `
-        <div style="display:flex;align-items:center;gap:4px;white-space:nowrap;pointer-events:none">
-          <div style="width:8px;height:8px;background:#fbbf24;transform:rotate(45deg);box-shadow:0 0 8px #fbbf24;flex-shrink:0"></div>
-          <span style="font-size:9px;font-family:monospace;color:#fde68a;font-weight:700;text-shadow:0 0 10px rgba(0,0,0,0.9)">${d.flag} ${d.label}</span>
-        </div>`;
+        <span style="
+          font-size:9px;font-family:monospace;font-weight:700;letter-spacing:0.03em;
+          color:#fde68a;
+          text-shadow:0 0 8px rgba(0,0,0,0.95),0 0 3px rgba(0,0,0,0.9);
+          background:rgba(0,0,0,0.5);
+          padding:2px 6px;border-radius:4px;
+          border:1px solid rgba(251,191,36,0.4);
+          white-space:nowrap;
+        ">${d.text}</span>
+      `;
       return el;
     }
 
     const p     = d.provider as StorageProvider & { clLat: number; clLng: number };
-    const color = p.health === "Healthy" ? "#38bdf8" : p.state === "Frozen" ? "#60a5fa" : "#ef4444";
+    const color =
+      p.health === "Healthy"       ? "#ff77c9"
+      : p.state  === "Waitlisted"  ? "#f59e0b"
+      : p.state  === "Frozen"      ? "#60a5fa"
+      : "#ef4444";
     const size  = p.health === "Healthy" ? 10 : 7;
-    const city  = p.geo?.city ?? "";
-    const cc    = p.geo?.countryCode ?? "";
 
+    el.className = "globe-sp-marker";
     el.innerHTML = `
-      <div style="
+      <div class="sp-diamond" style="
         width:${size}px;height:${size}px;
         background:${color};
         transform:rotate(45deg);
-        box-shadow:0 0 ${p.health==="Healthy"?8:4}px ${color}aa;
-        border:1px solid rgba(255,255,255,0.3);
-        transition:transform 0.15s,box-shadow 0.15s;
-      "></div>`;
+        box-shadow:0 0 ${size + 2}px ${color}99;
+        border:1px solid rgba(255,255,255,0.25);
+        transition:transform 0.15s ease,box-shadow 0.15s ease,filter 0.15s ease;
+      "></div>
+    `;
 
-    el.addEventListener("mouseenter", () => {
-      (el.firstElementChild as HTMLElement).style.transform = "rotate(45deg) scale(1.5)";
-      (el.firstElementChild as HTMLElement).style.boxShadow = `0 0 14px ${color}cc`;
-      setHoveredSP({
-        addressShort: p.addressShort,
-        az:           p.availabilityZone,
-        health:       p.health,
-        city:         city,
-        country:      cc,
-      });
-    });
-    el.addEventListener("mouseleave", () => {
-      (el.firstElementChild as HTMLElement).style.transform = "rotate(45deg)";
-      (el.firstElementChild as HTMLElement).style.boxShadow = `0 0 ${p.health==="Healthy"?8:4}px ${color}aa`;
-      setHoveredSP(null);
-    });
-    el.addEventListener("click", () => {
-      if (onProviderClick) onProviderClick(p);
-    });
-
+    el.addEventListener("mouseenter", () =>
+      setHovered({
+        addr:   p.addressShort ?? (p.address?.slice(0, 8) + "…" + p.address?.slice(-6)),
+        az:     p.availabilityZone ?? "",
+        health: p.health as string,
+        city:   p.geo?.city ? `${p.geo.city}${p.geo.countryCode ? ", " + p.geo.countryCode : ""}` : "",
+      })
+    );
+    el.addEventListener("mouseleave", () => setHovered(null));
+    el.addEventListener("click",      () => onProviderClick?.(p));
     return el;
   }, [providers, onProviderClick]);
 
-  // ── Globe init ───────────────────────────────────────────────────────────────
+  // Globe initialisation
   useEffect(() => {
     if (!mountRef.current) return;
     let active = true;
+    injectStyles();
 
     (async () => {
       try {
@@ -348,163 +348,227 @@ export default function GlobeEngine({ providers, network, accentColor, onProvide
         if (!active || !mountRef.current) return;
 
         const GlobeGL = (window as any).Globe;
-        if (typeof GlobeGL !== "function") throw new Error("Globe not found after CDN load");
+        if (typeof GlobeGL !== "function") throw new Error("Globe not on window");
 
         const el = mountRef.current;
-        el.id = containerId.current;
-        injectStarfieldStyles(containerId.current);
 
-        const hexTexture = buildHexDotTexture();
+        // Load country polygons for pink land
+        const countries = await loadWorldCountries();
 
         const globe = GlobeGL({ waitForGlobeReady: true, animateIn: true })(el)
-          .width(el.clientWidth  || 700)
-          .height(el.clientHeight || 500)
+          .width(el.clientWidth   || 800)
+          .height(el.clientHeight || 600)
           .backgroundColor("rgba(0,0,0,0)")
-          .globeImageUrl(hexTexture)
+          // ── Pink land polygons ──────────────────────────────────
+          .polygonsData(countries)
+          .polygonCapColor(() => "rgba(255, 100, 180, 0.78)")
+          .polygonSideColor(() => "rgba(220, 60, 150, 0.18)")
+          .polygonStrokeColor(() => "rgba(255, 140, 210, 0.45)")
+          .polygonAltitude(0.005)
+          // ── Atmosphere (pink glow) ──────────────────────────────
           .showAtmosphere(true)
-          .atmosphereColor("#3b82f6")
+          .atmosphereColor("#ff88cc")
           .atmosphereAltitude(0.18)
-          // ── HTML element markers (SP squares + sovereignty diamonds) ──────
-          .htmlElementsData(buildHtmlElements())
-          .htmlLat("lat")
-          .htmlLng("lng")
-          .htmlAltitude(0.015)
-          .htmlElement((d: any) => makeHtmlEl(d))
-          // ── Arcs ──────────────────────────────────────────────────────────
-          .arcsData(eventArcs)
+          // ── HTML elements (SP markers + sovereignty labels) ─────
+          .htmlElementsData(buildHtmlData())
+          .htmlLat("lat").htmlLng("lng").htmlAltitude(0.015)
+          .htmlElement((d: any) => makeEl(d))
+          // ── Arcs ────────────────────────────────────────────────
+          .arcsData(arcs)
           .arcStartLat("startLat").arcStartLng("startLng")
           .arcEndLat("endLat").arcEndLng("endLng")
-          .arcColor("color")
-          .arcStroke("stroke")
-          .arcAltitude("arcAlt")
-          .arcDashLength(0.28)
-          .arcDashGap(0.1)
+          .arcColor("color").arcStroke("stroke").arcAltitude("arcAlt")
+          .arcDashLength(0.28).arcDashGap(0.1)
           .arcDashAnimateTime("dashAnimTime")
-          .pointOfView({ lat: 20, lng: 30, altitude: 1.9 }, 1200);
+          .pointOfView({ lat: 20, lng: 10, altitude: 1.85 }, 1200);
 
-        globe.onGlobeReady(() => {
-          if (!active) return;
-          setStatus("ready");
-        });
-        setTimeout(() => { if (active) setStatus(s => s === "loading" ? "ready" : s); }, 7000);
+        globe.onGlobeReady(() => { if (active) setStatus("ready"); });
+        setTimeout(() => { if (active) setStatus(s => s === "loading" ? "ready" : s); }, 8_000);
 
+        // Controls
         const ctrl = globe.controls();
         ctrl.autoRotate      = true;
-        ctrl.autoRotateSpeed = 0.28;
+        ctrl.autoRotateSpeed = 0.25;
         ctrl.enableDamping   = true;
         ctrl.dampingFactor   = 0.08;
+        // DRAG FIX: negative rotateSpeed → drag-right rotates globe right
+        ctrl.rotateSpeed     = -0.7;
 
         globeRef.current = globe;
 
         const ro = new ResizeObserver(entries => {
-          for (const e of entries) globe.width(e.contentRect.width).height(e.contentRect.height);
+          for (const e of entries)
+            globe.width(e.contentRect.width).height(e.contentRect.height);
         });
         ro.observe(el);
-      } catch (err: any) {
-        if (active) { setErrorMsg(err?.message ?? String(err)); setStatus("error"); }
+      } catch (e: any) {
+        if (active) { setErrMsg(String(e?.message ?? e)); setStatus("error"); }
       }
     })();
 
     return () => { active = false; };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Refresh HTML elements when providers change ────────────────────────────
+  // Refresh HTML elements when providers change
   useEffect(() => {
-    const g = globeRef.current;
-    if (!g) return;
-    g.htmlElementsData(buildHtmlElements());
-    g.htmlElement((d: any) => makeHtmlEl(d));
-  }, [providers, buildHtmlElements, makeHtmlEl]);
+    if (!globeRef.current) return;
+    globeRef.current
+      .htmlElementsData(buildHtmlData())
+      .htmlElement((d: any) => makeEl(d));
+  }, [providers, buildHtmlData, makeEl]);
 
-  // ── Refresh arcs ────────────────────────────────────────────────────────────
+  // Refresh arcs
   useEffect(() => {
-    const g = globeRef.current;
-    if (!g) return;
-    g.arcsData(eventArcs);
-  }, [eventArcs]);
+    globeRef.current?.arcsData(arcs);
+  }, [arcs]);
 
   return (
-    <div style={{ position: "relative", width: "100%", height: "100%", background: "#070e1a", overflow: "hidden" }}>
-      <div ref={mountRef} style={{ width: "100%", height: "100%", opacity: status === "ready" ? 1 : 0, transition: "opacity 0.8s" }} />
+    // position:absolute inset:0 ensures the globe always fills its parent fully
+    <div className="globe-engine-wrap">
+      {/* Globe mount */}
+      <div
+        ref={mountRef}
+        style={{
+          width: "100%", height: "100%",
+          opacity: status === "ready" ? 1 : 0,
+          transition: "opacity 1s ease",
+        }}
+      />
 
-      {/* Loading */}
+      {/* Loading spinner */}
       {status === "loading" && (
-        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, background: "#070e1a", color: "#38bdf8", fontFamily: "monospace", fontSize: 13 }}>
-          <style>{`@keyframes _gs2{to{transform:rotate(360deg)}}`}</style>
-          <svg width="36" height="36" viewBox="0 0 36 36" fill="none">
-            <circle cx="18" cy="18" r="14" stroke="#1e3a6e" strokeWidth="2"/>
-            <circle cx="18" cy="18" r="14" stroke="#38bdf8" strokeWidth="2" strokeDasharray="22 66" strokeLinecap="round"
-              style={{ transformOrigin:"18px 18px", animation:"_gs2 1.2s linear infinite" }}/>
+        <div style={{
+          position: "absolute", inset: 0,
+          display: "flex", flexDirection: "column",
+          alignItems: "center", justifyContent: "center",
+          gap: 14, color: "#ff77c9",
+          fontFamily: "monospace", fontSize: 13,
+        }}>
+          <style>{`@keyframes _gs{to{transform:rotate(360deg)}}`}</style>
+          <svg width="38" height="38" viewBox="0 0 38 38" fill="none">
+            <circle cx="19" cy="19" r="15" stroke="#2e1a2e" strokeWidth="2"/>
+            <circle cx="19" cy="19" r="15" stroke="#ff77c9" strokeWidth="2"
+              strokeDasharray="24 70" strokeLinecap="round"
+              style={{ transformOrigin:"19px 19px", animation:"_gs 1.1s linear infinite" }}/>
           </svg>
           Loading globe…
         </div>
       )}
 
-      {/* Error */}
+      {/* Error state */}
       {status === "error" && (
-        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, background: "#070e1a", color: "#64748b", fontSize: 12, textAlign: "center", padding: "0 24px" }}>
-          <span style={{ fontSize: 22 }}>⚠</span>
-          <span style={{ color: "#94a3b8" }}>Globe failed to load</span>
-          <span style={{ fontSize: 10, color: "#475569", maxWidth: 300 }}>{errorMsg}</span>
-          <button onClick={() => window.location.reload()} style={{ marginTop: 8, padding: "5px 14px", borderRadius: 7, border: "1px solid #1e3a6e", background: "#0c1a2e", color: "#38bdf8", cursor: "pointer", fontSize: 11 }}>Retry</button>
-        </div>
-      )}
-
-      {/* SP hover detail panel */}
-      {status === "ready" && hoveredSP && (
         <div style={{
-          position: "absolute", bottom: 48, left: 12, zIndex: 30,
-          background: "rgba(7,14,26,0.95)", border: "1px solid #1e3a6e",
-          borderRadius: 10, padding: "10px 14px", fontFamily: "monospace", fontSize: 11,
-          color: "#e2e8f0", backdropFilter: "blur(8px)", pointerEvents: "none",
-          boxShadow: "0 4px 12px rgba(0,0,0,0.5)",
+          position: "absolute", inset: 0, display: "flex",
+          flexDirection: "column", alignItems: "center", justifyContent: "center",
+          gap: 8, color: "#64748b", fontSize: 12, textAlign: "center", padding: "0 24px",
         }}>
-          <div style={{ color: "#38bdf8", fontWeight: 700, marginBottom: 3 }}>{hoveredSP.addressShort}</div>
-          <div style={{ color: "#94a3b8" }}>{hoveredSP.az}</div>
-          {hoveredSP.city && <div style={{ color: "#64748b" }}>{hoveredSP.city}{hoveredSP.country ? `, ${hoveredSP.country}` : ""}</div>}
-          <div style={{ marginTop: 3, color: hoveredSP.health === "Healthy" ? "#34d399" : "#f87171", fontWeight: 700 }}>
-            {hoveredSP.health}
-          </div>
+          <span style={{ fontSize: 24 }}>⚠</span>
+          <span style={{ color: "#94a3b8" }}>Globe failed to load</span>
+          <span style={{ fontSize: 10, color: "#475569", maxWidth: 300 }}>{errMsg}</span>
+          <button
+            onClick={() => window.location.reload()}
+            style={{
+              marginTop: 8, padding: "5px 14px", borderRadius: 7,
+              border: "1px solid #1e3a6e", background: "#0c1a2e",
+              color: "#ff77c9", cursor: "pointer", fontSize: 11,
+            }}
+          >Retry</button>
         </div>
       )}
 
-      {/* Status badges */}
+      {/* Hover detail panel */}
+      {status === "ready" && hovered && (
+        <div style={{
+          position: "absolute", bottom: 56, left: 12, zIndex: 30,
+          background: "rgba(7,14,26,0.95)",
+          border: "1px solid rgba(255,119,201,0.3)", borderRadius: 10,
+          padding: "9px 13px", fontFamily: "monospace", fontSize: 11,
+          color: "#e2e8f0", backdropFilter: "blur(8px)", pointerEvents: "none",
+          minWidth: 170,
+        }}>
+          <div style={{ color: "#ff77c9", fontWeight: 700, marginBottom: 3 }}>{hovered.addr}</div>
+          <div style={{ color: "#94a3b8" }}>{hovered.az}</div>
+          {hovered.city && <div style={{ color: "#64748b", fontSize: 10 }}>{hovered.city}</div>}
+          <div style={{
+            marginTop: 4, fontWeight: 700,
+            color: hovered.health === "Healthy" ? "#34d399" : "#f87171",
+          }}>{hovered.health}</div>
+        </div>
+      )}
+
+      {/* Node count badge */}
       {status === "ready" && providers.length > 0 && (
-        <div style={{ position: "absolute", top: 12, left: 12, zIndex: 10, display: "flex", gap: 6, flexDirection: "column", alignItems: "flex-start" }}>
-          <div style={{ fontSize: 11, fontFamily: "monospace", background: "rgba(7,14,26,0.9)", border: "1px solid #1e3a6e", borderRadius: 8, padding: "4px 10px", color: "#38bdf8", backdropFilter: "blur(8px)" }}>
+        <div style={{
+          position: "absolute", top: 12, left: 12, zIndex: 10,
+          display: "flex", flexDirection: "column", gap: 4,
+        }}>
+          <div style={{
+            fontSize: 11, fontFamily: "monospace",
+            background: "rgba(7,14,26,0.88)",
+            border: "1px solid rgba(255,119,201,0.25)", borderRadius: 8,
+            padding: "4px 10px", color: "#ff77c9", backdropFilter: "blur(8px)",
+          }}>
             {providers.length} nodes online
           </div>
-          <div style={{ fontSize: 9, fontFamily: "monospace", background: "rgba(7,14,26,0.85)", border: `1px solid ${lastEventCount > 0 ? "#065f46" : "#1e3a6e"}`, borderRadius: 6, padding: "3px 8px", color: lastEventCount > 0 ? "#34d399" : "#475569", backdropFilter: "blur(8px)" }}>
-            {lastEventCount > 0 ? `● ${lastEventCount} real events` : "○ simulated arcs"}
+          <div style={{
+            fontSize: 9, fontFamily: "monospace",
+            background: "rgba(7,14,26,0.8)",
+            border: `1px solid ${liveCount > 0 ? "#065f46" : "rgba(255,119,201,0.12)"}`,
+            borderRadius: 6, padding: "3px 8px",
+            color: liveCount > 0 ? "#34d399" : "#475569",
+          }}>
+            {liveCount > 0 ? `● ${liveCount} live events` : "○ simulated arcs"}
           </div>
         </div>
       )}
-
-      {/* Sovereignty badge */}
-      <div style={{ position: "absolute", top: 12, right: 12, zIndex: 10, fontSize: 9, fontFamily: "monospace", background: "rgba(7,14,26,0.9)", border: "1px solid rgba(251,191,36,0.3)", borderRadius: 8, padding: "4px 10px", color: "#fde68a", backdropFilter: "blur(8px)" }}>
-        🇻🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
-      </div>
 
       {/* Legend */}
       {status === "ready" && (
-        <div style={{ position: "absolute", bottom: 12, left: 12, zIndex: 10, display: "flex", gap: 12, alignItems: "center", fontSize: 9, fontFamily: "monospace", color: "#64748b", background: "rgba(7,14,26,0.8)", border: "1px solid #1e3a6e", borderRadius: 6, padding: "5px 10px", backdropFilter: "blur(8px)" }}>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <span style={{ display: "inline-block", width: 8, height: 8, background: "#38bdf8", transform: "rotate(45deg)" }}/>
-            Healthy SP
-          </span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <span style={{ display: "inline-block", width: 6, height: 6, background: "#ef4444", transform: "rotate(45deg)" }}/>
-            Faulty / Waitlisted
-          </span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <span style={{ display: "inline-block", width: 7, height: 7, background: "#fbbf24", transform: "rotate(45deg)" }}/>
-            Sovereignty
-          </span>
+        <div style={{
+          position: "absolute", bottom: 36, left: 12, zIndex: 10,
+          display: "flex", gap: 10, alignItems: "center",
+          fontSize: 9, fontFamily: "monospace", color: "#64748b",
+          background: "rgba(7,14,26,0.8)",
+          border: "1px solid rgba(255,119,201,0.15)", borderRadius: 6,
+          padding: "4px 10px", backdropFilter: "blur(8px)",
+        }}>
+          {[
+            { color: "#ff77c9", label: "Healthy" },
+            { color: "#f59e0b", label: "Waitlisted" },
+            { color: "#60a5fa", label: "Frozen" },
+            { color: "#ef4444", label: "Faulty" },
+          ].map(({ color, label }) => (
+            <span key={label} style={{ display: "flex", alignItems: "center", gap: 3 }}>
+              <span style={{
+                display: "inline-block", width: 7, height: 7,
+                background: color, transform: "rotate(45deg)",
+              }}/>
+              {label}
+            </span>
+          ))}
         </div>
       )}
-      <div style={{ position: "absolute", bottom: 12, right: 12, zIndex: 10, fontSize: 9, fontFamily: "monospace", color: "#334155", pointerEvents: "none" }}>
-        drag · scroll · hover = detail
+
+      {/* Sovereignty text badge */}
+      <div style={{
+        position: "absolute", bottom: 12, right: 12, zIndex: 10,
+        fontSize: 9, fontFamily: "monospace",
+        background: "rgba(7,14,26,0.85)",
+        border: "1px solid rgba(251,191,36,0.3)", borderRadius: 6,
+        padding: "4px 9px", color: "#fde68a",
+        backdropFilter: "blur(8px)", pointerEvents: "none",
+      }}>
+        🇻🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
+      </div>
+
+      <div style={{
+        position: "absolute", bottom: 14, left: "50%",
+        transform: "translateX(-50%)", zIndex: 10,
+        fontSize: 9, fontFamily: "monospace", color: "#1e293b",
+        pointerEvents: "none",
+      }}>
+        drag · scroll · hover
       </div>
     </div>
   );

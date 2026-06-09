@@ -6,8 +6,8 @@
 // → SSR: không render gì (chỉ client-side)
 
 import dynamic from "next/dynamic";
-import { useState } from "react";
 import type { StorageProvider } from "@/lib/types";
+import { useTheme } from "./theme-context";
 
 export interface ProviderMapProps {
   providers: StorageProvider[];
@@ -24,8 +24,7 @@ const WorldMapInner = dynamic(
       <div style={{
         width: "100%", height: "100%",
         display: "flex", alignItems: "center", justifyContent: "center",
-        background: "var(--bg-primary)",
-        flexDirection: "column", gap: 12,
+        background: "var(--bg-primary)", flexDirection: "column", gap: 12,
       }}>
         <div style={{
           width: 32, height: 32, borderRadius: "50%",

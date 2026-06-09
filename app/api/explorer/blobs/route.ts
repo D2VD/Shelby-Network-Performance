@@ -4,7 +4,7 @@
 // This route replaces any prior client-side fetch that hit the indexer directly.
 
 import { NextRequest, NextResponse } from "next/server";
-
+export const runtime = 'edge';
 const VPS_BASE = (process.env.VPS_API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "").replace(/\/$/, "");
 const INTERNAL_KEY = process.env.INTERNAL_API_KEY ?? "";
 

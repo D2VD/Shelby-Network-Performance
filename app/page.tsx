@@ -204,10 +204,11 @@ export default function LandingPage() {
           const mkrs: GlobeMarker[] = providers
             .filter((p: any) => p.geo?.lat && p.geo?.lng)
             .map((p: any): GlobeMarker => ({
-              location: [p.geo.lat, p.geo.lng],
-              size:     p.health === "Healthy" ? 0.07 : 0.05,
-              color:    p.health === "Healthy" ? "#ff77c9" : p.state === "Waitlisted" ? "#a855f7" : "#ef4444",
-              label:    p.availabilityZone ?? undefined,
+              address: p.address ?? "",
+              lat:     p.geo.lat,
+              lng:     p.geo.lng,
+              health:  p.health ?? "Unknown",
+              az:      p.availabilityZone ?? "",
             }));
           setGlobeMarkers(mkrs);
         }
@@ -391,11 +392,6 @@ export default function LandingPage() {
           <Globe
             markers={globeMarkers}
             autoRotate
-            interactive={false}
-            style={{
-              width: "min(90%, 560px)",
-              height: "min(90%, 560px)",
-            }}
           />
 
           {/* Network labels */}

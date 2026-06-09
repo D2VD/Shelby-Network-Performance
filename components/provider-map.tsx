@@ -1,5 +1,5 @@
 "use client";
-// components/provider-map.tsx — v11.0
+// components/provider-map.tsx — v11.1
 // Strategy: react-simple-maps qua dynamic import + ssr:false
 // → Tránh hoàn toàn crash CF Pages bundle (không có window/document khi build)
 // → Fallback: skeleton loading khi JS chưa load
@@ -11,11 +11,11 @@ import type { StorageProvider } from "@/lib/types";
 
 export interface ProviderMapProps {
   providers: StorageProvider[];
+  isDark?: boolean; // Thêm thuộc tính để đồng bộ với WorldMapInnerProps
   onProviderClick?: (p: StorageProvider) => void;
 }
 
 // Dynamic import với ssr: false — react-simple-maps và d3-geo chỉ chạy client
-// CF Pages edge runtime không có browser APIs → ssr:false đảm bảo không import khi build
 const WorldMapInner = dynamic(
   () => import("./world-map-inner"),
   {
@@ -39,10 +39,16 @@ const WorldMapInner = dynamic(
   }
 );
 
-export function ProviderMap({ providers }: ProviderMapProps) {
+export function ProviderMap({ providers, isDark = false }: ProviderMapProps) {
+  // Edge case: Kiểm tra dữ liệu đầu vào trống hoặc không hợp lệ trước khi xử lý logic chính
+  if (!providers) {
+    return null;
+  }
+
+  // Happy path: Truyền đầy đủ các tham số bắt buộc cho component con
   return (
     <div style={{ width: "100%", height: "100%" }}>
-      <WorldMapInner providers={providers} />
+      <WorldMapInner providers={providers} isDark={isDark} />
     </div>
   );
 }

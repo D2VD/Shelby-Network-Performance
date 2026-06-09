@@ -1,352 +1,424 @@
 "use client";
-// components/ui/globe.tsx — v14.0
-//
-// CHANGES vs v13.0:
-//  1. Square diamond markers (rotated rect) instead of circles
-//  2. Starfield dots rendered in dark mode background layer
-//  3. Hoàng Sa / Trường Sa sovereignty markers (gold diamonds + label)
-//  4. Hover tooltip shows marker label on mouse proximity
-//  5. Full XY drag preserved from v13
+// components/ui/globe.tsx — v8.0
+// Fixes applied in this version:
+//   [1] Full sphere visible — radius = min(W,H) × 0.46, translate to canvas center
+//   [2] CSS starfield — 60 deterministic radial-gradient stars on parent div
+//   [3] Shelby-pink continents — LAND_FILL = "#e91e8c" (was near-transparent)
+//   [4] SP marker pulse animation — scale 0→1 (ease-in), hold, 1→0 (ease-out)
+//   [5] No sovereignty text labels on globe (labels only on flat map)
+//   [6] Drag direction fix — rot[0] + dx·SENS (was rot[0] − dx·SENS)
 
-import { useEffect, useRef, useState, useCallback } from "react";
-import { useTheme }                                  from "@/components/theme-context";
+import React, {
+  useEffect,
+  useRef,
+  useCallback,
+  useState,
+} from "react";
+import { geoOrthographic, geoPath, geoGraticule } from "d3-geo";
+import { feature } from "topojson-client";
+import type { Topology } from "topojson-specification";
+import type { FeatureCollection, Geometry, GeoJsonProperties } from "geojson";
+
+/* ── Visual constants ─────────────────────────────────────────────────────── */
+
+const LAND_FILL      = "#e91e8c";                  // [3] Shelby pink continents
+const LAND_STROKE    = "rgba(255,255,255,0.12)";
+const OCEAN_FILL     = "#06061a";                  // Deep space ocean
+const OUTLINE_GLOW   = "rgba(233,30,140,0.22)";   // Subtle pink halo on sphere edge
+const GRATICULE_CLR  = "rgba(255,255,255,0.04)";
+
+const HEALTH_COLOR: Record<string, string> = {
+  Healthy:    "#22c55e",
+  Faulty:     "#ef4444",
+  Waitlisted: "#a855f7",
+  Leaving:    "#f97316",
+  Unknown:    "#6b7280",
+};
+
+const SENSITIVITY  = 0.45;   // degrees per CSS-pixel drag
+const AUTO_RPM     = 0.06;   // auto-rotation degrees per frame
+const CYCLE_MS     = 2800;   // [4] one full marker appear/disappear cycle (ms)
+const GOLDEN       = 0.618;  // marker phase offset (golden ratio spread)
+
+/* ── [2] Starfield — 60 deterministic stars via radial-gradient ───────────── */
+
+const STARFIELD = Array.from({ length: 60 }, (_, i) => {
+  const x  = ((i * 137.508) % 100).toFixed(2);   // Sunflower distribution
+  const y  = ((i * 91.274 + 17) % 100).toFixed(2);
+  const sz = (0.5 + (i % 3) * 0.35).toFixed(1);
+  const op = (0.25 + (i % 7) * 0.08).toFixed(2);
+  return `radial-gradient(${sz}px ${sz}px at ${x}% ${y}%, rgba(255,255,255,${op}) 0%, transparent 100%)`;
+}).join(",\n");
+
+/* ── Types ────────────────────────────────────────────────────────────────── */
 
 export interface GlobeMarker {
-  location: [number, number]; // [lat, lng]
-  size:     number;
-  label?:   string;
-  color?:   string;
+  address: string;
+  lat: number;
+  lng: number;
+  health: string;
+  az: string;
+  // NOTE: sovereignty markers (Paracel/Spratly) must NOT be passed here.
+  // Globe only receives real SP nodes. Sovereignty labels live in world-map-inner.tsx only.
 }
 
 interface GlobeProps {
-  markers?:     GlobeMarker[];
-  autoRotate?:  boolean;
-  interactive?: boolean;
-  className?:   string;
-  style?:       React.CSSProperties;
-  markerColor?: string;
+  markers?: GlobeMarker[];
+  autoRotate?: boolean;
+  onMarkerClick?: (marker: GlobeMarker) => void;
+  className?: string;
 }
 
-// ── World topology cache ──────────────────────────────────────────────────────
-let _worldCache: unknown = null;
-let _worldFetch: Promise<unknown> | null = null;
+/* ── Helpers ──────────────────────────────────────────────────────────────── */
 
-async function getWorld(): Promise<unknown> {
-  if (_worldCache) return _worldCache;
-  if (_worldFetch) return _worldFetch;
-  _worldFetch = (async () => {
-    try {
-      const res  = await fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json");
-      const topo = await res.json() as Record<string, unknown>;
-      const { feature } = await import("topojson-client" as any);
-      _worldCache = feature(topo, (topo as any).objects.land);
-      return _worldCache;
-    } catch { return null; }
-  })();
-  return _worldFetch;
+/**
+ * Returns true if the geographic point (lng, lat) is on the visible hemisphere
+ * of the orthographic projection at the given rotation [lambda, phi].
+ * Uses the spherical dot-product: center of visible face is at (−λ, −φ).
+ */
+function isVisible(lng: number, lat: number, rot: [number, number]): boolean {
+  const toR = (d: number) => d * (Math.PI / 180);
+  const cLng = -rot[0];
+  const cLat = -rot[1];
+  const dot =
+    Math.sin(toR(lat)) * Math.sin(toR(cLat)) +
+    Math.cos(toR(lat)) * Math.cos(toR(cLat)) * Math.cos(toR(lng - cLng));
+  return dot > 0.01; // small positive threshold avoids limb jitter
 }
 
-// ── d3-geo lazy load ──────────────────────────────────────────────────────────
-let _d3: unknown = null;
-async function getD3(): Promise<unknown> {
-  if (_d3) return _d3;
-  _d3 = await import("d3-geo" as any);
-  return _d3;
+/** Convert 6-char hex color + alpha to rgba string for canvas gradients */
+function hexToRgba(hex: string, alpha: number): string {
+  const h = hex.replace("#", "");
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
 }
 
-// ── Sovereignty markers (always rendered) ────────────────────────────────────
-const SOVEREIGNTY_MARKERS: GlobeMarker[] = [
-  { location: [16.5,  112.0 ], size: 0.06, label: "🇻🇳 Hoàng Sa", color: "#fbbf24" },
-  { location: [10.0,  114.17], size: 0.06, label: "🇻🇳 Trường Sa", color: "#fbbf24" },
-];
-
-// ── Draw square diamond ───────────────────────────────────────────────────────
-function drawDiamond(
-  ctx: CanvasRenderingContext2D,
-  cx: number,
-  cy: number,
-  halfSize: number,
-  fillColor: string,
-  strokeColor: string,
-  strokeWidth = 1.5
-) {
-  ctx.beginPath();
-  ctx.moveTo(cx,               cy - halfSize); // top
-  ctx.lineTo(cx + halfSize,    cy);            // right
-  ctx.lineTo(cx,               cy + halfSize); // bottom
-  ctx.lineTo(cx - halfSize,    cy);            // left
-  ctx.closePath();
-  ctx.fillStyle   = fillColor;
-  ctx.fill();
-  ctx.strokeStyle = strokeColor;
-  ctx.lineWidth   = strokeWidth;
-  ctx.stroke();
+/** Smooth ease-in-out curve (cubic) */
+function easeInOut(t: number): number {
+  return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
 }
 
-// ── Starfield (pre-generate random star positions once) ───────────────────────
-const STAR_COUNT = 180;
-const STARS = Array.from({ length: STAR_COUNT }, () => ({
-  x:    Math.random(),
-  y:    Math.random(),
-  r:    0.4 + Math.random() * 1.0,
-  a:    0.25 + Math.random() * 0.55,
-}));
+/* ── Component ────────────────────────────────────────────────────────────── */
 
 export default function Globe({
-  markers       = [],
-  autoRotate    = true,
-  interactive   = true,
-  className,
-  style,
-  markerColor   = "#ff77c9",
+  markers = [],
+  autoRotate = true,
+  onMarkerClick,
+  className = "",
 }: GlobeProps) {
-  const { isDark }   = useTheme();
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef    = useRef<HTMLCanvasElement>(null);
 
-  const rotRef    = useRef<[number, number]>([0, -10]);
-  const dragStart = useRef<{ x: number; y: number; rot: [number, number] } | null>(null);
-  const assetsRef = useRef<{ d3: unknown; world: unknown } | null>(null);
+  // World topology (loaded once)
+  const worldRef = useRef<FeatureCollection<Geometry, GeoJsonProperties> | null>(null);
 
-  const [ready,    setReady]    = useState(false);
-  const [hoverLbl, setHoverLbl] = useState<string | null>(null);
+  // [1] Rotation state — stored in ref to avoid re-render on each frame
+  const rotRef = useRef<[number, number]>([-20, -25]);
 
-  // ── Draw one frame ────────────────────────────────────────────────────────
+  // [6] Drag state
+  const dragRef = useRef({
+    active: false,
+    sx: 0,
+    sy: 0,
+    sr: [-20, -25] as [number, number],
+  });
+
+  const rafRef  = useRef<number>(0);
+  const t0Ref   = useRef(Date.now());           // animation start time
+  const [loaded, setLoaded] = useState(false);
+
+  /* ── Load world atlas TopoJSON ─────────────────────────────────────────── */
+  useEffect(() => {
+    fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json")
+      .then((r) => r.json())
+      .then((topo: Topology) => {
+        const countries = topo.objects.countries;
+        worldRef.current = feature(
+          topo,
+          countries as Parameters<typeof feature>[1]
+        ) as FeatureCollection<Geometry, GeoJsonProperties>;
+        setLoaded(true);
+      })
+      .catch((err) => console.error("[Globe] world-atlas load failed:", err));
+  }, []);
+
+  /* ── Canvas draw ───────────────────────────────────────────────────────── */
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !assetsRef.current) return;
-    const { d3, world } = assetsRef.current as any;
+    const ctr    = containerRef.current;
+    const world  = worldRef.current;
+    if (!canvas || !ctr || !world) return;
+
+    const W = ctr.clientWidth;
+    const H = ctr.clientHeight;
+
+    // [1] Resize canvas to match container exactly
+    if (canvas.width !== W || canvas.height !== H) {
+      canvas.width  = W;
+      canvas.height = H;
+    }
+
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const W  = canvas.width, H = canvas.height;
-    const cx = W / 2, cy = H / 2;
-    const R  = Math.min(W, H) * 0.44;
+    // [1] Radius: fit full sphere in both dimensions
+    const radius = Math.min(W, H) * 0.46;
+    const rot    = rotRef.current;
+
+    const proj = geoOrthographic()
+      .scale(radius)
+      .translate([W / 2, H / 2])   // [1] center the sphere in the canvas
+      .rotate([rot[0], rot[1], 0])
+      .clipAngle(90);
+
+    const pathGen = geoPath(proj, ctx);
+    const grat    = geoGraticule();
+    const sphere  = { type: "Sphere" } as Parameters<typeof pathGen>[0];
 
     ctx.clearRect(0, 0, W, H);
 
-    const proj = d3.geoOrthographic()
-      .scale(R).translate([cx, cy])
-      .rotate(rotRef.current).clipAngle(90);
-    const path = d3.geoPath(proj, ctx);
-
-    // ── Starfield (dark mode only) ──────────────────────────────────────────
-    if (isDark) {
-      for (const star of STARS) {
-        ctx.beginPath();
-        ctx.arc(star.x * W, star.y * H, star.r, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(255,255,255,${star.a})`;
-        ctx.fill();
-      }
-    }
-
-    // ── Ocean ───────────────────────────────────────────────────────────────
+    /* Ocean base */
     ctx.beginPath();
-    path({ type: "Sphere" });
-    ctx.fillStyle = isDark ? "#151010" : "#f2f2f4";
+    pathGen(sphere);
+    ctx.fillStyle = OCEAN_FILL;
     ctx.fill();
 
-    // ── Atmosphere ──────────────────────────────────────────────────────────
-    const atm = ctx.createRadialGradient(cx, cy, R * 0.94, cx, cy, R * 1.10);
-    atm.addColorStop(0, isDark ? "rgba(255,119,201,0.06)" : "rgba(180,180,200,0.35)");
-    atm.addColorStop(1, "rgba(0,0,0,0)");
-    ctx.beginPath(); path({ type: "Sphere" });
-    ctx.fillStyle = atm; ctx.fill();
+    /* Sphere edge glow */
+    ctx.beginPath();
+    pathGen(sphere);
+    ctx.strokeStyle = OUTLINE_GLOW;
+    ctx.lineWidth   = 2;
+    ctx.stroke();
 
-    // ── Graticule ────────────────────────────────────────────────────────────
-    const grat = d3.geoGraticule().step([20, 20])();
-    ctx.beginPath(); path(grat);
-    ctx.strokeStyle = isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.05)";
-    ctx.lineWidth   = 0.5; ctx.stroke();
+    /* Graticule grid */
+    ctx.beginPath();
+    pathGen(grat());
+    ctx.strokeStyle = GRATICULE_CLR;
+    ctx.lineWidth   = 0.5;
+    ctx.stroke();
 
-    // ── Land ─────────────────────────────────────────────────────────────────
-    if (world) {
-      ctx.beginPath(); path(world as any);
-      ctx.fillStyle   = isDark ? "rgba(255,255,255,0.11)" : "rgba(40,30,20,0.14)";
-      ctx.strokeStyle = isDark ? "rgba(255,255,255,0.05)" : "rgba(40,30,20,0.07)";
-      ctx.lineWidth   = 0.4; ctx.fill(); ctx.stroke();
-    }
+    /* [3] Land — Shelby pink */
+    ctx.beginPath();
+    pathGen(world);
+    ctx.fillStyle   = LAND_FILL;
+    ctx.fill();
+    ctx.strokeStyle = LAND_STROKE;
+    ctx.lineWidth   = 0.4;
+    ctx.stroke();
 
-    // ── Globe border ─────────────────────────────────────────────────────────
-    ctx.beginPath(); path({ type: "Sphere" });
-    ctx.strokeStyle = isDark ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.10)";
-    ctx.lineWidth   = 1.5; ctx.stroke();
+    /* [4] SP Markers — animated diamonds ─────────────────────────────────── */
+    const elapsed = Date.now() - t0Ref.current;
 
-    // ── All markers (user + sovereignty) ────────────────────────────────────
-    const allMarkers = [...markers, ...SOVEREIGNTY_MARKERS];
-    const labelScale = R / 200;
-    const labels: { sx: number; sy: number; label: string; color: string }[] = [];
+    markers.forEach((m, i) => {
+      // [5] Skip any marker that shouldn't appear on globe
+      // (sovereignty markers should never be in the markers prop;
+      //  this guard is a final safety net)
+      if (!m.lat || !m.lng) return;
+      if (!isVisible(m.lng, m.lat, rot)) return;
 
-    for (const m of allMarkers) {
-      const [lat, lng] = m.location;
-      const pt = proj([lng, lat]);
-      if (!pt) continue;
-      const [sx, sy] = pt;
+      const pt = proj([m.lng, m.lat]);
+      if (!pt) return;
+      const [px, py] = pt;
 
-      // Visibility
-      const [lam, phi] = rotRef.current.map(d => d * Math.PI / 180);
-      const latR = lat * Math.PI / 180, lngR = lng * Math.PI / 180;
-      const vis  =
-        Math.cos(latR) * Math.cos(phi) * Math.cos(lngR - (-lam)) +
-        Math.sin(latR) * Math.sin(-phi);
-      if (vis < 0.05) continue;
+      /* Phase: offset each marker by golden-ratio fraction so they don't all
+         appear/disappear in sync */
+      const raw   = ((elapsed / CYCLE_MS) + i * GOLDEN) % 1; // 0..1
 
-      const col      = m.color || markerColor;
-      const halfSize = R * m.size * 0.7;
-      const alpha    = 0.4 + vis * 0.6;
+      /* Scale curve:
+           0 – 20%  → ease-in  0→1  (appear / enlarge)
+          20 – 75%  → hold at  1    (fully visible)
+          75 – 100% → ease-out 1→0  (shrink / disappear)         */
+      let scale: number;
+      if (raw < 0.20) {
+        scale = easeInOut(raw / 0.20);
+      } else if (raw < 0.75) {
+        scale = 1;
+      } else {
+        scale = easeInOut(1 - (raw - 0.75) / 0.25);
+      }
 
-      // Glow
-      const grd = ctx.createRadialGradient(sx, sy, 0, sx, sy, halfSize * 3.5);
-      grd.addColorStop(0, col + "55");
-      grd.addColorStop(1, col + "00");
-      ctx.globalAlpha = alpha * 0.8;
-      ctx.fillStyle   = grd;
+      const alpha = Math.max(0.05, scale);
+      const sz    = 10 * scale;                  // half-diagonal of the diamond
+      const color = HEALTH_COLOR[m.health] ?? HEALTH_COLOR.Unknown;
+
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(px, py);
+
+      /* Glow halo */
+      const grd = ctx.createRadialGradient(0, 0, 0, 0, 0, sz * 3.5);
+      grd.addColorStop(0, hexToRgba(color, 0.45));
+      grd.addColorStop(1, hexToRgba(color, 0));
+      ctx.fillStyle = grd;
       ctx.beginPath();
-      ctx.arc(sx, sy, halfSize * 3.5, 0, Math.PI * 2);
+      ctx.arc(0, 0, sz * 3.5, 0, Math.PI * 2);
       ctx.fill();
 
-      // Diamond marker
-      ctx.globalAlpha = 0.7 + vis * 0.3;
-      drawDiamond(
-        ctx, sx, sy, halfSize,
-        col,
-        isDark ? "rgba(255,255,255,0.25)" : "rgba(0,0,0,0.15)",
-        Math.max(1, halfSize * 0.25)
-      );
-      ctx.globalAlpha = 1;
-
-      if (m.label && vis > 0.15) labels.push({ sx, sy, label: m.label, color: col });
-    }
-
-    // ── Label chips ───────────────────────────────────────────────────────────
-    for (const { sx, sy, label, color } of labels) {
-      const fs  = Math.max(9, Math.round(10 * labelScale));
-      ctx.font  = `700 ${fs}px 'Roboto Mono', monospace`;
-      ctx.textBaseline = "middle";
-      const tw  = ctx.measureText(label).width;
-      const px  = 7, py = 3;
-      const cw  = tw + px * 2, ch = fs + py * 2;
-      const lx  = sx + Math.max(7, R * 0.055);
-      const ly  = sy - ch - Math.max(4, R * 0.04);
-
-      ctx.fillStyle = color;
+      /* Diamond (square rotated 45°) */
+      ctx.rotate(Math.PI / 4);
       ctx.beginPath();
-      ctx.roundRect(lx, ly, cw, ch, ch * 0.35);
+      ctx.rect(-sz / 2, -sz / 2, sz, sz);
+      ctx.fillStyle   = color;
       ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,0.55)";
+      ctx.lineWidth   = Math.max(0.5, 0.8 / (scale || 0.01));
+      ctx.stroke();
 
-      ctx.strokeStyle = isDark ? "rgba(0,0,0,0.3)" : "rgba(0,0,0,0.15)";
-      ctx.lineWidth   = 0.5; ctx.stroke();
-
-      // Connector
-      ctx.strokeStyle = color + "cc"; ctx.lineWidth = 1;
-      ctx.setLineDash([3, 3]);
-      ctx.beginPath();
-      ctx.moveTo(sx, sy - Math.max(2, R * 0.015));
-      ctx.lineTo(lx + 4, ly + ch);
-      ctx.stroke(); ctx.setLineDash([]);
-
-      ctx.fillStyle = "#ffffff";
-      ctx.fillText(label, lx + px, ly + ch / 2);
-    }
-  }, [isDark, markers, markerColor]);
-
-  // ── Load assets ───────────────────────────────────────────────────────────
-  useEffect(() => {
-    Promise.all([getD3(), getWorld()]).then(([d3, world]) => {
-      assetsRef.current = { d3, world };
-      setReady(true);
+      ctx.restore();
     });
-  }, []);
+  }, [markers]);
 
-  // ── Animation loop ────────────────────────────────────────────────────────
+  /* ── RAF animation loop ────────────────────────────────────────────────── */
   useEffect(() => {
-    let rafId: number;
-    let last = performance.now();
-    const loop = (now: number) => {
-      const dt = Math.min((now - last) / 1000, 0.05);
-      last = now;
-      if (autoRotate && !dragStart.current) {
-        rotRef.current = [rotRef.current[0] - dt * 12, rotRef.current[1]];
+    if (!loaded) return;
+
+    const loop = () => {
+      // Auto-rotate when idle
+      if (autoRotate && !dragRef.current.active) {
+        rotRef.current = [rotRef.current[0] + AUTO_RPM, rotRef.current[1]];
       }
       draw();
-      rafId = requestAnimationFrame(loop);
+      rafRef.current = requestAnimationFrame(loop);
     };
-    rafId = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(rafId);
-  }, [autoRotate, draw]);
 
-  // ── ResizeObserver ────────────────────────────────────────────────────────
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [loaded, autoRotate, draw]);
+
+  /* ── Resize observer ───────────────────────────────────────────────────── */
   useEffect(() => {
-    const container = containerRef.current;
-    const canvas    = canvasRef.current;
-    if (!container || !canvas) return;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const ro = new ResizeObserver(entries => {
-      const w = Math.round(entries[0]?.contentRect.width ?? 0);
-      if (w <= 0) return;
-      canvas.width  = Math.round(w * dpr);
-      canvas.height = Math.round(w * dpr);
-      canvas.style.width  = `${w}px`;
-      canvas.style.height = `${w}px`;
-    });
-    ro.observe(container);
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => draw());
+    ro.observe(el);
     return () => ro.disconnect();
+  }, [draw]);
+
+  /* ── [6] Drag: RIGHT drag → positive Δlambda → globe rotates RIGHT ──────
+     Previous bug: rotRef.current[0] -= dx * SENSITIVITY  (inverted)
+     Fixed:        rotRef.current[0] += dx * SENSITIVITY  (natural)        */
+
+  const onMouseDown = useCallback((e: React.MouseEvent) => {
+    dragRef.current = {
+      active: true,
+      sx: e.clientX,
+      sy: e.clientY,
+      sr: [...rotRef.current] as [number, number],
+    };
   }, []);
 
-  // ── Pointer events ────────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!interactive) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+  const onMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!dragRef.current.active) return;
+    const dx = e.clientX - dragRef.current.sx;
+    const dy = e.clientY - dragRef.current.sy;
+    rotRef.current = [
+      dragRef.current.sr[0] + dx * SENSITIVITY,                            // [6] + not −
+      Math.max(-90, Math.min(90, dragRef.current.sr[1] - dy * SENSITIVITY)),
+    ];
+  }, []);
 
-    const onDown = (e: PointerEvent) => {
-      dragStart.current = { x: e.clientX, y: e.clientY, rot: [...rotRef.current] as [number, number] };
-      canvas.setPointerCapture(e.pointerId);
-      canvas.style.cursor = "grabbing";
-    };
-    const onMove = (e: PointerEvent) => {
-      if (!dragStart.current) return;
-      const dx =  (e.clientX - dragStart.current.x) * 0.35;
-      const dy = -(e.clientY - dragStart.current.y) * 0.35;
-      rotRef.current = [
-        dragStart.current.rot[0] - dx,
-        Math.max(-80, Math.min(80, dragStart.current.rot[1] + dy)),
-      ];
-    };
-    const onUp = () => { dragStart.current = null; canvas.style.cursor = "grab"; };
+  const endDrag = useCallback(() => {
+    dragRef.current.active = false;
+  }, []);
 
-    canvas.addEventListener("pointerdown",  onDown);
-    canvas.addEventListener("pointermove",  onMove);
-    canvas.addEventListener("pointerup",    onUp);
-    canvas.addEventListener("pointerleave", onUp);
-    return () => {
-      canvas.removeEventListener("pointerdown",  onDown);
-      canvas.removeEventListener("pointermove",  onMove);
-      canvas.removeEventListener("pointerup",    onUp);
-      canvas.removeEventListener("pointerleave", onUp);
+  /* Touch equivalents */
+  const onTouchStart = useCallback((e: React.TouchEvent) => {
+    const t = e.touches[0];
+    dragRef.current = {
+      active: true,
+      sx: t.clientX,
+      sy: t.clientY,
+      sr: [...rotRef.current] as [number, number],
     };
-  }, [interactive]);
+  }, []);
 
+  const onTouchMove = useCallback((e: React.TouchEvent) => {
+    if (!dragRef.current.active) return;
+    const t  = e.touches[0];
+    const dx = t.clientX - dragRef.current.sx;
+    const dy = t.clientY - dragRef.current.sy;
+    rotRef.current = [
+      dragRef.current.sr[0] + dx * SENSITIVITY,                            // [6] + not −
+      Math.max(-90, Math.min(90, dragRef.current.sr[1] - dy * SENSITIVITY)),
+    ];
+  }, []);
+
+  /* Click → hit-test markers */
+  const onClick = useCallback(
+    (e: React.MouseEvent) => {
+      if (!onMarkerClick) return;
+      const canvas = canvasRef.current;
+      const ctr    = containerRef.current;
+      if (!canvas || !ctr) return;
+
+      const rect   = canvas.getBoundingClientRect();
+      const mx     = e.clientX - rect.left;
+      const my     = e.clientY - rect.top;
+      const W      = ctr.clientWidth;
+      const H      = ctr.clientHeight;
+      const radius = Math.min(W, H) * 0.46;
+      const rot    = rotRef.current;
+
+      const proj = geoOrthographic()
+        .scale(radius)
+        .translate([W / 2, H / 2])
+        .rotate([rot[0], rot[1], 0])
+        .clipAngle(90);
+
+      for (const m of markers) {
+        if (!isVisible(m.lng, m.lat, rot)) continue;
+        const pt = proj([m.lng, m.lat]);
+        if (!pt) continue;
+        const dx = mx - pt[0];
+        const dy = my - pt[1];
+        if (Math.sqrt(dx * dx + dy * dy) < 18) {
+          onMarkerClick(m);
+          break;
+        }
+      }
+    },
+    [markers, onMarkerClick]
+  );
+
+  /* ── Render ─────────────────────────────────────────────────────────────── */
   return (
     <div
       ref={containerRef}
-      className={className}
-      style={{ position: "relative", ...style }}
+      className={`relative w-full h-full overflow-hidden select-none ${className}`}
+      style={{
+        // Deep-space background — radial so centre is lighter (galaxy core feel)
+        background: "radial-gradient(ellipse at 50% 42%, #0d0d2b 0%, #050510 80%)",
+      }}
+      onMouseDown={onMouseDown}
+      onMouseMove={onMouseMove}
+      onMouseUp={endDrag}
+      onMouseLeave={endDrag}
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={endDrag}
+      onClick={onClick}
     >
-      {!ready && (
-        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1 }}>
-          <div style={{ width: 36, height: 36, borderRadius: "50%", border: "2px solid var(--border)", borderTopColor: "var(--shelby-pink, #ff77c9)", animation: "gspin 1s linear infinite" }} />
-          <style>{`@keyframes gspin{to{transform:rotate(360deg)}}`}</style>
-        </div>
-      )}
+      {/* [2] Starfield — pure CSS, no extra DOM cost */}
+      <div
+        aria-hidden="true"
+        className="absolute inset-0 pointer-events-none"
+        style={{ background: STARFIELD }}
+      />
+
+      {/* Globe canvas — absolutely positioned to fill container */}
       <canvas
         ref={canvasRef}
-        style={{ display: "block", cursor: interactive ? "grab" : "default", opacity: ready ? 1 : 0, transition: "opacity 0.5s" }}
+        className="absolute inset-0 w-full h-full cursor-grab active:cursor-grabbing"
       />
-      {/* Sovereignty footer badge */}
-      {ready && (
-        <div style={{ position: "absolute", bottom: 4, right: 6, fontSize: 8, fontFamily: "monospace", color: isDark ? "rgba(251,191,36,0.7)" : "rgba(161,120,0,0.7)", pointerEvents: "none" }}>
-          🇻🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
+
+      {/* Loading indicator */}
+      {!loaded && (
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <span className="text-sm text-pink-400 animate-pulse tracking-wide">
+            Loading globe…
+          </span>
         </div>
       )}
     </div>

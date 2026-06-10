@@ -1,6 +1,6 @@
 "use client";
-// components/ui/globe.tsx — v8.0
-// Fixes applied in this version:
+// components/ui/globe.tsx — v8.1
+// Added: Hoàng Sa + Trường Sa pink blobs (VN maritime territories not in world-atlas)
 //   [1] Full sphere visible — radius = min(W,H) × 0.46, translate to canvas center
 //   [2] CSS starfield — 60 deterministic radial-gradient stars on parent div
 //   [3] Shelby-pink continents — LAND_FILL = "#e91e8c" (was near-transparent)
@@ -207,6 +207,29 @@ export default function Globe({
     ctx.strokeStyle = LAND_STROKE;
     ctx.lineWidth   = 0.4;
     ctx.stroke();
+
+    /* Vietnamese maritime territories — drawn on top of ocean, same pink as land.
+       world-atlas 110m TopoJSON does not include these; we paint them manually.
+         Hoàng Sa (Paracel Is.) : ~16.5°N 112.2°E
+         Trường Sa (Spratly Is.): ~11.5°N 114.3°E                               */
+    const VN_TERRITORIES = [
+      { lat: 16.5, lng: 112.2, rFrac: 0.009 },  // Hoàng Sa  ~150 km wide
+      { lat: 11.5, lng: 114.3, rFrac: 0.018 },  // Trường Sa ~800 km span
+    ];
+    VN_TERRITORIES.forEach(({ lat, lng, rFrac }) => {
+      if (!isVisible(lng, lat, rot)) return;
+      const pt = proj([lng, lat]);
+      if (!pt) return;
+      const [tx, ty] = pt;
+      const tr = Math.max(5, radius * rFrac);
+      ctx.beginPath();
+      ctx.arc(tx, ty, tr, 0, Math.PI * 2);
+      ctx.fillStyle   = LAND_FILL;
+      ctx.fill();
+      ctx.strokeStyle = LAND_STROKE;
+      ctx.lineWidth   = 0.4;
+      ctx.stroke();
+    });
 
     /* [4] SP Markers — animated diamonds ─────────────────────────────────── */
     const elapsed = Date.now() - t0Ref.current;

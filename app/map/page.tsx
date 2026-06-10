@@ -1,9 +1,9 @@
 "use client";
-// app/map/page.tsx — v7.2
-// Changes from v7.1:
-// 5. GlobeHandle: defined locally (next/dynamic strips named exports — ts2614)
-// 6. Globe dynamic import: cast to ForwardRefExoticComponent so ref={globeRef}
-//    is accepted by TypeScript (next/dynamic loses forwardRef type — ts2769)
+// app/map/page.tsx — v7.3
+// Changes from v7.2:
+// 7. Map area: height 70vh → 57vh so Provider Directory is proportionally visible
+// 8. Flatmap: onWheel stopPropagation — wheel-zoom no longer scrolls the page
+// 9. Flatmap legend: Healthy marker color #ff77c9 → #ffffff (contrasts pink land)
 
 import React, { useState, useCallback, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
@@ -538,7 +538,7 @@ export default function MapPage() {
       </div>
 
       {/* Map area — touch-action none for globe interaction */}
-      <div style={{ height:"70vh", minHeight:320, position:"relative", overflow:"hidden",
+      <div style={{ height:"57vh", minHeight:280, position:"relative", overflow:"hidden",
                     flexShrink:0, touchAction:"none" }}>
         {error && (
           <div style={{ position:"absolute", top:8, left:"50%", transform:"translateX(-50%)", zIndex:30,
@@ -580,7 +580,10 @@ export default function MapPage() {
         {mode === "flat" && (
           // Flat map with dark pink ocean + pink land (matches globe)
           // WorldMapInner uses react-simple-maps; we override colors via CSS vars
-          <div style={{ width:"100%", height:"100%", background:"#120418", position:"relative" }}>
+          <div
+            style={{ width:"100%", height:"100%", background:"#120418", position:"relative" }}
+            onWheel={(e) => e.stopPropagation()}   // prevent page scroll while zooming map
+          >
             <style>{`
               /* Override react-simple-maps geography fill to match globe pink */
               .rsm-geography { fill: #ff77c9 !important; stroke: rgba(255,40,155,0.4) !important; }
@@ -595,7 +598,7 @@ export default function MapPage() {
                 <div style={{ fontSize:8, fontWeight:700, fontFamily:"monospace", textTransform:"uppercase",
                               letterSpacing:"0.1em", color:"rgba(255,119,201,0.45)", marginBottom:5 }}>Legend</div>
                 {[
-                  { color:"#ff77c9", label:"Healthy" },
+                  { color:"#ffffff", label:"Healthy" },
                   { color:"#a855f7", label:"Waitlisted" },
                   { color:"#f97316", label:"Leaving" },
                   { color:"#ef4444", label:"Faulty" },

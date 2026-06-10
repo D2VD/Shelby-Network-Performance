@@ -1,8 +1,16 @@
 "use client";
 /**
- * components/world-map-inner.tsx — v8.0
+ * components/world-map-inner.tsx — v8.1
  *
- * Fixes vs v7:
+ * Changes vs v8.0:
+ *  6. SP marker color: Healthy #ff77c9 → #ffffff (white) so markers contrast
+ *     against the pink (#ec4899) land fill instead of blending into it.
+ *  7. Hoàng Sa + Trường Sa: replaced single text label with per-island SVG
+ *     circle dots (same coord set as globe v8.2) — labels are stable because
+ *     they sit inside ComposableMap's projection coordinate space, not CSS.
+ *  8. Scroll prevention: removed passive React onWheel; added native wheel
+ *     listener with { passive: false } so e.preventDefault() is honoured by
+ *     the browser and page no longer scrolls while zooming the map.
  *  1. SVG diamond markers no longer appear off-map
  *     ROOT CAUSE: `style={{ transform:"rotate(45deg)" }}` on SVG <rect>
  *     rotates around the SVG viewport origin (0,0), not the element centre —
@@ -48,8 +56,26 @@ const SOVEREIGNTY = [
   { key: "truong-sa", lat: 10.0,  lng: 114.17, label: "🇻🇳 Trường Sa" },
 ];
 
+// ── Vietnamese maritime territory island dots ─────────────────────────────────
+// world-atlas 110m omits Hoàng Sa + Trường Sa; we render each island as a
+// small SVG circle so the archipelago scatter matches official VN maps.
+const HOANG_SA_COORDS: [number, number][] = [
+  [112.34, 16.84], // Phú Lâm (principal — rendered larger)
+  [112.35, 16.97], [112.72, 16.72], [112.64, 16.56], [112.47, 16.61],
+  [112.21, 16.51], [112.13, 16.53], [111.92, 16.43], [111.86, 16.58],
+  [111.75, 16.45], [111.69, 16.47], [111.60, 16.41],
+];
+const TRUONG_SA_COORDS: [number, number][] = [
+  [114.28, 11.05], // Thị Tứ (principal — rendered larger)
+  [114.32, 11.09], [113.95, 11.43], [115.14, 10.87], [114.51,  9.87],
+  [114.36, 10.18], [113.79, 10.73], [114.66, 10.37], [114.22,  9.72],
+  [111.92,  8.64], [115.64, 10.52], [116.73,  9.72], [116.55,  9.57],
+  [115.87, 10.06], [115.23,  9.48], [114.08,  9.15], [113.63,  9.90],
+  [112.55, 10.04], [112.98,  9.45],
+];
+
 const HEALTH_COLOR: Record<string, string> = {
-  Healthy:    "#ff77c9",
+  Healthy:    "#ffffff",   // white — contrasts against pink land (#ec4899)
   Waitlisted: "#f59e0b",
   Leaving:    "#fb923c",
   Faulty:     "#ef4444",
@@ -184,6 +210,21 @@ export default function WorldMapInner({
 
   const dragRef = useRef<{ startX: number; startY: number; startCenter: [number, number] } | null>(null);
 
+  // ── Non-passive wheel listener — prevents page scroll while zooming ──────
+  // React's synthetic onWheel is passive in modern browsers; preventDefault()
+  // is silently ignored. We attach a native listener with { passive: false }.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const handler = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setScale(s => Math.max(80, Math.min(600, s * (e.deltaY < 0 ? 1.12 : 0.89))));
+    };
+    el.addEventListener("wheel", handler, { passive: false });
+    return () => el.removeEventListener("wheel", handler);
+  }, []);
+
   // ── Drag to pan ──────────────────────────────────────────────────────────
   const onMouseDown = useCallback((e: React.MouseEvent) => {
     if (e.button !== 0) return;
@@ -212,13 +253,7 @@ export default function WorldMapInner({
     };
   }, [scale]);
 
-  // ── Scroll to zoom ───────────────────────────────────────────────────────
-  const onWheel = useCallback((e: React.WheelEvent) => {
-    e.preventDefault();
-    setScale(s => Math.max(80, Math.min(600, s * (e.deltaY < 0 ? 1.12 : 0.89))));
-  }, []);
-
-  // Handle cluster click → show tooltip
+  // ── Handle cluster click → show tooltip or fire onProviderClick ─────────
   const handleClusterClick = useCallback((cluster: Cluster) => {
     if (cluster.providers.length === 1) {
       onProviderClick?.(cluster.providers[0]);
@@ -237,7 +272,6 @@ export default function WorldMapInner({
       style={{ position: "relative", width: "100%", height: "100%", overflow: "hidden",
                background: oceanColor, cursor: "grab", userSelect: "none" }}
       onMouseDown={onMouseDown}
-      onWheel={onWheel}
     >
       {/* Dismiss tooltip on background click */}
       {tooltip && (
@@ -285,26 +319,59 @@ export default function WorldMapInner({
           />
         ))}
 
-        {/* Sovereignty markers — text only, same SVG transform fix */}
-        {SOVEREIGNTY.map(s => (
-          <Marker key={s.key} coordinates={[s.lng, s.lat]}>
-            <text
-              textAnchor="middle"
-              dy={0}
-              style={{
-                fontSize: 8,
-                fontFamily: "monospace",
-                fontWeight: 700,
-                fill: isDark ? "#fde68a" : "#92400e",
-                paintOrder: "stroke",
-                stroke: isDark ? "rgba(0,0,0,0.8)" : "rgba(255,255,255,0.9)",
-                strokeWidth: 3,
-                strokeLinejoin: "round",
-                pointerEvents: "none",
-              }}
-            >
-              {s.label}
-            </text>
+        {/* Hoàng Sa — individual island dots */}
+        {HOANG_SA_COORDS.map(([lng, lat], idx) => (
+          <Marker key={`hs-${idx}`} coordinates={[lng, lat]}>
+            <circle
+              r={idx === 0 ? 3.5 : 2}
+              fill={landColor}
+              stroke="rgba(255,255,255,0.5)"
+              strokeWidth={0.6}
+            />
+            {idx === 0 && (
+              <text
+                textAnchor="middle"
+                dy={-7}
+                style={{
+                  fontSize: 7, fontFamily: "monospace", fontWeight: 700,
+                  fill: isDark ? "#fde68a" : "#92400e",
+                  paintOrder: "stroke",
+                  stroke: isDark ? "rgba(0,0,0,0.8)" : "rgba(255,255,255,0.9)",
+                  strokeWidth: 3, strokeLinejoin: "round" as const,
+                  pointerEvents: "none",
+                }}
+              >
+                🇻🇳 Hoàng Sa
+              </text>
+            )}
+          </Marker>
+        ))}
+
+        {/* Trường Sa — individual island dots */}
+        {TRUONG_SA_COORDS.map(([lng, lat], idx) => (
+          <Marker key={`ts-${idx}`} coordinates={[lng, lat]}>
+            <circle
+              r={idx === 0 ? 3.5 : 2}
+              fill={landColor}
+              stroke="rgba(255,255,255,0.5)"
+              strokeWidth={0.6}
+            />
+            {idx === 0 && (
+              <text
+                textAnchor="middle"
+                dy={-7}
+                style={{
+                  fontSize: 7, fontFamily: "monospace", fontWeight: 700,
+                  fill: isDark ? "#fde68a" : "#92400e",
+                  paintOrder: "stroke",
+                  stroke: isDark ? "rgba(0,0,0,0.8)" : "rgba(255,255,255,0.9)",
+                  strokeWidth: 3, strokeLinejoin: "round" as const,
+                  pointerEvents: "none",
+                }}
+              >
+                🇻🇳 Trường Sa
+              </text>
+            )}
           </Marker>
         ))}
       </ComposableMap>

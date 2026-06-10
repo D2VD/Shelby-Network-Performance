@@ -1,14 +1,16 @@
 "use client";
 /**
- * app/explorer/page.tsx — v2.0
+ * app/explorer/page.tsx — v2.1
  *
- * KEY CHANGES vs v1.0:
- *  - ALL direct browser GraphQL fetches removed (were causing CSP violations)
- *  - Transactions  → GET /api/network/transactions?network=&cursor=
- *  - Blobs         → GET /api/network/blobs-data?network=&status=&cursor=
- *  - SP directory  → GET /api/network/providers?network=   (already server-side)
- *  - Skeleton loading states added throughout
- *  - Search bar wired to tab auto-select heuristic (unchanged)
+ * Changes vs v2.0:
+ *  - handleSearch: 0x addresses now route to Transactions tab (were wrongly
+ *    routing to SP Directory / leaderboard tab — root cause of "wallet search
+ *    shows SP list" bug)
+ *  - TransactionsTab: accepts optional `address` prop; includes it in the
+ *    fetch URL so the VPS can filter transactions by sender address
+ *  - TransactionsTab + BlobsTab: content-type guard added before r.json() so
+ *    a 502/HTML response shows "Server returned 502" instead of
+ *    "Unexpected token '<', <!DOCTYPE..."
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -170,7 +172,7 @@ function Pager({ hasPrev, hasNext, onPrev, onNext, loading }: {
 }
 
 // ─── Transactions Tab ─────────────────────────────────────────────────────────
-function TransactionsTab({ network }: { network: string }) {
+function TransactionsTab({ network, address }: { network: string; address?: string }) {
   const [txs,     setTxs]     = useState<TxRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState<string | null>(null);
@@ -182,11 +184,17 @@ function TransactionsTab({ network }: { network: string }) {
   const load = useCallback(async (cursor: string) => {
     if (alive.current) { setLoading(true); setError(null); }
     try {
-      // Uses server-side proxy route — no direct browser fetch to indexer
+      const params = new URLSearchParams({ network, cursor });
+      if (address) params.set("address", address);
       const r = await fetch(
-        `/api/network/transactions?network=${network}&cursor=${cursor}`,
+        `/api/network/transactions?${params}`,
         { signal: AbortSignal.timeout(15_000) }
       );
+      // Guard: if the proxy returns HTML (e.g. 404/502 page), surface a clean error
+      const ct = r.headers.get("content-type") ?? "";
+      if (!ct.includes("application/json")) {
+        throw new Error(`Server returned ${r.status} — check VPS connection`);
+      }
       const j = await r.json() as { ok: boolean; txs?: TxRecord[]; nextCursor?: string; error?: string };
       if (!alive.current) return;
       if (!j.ok) throw new Error(j.error ?? "Request failed");
@@ -199,14 +207,14 @@ function TransactionsTab({ network }: { network: string }) {
     } finally {
       if (alive.current) setLoading(false);
     }
-  }, [network, cursorIdx]);
+  }, [network, address, cursorIdx]);
 
   useEffect(() => {
     cursorStack.current = [""];
     setCursorIdx(0);
     setTxs([]);
     load("");
-  }, [network]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [network, address]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const goNext = () => {
     const next = cursorStack.current[cursorIdx + 1];
@@ -297,11 +305,15 @@ function BlobsTab({ network }: { network: string }) {
   const load = useCallback(async (cursor: string, sf: string) => {
     if (alive.current) { setLoading(true); setError(null); }
     try {
-      // Uses server-side proxy route — no direct browser fetch to indexer
       const r = await fetch(
         `/api/network/blobs-data?network=${network}&status=${sf}&cursor=${cursor}`,
         { signal: AbortSignal.timeout(15_000) }
       );
+      // Guard: HTML response means proxy/VPS error — show meaningful message
+      const ct = r.headers.get("content-type") ?? "";
+      if (!ct.includes("application/json")) {
+        throw new Error(`Server returned ${r.status} — the VPS blob endpoint may be unavailable`);
+      }
       const j = await r.json() as { ok: boolean; blobs?: BlobRecord[]; nextCursor?: string; note?: string; error?: string };
       if (!alive.current) return;
       if (!j.ok) throw new Error(j.error ?? "Request failed");
@@ -551,10 +563,13 @@ export default function ExplorerPage() {
   const handleSearch = (q: string) => {
     if (!q) return;
     setSearchResult(q);
-    // Heuristic: "v12345" or pure digits → transactions; long 0x → leaderboard; else → blobs
-    if (q.startsWith("v") || /^\d+$/.test(q))  setTab("transactions");
-    else if (q.startsWith("0x") && q.length >= 64) setTab("leaderboard");
-    else setTab("blobs");
+    // Routing heuristic (fixed):
+    //   "v12345" or digits  → transactions (version lookup)
+    //   0x address          → transactions filtered by address (was: leaderboard — BUG FIXED)
+    //   anything else       → blobs
+    if (q.startsWith("v") || /^\d+$/.test(q))      setTab("transactions");
+    else if (q.startsWith("0x"))                     setTab("transactions");
+    else                                              setTab("blobs");
   };
 
   const TABS: { id: ExplorerTab; label: string; icon: string }[] = [
@@ -606,7 +621,12 @@ export default function ExplorerPage() {
           ))}
         </div>
 
-        {tab === "transactions" && <TransactionsTab network={network} />}
+        {tab === "transactions" && (
+          <TransactionsTab
+            network={network}
+            address={searchResult?.startsWith("0x") ? searchResult : undefined}
+          />
+        )}
         {tab === "blobs"        && <BlobsTab        network={network} />}
         {tab === "leaderboard"  && <LeaderboardTab  network={network} />}
       </div>

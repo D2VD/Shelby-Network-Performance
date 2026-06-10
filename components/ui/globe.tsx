@@ -1,6 +1,7 @@
 "use client";
-// components/ui/globe.tsx — v8.1
-// Added: Hoàng Sa + Trường Sa pink blobs (VN maritime territories not in world-atlas)
+// components/ui/globe.tsx — v8.2
+// v8.1 → v8.2: Hoàng Sa + Trường Sa rendered as per-island dot scatter
+//   (replaces single circle per group; matches actual archipelago layout)
 //   [1] Full sphere visible — radius = min(W,H) × 0.46, translate to canvas center
 //   [2] CSS starfield — 60 deterministic radial-gradient stars on parent div
 //   [3] Shelby-pink continents — LAND_FILL = "#e91e8c" (was near-transparent)
@@ -98,6 +99,77 @@ function hexToRgba(hex: string, alpha: number): string {
 /** Smooth ease-in-out curve (cubic) */
 function easeInOut(t: number): number {
   return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+}
+
+/* ── Vietnamese maritime territory island coordinates ─────────────────────────
+   world-atlas 110m omits Hoàng Sa and Trường Sa. We render each island as a
+   small filled dot so the archipelago scatter matches official VN maps.
+   Coordinates are approximate centroids of individual islands/reefs.         */
+
+// Hoàng Sa — Paracel Islands  (~16–17 °N, 111–113 °E)
+const HOANG_SA: [number, number][] = [
+  [112.34, 16.84], // Phú Lâm (Woody) — principal island (index 0, drawn larger)
+  [112.35, 16.97], // Linh Côn
+  [112.72, 16.72], // Đảo Trung
+  [112.64, 16.56], // Đảo Bắc
+  [112.47, 16.61],
+  [112.21, 16.51],
+  [112.13, 16.53],
+  [111.92, 16.43], // Hữu Nhật
+  [111.86, 16.58],
+  [111.75, 16.45], // Quang Hòa
+  [111.69, 16.47], // Duy Mộng
+  [111.60, 16.41],
+];
+
+// Trường Sa — Spratly Islands  (~8–12 °N, 111–116 °E)
+const TRUONG_SA: [number, number][] = [
+  [114.28, 11.05], // Thị Tứ (principal island, index 0)
+  [114.32, 11.09], // Đảo Bến Lạc
+  [113.95, 11.43], // Loại Ta
+  [115.14, 10.87],
+  [114.51,  9.87], // Sinh Tồn
+  [114.36, 10.18], // Nam Yit
+  [113.79, 10.73],
+  [114.66, 10.37], // An Bang
+  [114.22,  9.72], // Sơn Ca
+  [111.92,  8.64], // Trường Sa Island proper
+  [115.64, 10.52], // Vĩnh Viễn
+  [116.73,  9.72],
+  [116.55,  9.57],
+  [115.87, 10.06],
+  [115.23,  9.48],
+  [114.08,  9.15],
+  [113.63,  9.90],
+  [112.55, 10.04],
+  [112.98,  9.45],
+];
+
+/** Render one archipelago group as scattered pink island dots on a canvas.
+ *  @param biggestIdx  index of the principal island — drawn slightly larger. */
+function drawIslandsOnCanvas(
+  ctx:          CanvasRenderingContext2D,
+  proj:         (coord: [number, number]) => [number, number] | null,
+  rot:          [number, number],
+  islands:      [number, number][],
+  dotR:         number,
+  biggestIdx:   number = 0,
+) {
+  islands.forEach(([lng, lat], idx) => {
+    if (!isVisible(lng, lat, rot)) return;
+    const pt = proj([lng, lat]);
+    if (!pt) return;
+    const r = idx === biggestIdx
+      ? Math.max(3, dotR * 1.8)
+      : Math.max(1.5, dotR);
+    ctx.beginPath();
+    ctx.arc(pt[0], pt[1], r, 0, Math.PI * 2);
+    ctx.fillStyle   = LAND_FILL;
+    ctx.fill();
+    ctx.strokeStyle = LAND_STROKE;
+    ctx.lineWidth   = 0.3;
+    ctx.stroke();
+  });
 }
 
 /* ── Component ────────────────────────────────────────────────────────────── */
@@ -208,28 +280,16 @@ export default function Globe({
     ctx.lineWidth   = 0.4;
     ctx.stroke();
 
-    /* Vietnamese maritime territories — drawn on top of ocean, same pink as land.
-       world-atlas 110m TopoJSON does not include these; we paint them manually.
-         Hoàng Sa (Paracel Is.) : ~16.5°N 112.2°E
-         Trường Sa (Spratly Is.): ~11.5°N 114.3°E                               */
-    const VN_TERRITORIES = [
-      { lat: 16.5, lng: 112.2, rFrac: 0.009 },  // Hoàng Sa  ~150 km wide
-      { lat: 11.5, lng: 114.3, rFrac: 0.018 },  // Trường Sa ~800 km span
-    ];
-    VN_TERRITORIES.forEach(({ lat, lng, rFrac }) => {
-      if (!isVisible(lng, lat, rot)) return;
-      const pt = proj([lng, lat]);
-      if (!pt) return;
-      const [tx, ty] = pt;
-      const tr = Math.max(5, radius * rFrac);
-      ctx.beginPath();
-      ctx.arc(tx, ty, tr, 0, Math.PI * 2);
-      ctx.fillStyle   = LAND_FILL;
-      ctx.fill();
-      ctx.strokeStyle = LAND_STROKE;
-      ctx.lineWidth   = 0.4;
-      ctx.stroke();
-    });
+    /* ── Vietnamese maritime territories ────────────────────────────────────
+       world-atlas 110m omits these. We render each island as a small filled
+       dot so the archipelago scatter matches the reference map (Quần Đảo
+       Hoàng Sa / Trường Sa). Coordinates are approximate island centroids.
+       Dots are sized relative to the globe radius so they stay proportional. */
+
+    // Dot radius proportional to globe size: ~0.3% of radius
+    const dotR = Math.max(1.5, radius * 0.003);
+    drawIslandsOnCanvas(ctx, proj, rot, HOANG_SA,  dotR, 0);
+    drawIslandsOnCanvas(ctx, proj, rot, TRUONG_SA, dotR, 0);
 
     /* [4] SP Markers — animated diamonds ─────────────────────────────────── */
     const elapsed = Date.now() - t0Ref.current;

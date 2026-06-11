@@ -1,5 +1,5 @@
 "use client";
-// app/map/page.tsx — v7.3
+// app/map/page.tsx — v7.4
 // Changes from v7.2:
 // 7. Map area: height 70vh → 57vh so Provider Directory is proportionally visible
 // 8. Flatmap: onWheel stopPropagation — wheel-zoom no longer scrolls the page
@@ -493,62 +493,86 @@ export default function MapPage() {
 
   return (
     <div style={{ display:"flex", flexDirection:"column", height:"calc(100vh - 60px)",
-                  background:"var(--bg-primary)", overflow:"hidden" }}>
+                  background:"var(--bg-primary)", overflow:"hidden",
+                  fontFamily:"var(--font-body,'Inter',system-ui,sans-serif)" }}>
       <style>{`
-        @media (max-width: 600px) {
-          .map-topbar { flex-wrap: wrap; gap: 6px !important; padding: 6px 10px !important; }
-          .map-controls { flex-wrap: wrap; gap: 5px !important; }
+        @media (max-width:600px) {
+          .map-topbar { flex-wrap:wrap; gap:6px !important; padding:6px 10px !important; }
+          .map-controls { flex-wrap:wrap; gap:5px !important; }
         }
+        .rsm-svg { display:block; }
       `}</style>
 
-      {/* Top bar */}
-      <div className="map-topbar" style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
-                                           padding:"7px 14px", background:"var(--bg-card)",
-                                           borderBottom:"1px solid var(--border)", gap:8, flexShrink:0 }}>
-        <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
-          <div style={{ display:"flex", alignItems:"center", gap:5 }}>
+      {/* ── Top bar — thin, clean, no heavy border (gMonads style) ─────── */}
+      <div className="map-topbar" style={{
+        display:"flex", alignItems:"center", justifyContent:"space-between",
+        padding:"8px 16px", background:"var(--bg-primary)",
+        borderBottom:"1px solid var(--border)", gap:8, flexShrink:0,
+      }}>
+        <div style={{ display:"flex", alignItems:"center", gap:12, flexWrap:"wrap" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:6 }}>
             <span style={{ width:7, height:7, background:loading?"var(--text-dim)":"#ff77c9",
                            display:"inline-block", transform:"rotate(45deg)",
                            boxShadow:!loading?"0 0 6px #ff77c988":"none" }}/>
-            <span style={{ fontFamily:"monospace", fontSize:11, color:"var(--text-muted)" }}>
+            <span style={{ fontFamily:"var(--font-mono,'Roboto Mono',monospace)", fontSize:12,
+                           color:"var(--text-muted)", fontWeight:500 }}>
               {loading?"Loading…":`${healthy} healthy`}
             </span>
           </div>
           {!loading && providers.length > 0 && <>
             <span style={{ color:"var(--border)" }}>|</span>
-            <span style={{ fontFamily:"monospace", fontSize:11, color:"var(--text-muted)" }}>{providers.length} SPs</span>
+            <span style={{ fontFamily:"var(--font-mono,'Roboto Mono',monospace)", fontSize:12,
+                           color:"var(--text-muted)" }}>{providers.length} SPs</span>
           </>}
           {leaving > 0 && <>
             <span style={{ color:"var(--border)" }}>|</span>
-            <span style={{ fontFamily:"monospace", fontSize:11, color:"#f97316" }}>{leaving} leaving</span>
+            <span style={{ fontFamily:"var(--font-mono,'Roboto Mono',monospace)", fontSize:12,
+                           color:"#f97316" }}>{leaving} leaving</span>
           </>}
           <span style={{ color:"var(--border)" }}>|</span>
           <LiveUTCClock/>
         </div>
         <div className="map-controls" style={{ display:"flex", alignItems:"center", gap:6 }}>
-          <div style={{ display:"flex", background:"var(--bg-card2)", borderRadius:8, padding:2, border:"1px solid var(--border)", gap:1 }}>
+          <div style={{ display:"flex", background:"var(--bg-card2)", borderRadius:8,
+                        padding:2, border:"1px solid var(--border)", gap:1 }}>
             {([["globe","🌐 Globe"],["flat","🗺 Flat"]] as [ViewMode,string][]).map(([m,lbl]) => (
-              <button key={m} onClick={()=>setMode(m)} style={{ padding:"5px 10px", borderRadius:6, border:"none", fontSize:11, fontWeight:mode===m?600:400, background:mode===m?"var(--bg-card)":"transparent", color:mode===m?"var(--text-primary)":"var(--text-muted)", boxShadow:mode===m?"0 1px 2px var(--shadow-color)":"none", cursor:"pointer", whiteSpace:"nowrap" }}>
-                {lbl}
-              </button>
+              <button key={m} onClick={()=>setMode(m as ViewMode)} style={{
+                padding:"5px 12px", borderRadius:6, border:"none", fontSize:12,
+                fontFamily:"var(--font-mono,'Roboto Mono',monospace)",
+                fontWeight:mode===m?600:400,
+                background:mode===m?"var(--bg-card)":"transparent",
+                color:mode===m?"var(--text-primary)":"var(--text-muted)",
+                boxShadow:mode===m?"0 1px 2px var(--shadow-color)":"none",
+                cursor:"pointer", whiteSpace:"nowrap",
+              }}>{lbl}</button>
             ))}
           </div>
-          <button onClick={fetchProviders} disabled={loading} style={{ width:28, height:28, display:"flex", alignItems:"center", justifyContent:"center", borderRadius:7, border:"1px solid var(--border)", background:"var(--bg-card)", color:"var(--text-muted)", cursor:loading?"not-allowed":"pointer", opacity:loading?0.5:1, fontSize:13 }}>⟳</button>
+          <button onClick={fetchProviders} disabled={loading} style={{
+            width:30, height:30, display:"flex", alignItems:"center", justifyContent:"center",
+            borderRadius:7, border:"1px solid var(--border)", background:"var(--bg-card)",
+            color:"var(--text-muted)", cursor:loading?"not-allowed":"pointer",
+            opacity:loading?0.5:1, fontSize:14,
+          }}>⟳</button>
         </div>
       </div>
 
-      {/* Map area — touch-action none for globe interaction */}
-      <div style={{ height:"57vh", minHeight:280, position:"relative", overflow:"hidden",
-                    flexShrink:0, touchAction:"none" }}>
+      {/* ── Map area ─────────────────────────────────────────────────────────
+          No explicit box frame — map bleeds edge-to-edge like gMonads.
+          flex:"0 0 62vh" → directory gets ~38vh which shows 6-8 SP rows.     */}
+      <div style={{ flex:"0 0 62vh", position:"relative", touchAction:"none", overflow:"hidden" }}>
         {error && (
-          <div style={{ position:"absolute", top:8, left:"50%", transform:"translateX(-50%)", zIndex:30,
-                        background:"rgba(239,68,68,0.12)", border:"1px solid rgba(239,68,68,0.35)",
-                        borderRadius:7, padding:"5px 12px", fontFamily:"monospace", fontSize:11,
-                        color:"#ef4444", display:"flex", alignItems:"center", gap:7, whiteSpace:"nowrap",
-                        backdropFilter:"blur(8px)" }}>
+          <div style={{
+            position:"absolute", top:10, left:"50%", transform:"translateX(-50%)", zIndex:30,
+            background:"rgba(239,68,68,0.12)", border:"1px solid rgba(239,68,68,0.35)",
+            borderRadius:7, padding:"6px 14px",
+            fontFamily:"var(--font-mono,'Roboto Mono',monospace)", fontSize:12,
+            color:"#ef4444", display:"flex", alignItems:"center", gap:8,
+            backdropFilter:"blur(8px)",
+          }}>
             ⚠ {error.slice(0,60)}
-            <button onClick={fetchProviders} style={{ background:"none", border:"none", color:"#ef4444",
-                                                       cursor:"pointer", fontSize:10, textDecoration:"underline" }}>Retry</button>
+            <button onClick={fetchProviders} style={{ background:"none", border:"none",
+              color:"#ef4444", cursor:"pointer", fontSize:11, textDecoration:"underline",
+              fontFamily:"inherit" }}>Retry</button>
           </div>
         )}
 
@@ -560,17 +584,17 @@ export default function MapPage() {
               onZoomOut={() => globeRef.current?.zoomOut()}
               onReset={() => globeRef.current?.reset()}
             />
-            <div style={{ position:"absolute", bottom:8, right:8, zIndex:10,
-                          background:"rgba(8,2,14,0.82)", border:"1px solid rgba(255,119,201,0.18)",
-                          borderRadius:5, padding:"2px 8px", fontFamily:"monospace", fontSize:8,
-                          color:"rgba(255,119,201,0.45)", backdropFilter:"blur(8px)" }}>
+            <div style={{
+              position:"absolute", bottom:10, right:12, zIndex:10, pointerEvents:"none",
+              fontFamily:"var(--font-mono,'Roboto Mono',monospace)", fontSize:9,
+              color:"rgba(255,119,201,0.45)",
+            }}>
               🇻🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
             </div>
-            {/* ref wired so zoom/reset buttons (GlobeLegendAndZoom) reach the canvas */}
-            <Globe 
+            <Globe
               ref={globeRef}
-              markers={globeMarkers} 
-              autoRotate 
+              markers={globeMarkers}
+              autoRotate
               interactive
               style={{ width:"100%", height:"100%" }}
             />
@@ -578,49 +602,25 @@ export default function MapPage() {
         )}
 
         {mode === "flat" && (
-          // Flat map with dark pink ocean + pink land (matches globe)
-          // WorldMapInner uses react-simple-maps; we override colors via CSS vars
           <div
-            style={{ width:"100%", height:"100%", background:"#120418", position:"relative" }}
-            onWheel={(e) => e.stopPropagation()}   // prevent page scroll while zooming map
+            style={{ width:"100%", height:"100%", position:"relative",
+                     background:"var(--bg-primary)" }}
+            onWheel={(e) => e.stopPropagation()}
           >
-            <style>{`
-              /* Override react-simple-maps geography fill to match globe pink */
-              .rsm-geography { fill: #ff77c9 !important; stroke: rgba(255,40,155,0.4) !important; }
-              .rsm-geography:hover { fill: #ff99d6 !important; }
-            `}</style>
             <SpInfoPanel providers={providers} loading={loading}/>
-            {/* Flat map zoom/reset buttons */}
-            <div style={{ position:"absolute", top:12, right:12, zIndex:20, display:"flex", flexDirection:"column", gap:3 }}>
-              {/* Legend */}
-              <div style={{ background:"rgba(8,2,14,0.88)", border:"1px solid rgba(255,119,201,0.2)",
-                            borderRadius:9, padding:"9px 11px", backdropFilter:"blur(12px)", marginBottom:3 }}>
-                <div style={{ fontSize:8, fontWeight:700, fontFamily:"monospace", textTransform:"uppercase",
-                              letterSpacing:"0.1em", color:"rgba(255,119,201,0.45)", marginBottom:5 }}>Legend</div>
-                {[
-                  { color:"#ffffff", label:"Healthy" },
-                  { color:"#a855f7", label:"Waitlisted" },
-                  { color:"#f97316", label:"Leaving" },
-                  { color:"#ef4444", label:"Faulty" },
-                ].map(({ color, label }) => (
-                  <div key={label} style={{ display:"flex", alignItems:"center", gap:6, marginBottom:4 }}>
-                    <span style={{ width:7, height:7, background:color, display:"inline-block", transform:"rotate(45deg)", boxShadow:`0 0 4px ${color}88`, flexShrink:0 }}/>
-                    <span style={{ fontFamily:"monospace", fontSize:10, color:"rgba(255,255,255,0.5)" }}>{label}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div style={{ position:"absolute", bottom:8, right:8, zIndex:10, fontFamily:"monospace",
-                          fontSize:8, color:"rgba(255,119,201,0.4)" }}>
-              🇻🇳 Hoàng Sa · Trường Sa
-            </div>
             <ProviderMap providers={providers}/>
           </div>
         )}
       </div>
 
-      {/* Directory — scrollable */}
-      <div style={{ flex:1, overflowY:"auto", borderTop:"1px solid var(--border)" }}>
+      {/* ── Provider Directory ───────────────────────────────────────────────
+          flex:1 + minHeight:0 → takes all space below the map, fully scrollable.
+          No heavy top border — a subtle line separates sections.              */}
+      <div style={{
+        flex:1, overflowY:"auto", minHeight:0,
+        borderTop:"1px solid var(--border)",
+        fontFamily:"var(--font-body,'Inter',system-ui,sans-serif)",
+      }}>
         <ProviderDirectory providers={providers} loading={loading} onRefresh={fetchProviders}/>
       </div>
     </div>

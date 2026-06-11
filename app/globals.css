@@ -67,10 +67,29 @@
   --toggle-thumb:         #ffffff;
   --toggle-active:        #322313;
 
-  /* Fonts */
-  --font-display:         'Britti Sans', 'Georgia', serif;
-  --font-sans:            'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-  --font-mono:            'Roboto Mono', 'Menlo', monospace;
+:root {
+  /* Font families */
+  --font-headline: 'Britti Sans', 'DM Sans', 'Helvetica Neue', Arial, sans-serif;
+  --font-body:     'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono:     'Roboto Mono', 'SF Mono', 'Fira Code', monospace;
+}
+
+/* Apply globally */
+body {
+  font-family: var(--font-body);
+}
+ 
+h1, h2, h3, h4, h5, h6,
+.headline, [data-headline] {
+  font-family: var(--font-headline);
+  letter-spacing: -0.02em;
+}
+ 
+code, pre, kbd,
+.mono, [data-mono],
+button, label, .badge, .tag {
+  font-family: var(--font-mono);
+}
 
   /* Nav */
   --nav-h:                60px;

@@ -1,5 +1,5 @@
 "use client";
-// app/map/page.tsx — v7.4
+// app/map/page.tsx — v7.5
 // Changes from v7.2:
 // 7. Map area: height 70vh → 57vh so Provider Directory is proportionally visible
 // 8. Flatmap: onWheel stopPropagation — wheel-zoom no longer scrolls the page
@@ -28,6 +28,8 @@ type GlobeWithRef = React.ForwardRefExoticComponent<
     autoRotate?:    boolean;
     interactive?:   boolean;
     onMarkerClick?: (m: GlobeMarker) => void;
+    /* NEW LOGIC: Bổ sung định nghĩa cho onMarkerHover để sửa lỗi ts(2322) */
+    onMarkerHover?: (m: GlobeMarker | null, x: number, y: number) => void;
     className?:     string;
     style?:         React.CSSProperties;
   } & React.RefAttributes<GlobeHandle>
@@ -467,6 +469,9 @@ export default function MapPage() {
   
   // NEW LOGIC: Khởi tạo tham chiếu cho Globe
   const globeRef = useRef<GlobeHandle>(null);
+  const [globeTooltip, setGlobeTooltip] = React.useState<{
+    marker: GlobeMarker; x: number; y: number;
+  } | null>(null);
 
   const fetchProviders = useCallback(async () => {
     setError(null);
@@ -589,15 +594,61 @@ export default function MapPage() {
               fontFamily:"var(--font-mono,'Roboto Mono',monospace)", fontSize:9,
               color:"rgba(255,119,201,0.45)",
             }}>
-              🇻🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
+              🇲🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
             </div>
+
+            {/* Gradient fade at bottom — removes hard rectangular frame edge */}
+            <div style={{
+              position:"absolute", bottom:0, left:0, right:0, height:72,
+              background:"linear-gradient(to bottom, transparent, var(--bg-primary))",
+              zIndex:6, pointerEvents:"none",
+            }}/>
+
             <Globe
               ref={globeRef}
               markers={globeMarkers}
               autoRotate
               interactive
               style={{ width:"100%", height:"100%" }}
+              onMarkerHover={(marker, x, y) =>
+                setGlobeTooltip(marker ? { marker, x, y } : null)
+              }
             />
+
+            {/* Globe hover tooltip */}
+            {globeTooltip && (
+              <div style={{
+                position:"fixed",
+                left: globeTooltip.x + 14,
+                top:  globeTooltip.y - 10,
+                zIndex: 200,
+                background:"rgba(6,6,20,0.95)",
+                border:"1px solid rgba(255,119,201,0.35)",
+                borderRadius:9, padding:"9px 13px",
+                backdropFilter:"blur(12px)",
+                boxShadow:"0 4px 20px rgba(0,0,0,0.5)",
+                fontFamily:"var(--font-mono,'Roboto Mono',monospace)",
+                fontSize:11, color:"#e2e8f0",
+                pointerEvents:"none", minWidth:170,
+              }}>
+                <div style={{ fontWeight:700, color:"#ff77c9", marginBottom:5, fontSize:12 }}>
+                  {globeTooltip.marker.az || "Unknown AZ"}
+                </div>
+                <div style={{ color:"rgba(255,255,255,0.45)", fontSize:9, marginBottom:6 }}>
+                  {globeTooltip.marker.address.slice(0,6)}…{globeTooltip.marker.address.slice(-6)}
+                </div>
+                <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                  <span style={{
+                    width:6, height:6, display:"inline-block", transform:"rotate(45deg)",
+                    background: globeTooltip.marker.health === "Healthy" ? "#22c55e"
+                              : globeTooltip.marker.health === "Faulty"  ? "#ef4444"
+                              : "#a855f7",
+                    flexShrink:0,
+                  }}/>
+                  <span style={{ color:"rgba(255,255,255,0.6)" }}>{globeTooltip.marker.health}</span>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -609,6 +660,12 @@ export default function MapPage() {
           >
             <SpInfoPanel providers={providers} loading={loading}/>
             <ProviderMap providers={providers}/>
+            {/* Gradient fade — removes hard bottom frame edge */}
+            <div style={{
+              position:"absolute", bottom:0, left:0, right:0, height:48,
+              background:"linear-gradient(to bottom, transparent, var(--bg-primary))",
+              zIndex:6, pointerEvents:"none",
+            }}/>
           </div>
         )}
       </div>
@@ -618,7 +675,7 @@ export default function MapPage() {
           No heavy top border — a subtle line separates sections.              */}
       <div style={{
         flex:1, overflowY:"auto", minHeight:0,
-        borderTop:"1px solid var(--border)",
+        /* No borderTop — gradient fade on map bottom creates seamless join */
         fontFamily:"var(--font-body,'Inter',system-ui,sans-serif)",
       }}>
         <ProviderDirectory providers={providers} loading={loading} onRefresh={fetchProviders}/>

@@ -1,5 +1,5 @@
 "use client";
-// components/ui/globe.tsx — v8.2
+// components/ui/globe.tsx — v8.3
 // v8.1 → v8.2: Hoàng Sa + Trường Sa rendered as per-island dot scatter
 //   (replaces single circle per group; matches actual archipelago layout)
 //   [1] Full sphere visible — radius = min(W,H) × 0.46, translate to canvas center
@@ -64,10 +64,15 @@ export interface GlobeMarker {
 }
 
 interface GlobeProps {
-  markers?: GlobeMarker[];
-  autoRotate?: boolean;
+  markers?:       GlobeMarker[];
+  autoRotate?:    boolean;
   onMarkerClick?: (marker: GlobeMarker) => void;
-  className?: string;
+  /** Called every RAF frame when the hovered marker changes.
+   *  screenX/screenY are client-space coordinates (for tooltip positioning). */
+  onMarkerHover?: (marker: GlobeMarker | null, screenX: number, screenY: number) => void;
+  className?:     string;
+  interactive?:   boolean;
+  style?:         React.CSSProperties;
 }
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
@@ -178,7 +183,10 @@ export default function Globe({
   markers = [],
   autoRotate = true,
   onMarkerClick,
+  onMarkerHover,
   className = "",
+  interactive = true,
+  style,
 }: GlobeProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef    = useRef<HTMLCanvasElement>(null);
@@ -188,6 +196,12 @@ export default function Globe({
 
   // [1] Rotation state — stored in ref to avoid re-render on each frame
   const rotRef = useRef<[number, number]>([-20, -25]);
+
+  // Hover tracking — stored in refs so RAF loop can read without stale closure
+  const mouseCanvasRef  = useRef<[number, number] | null>(null); // canvas-local coords
+  const prevHoverRef    = useRef<GlobeMarker | null>(null);
+  const onMarkerHoverRef = useRef(onMarkerHover);
+  useEffect(() => { onMarkerHoverRef.current = onMarkerHover; }, [onMarkerHover]);
 
   // [6] Drag state
   const dragRef = useRef({
@@ -363,6 +377,37 @@ export default function Globe({
         rotRef.current = [rotRef.current[0] + AUTO_RPM, rotRef.current[1]];
       }
       draw();
+
+      // ── Hover hit-test (runs every frame, O(n) markers) ──────────────────
+      // Reading from refs avoids stale closure; no setState → no re-render.
+      if (onMarkerHoverRef.current && mouseCanvasRef.current && containerRef.current) {
+        const [mx, my] = mouseCanvasRef.current;
+        const ctr = containerRef.current;
+        const W = ctr.clientWidth;
+        const H = ctr.clientHeight;
+        const radius = Math.min(W, H) * 0.46;
+        const rot    = rotRef.current;
+        const proj   = geoOrthographic()
+          .scale(radius).translate([W / 2, H / 2])
+          .rotate([rot[0], rot[1], 0]).clipAngle(90);
+
+        let hit: GlobeMarker | null = null;
+        for (const m of markers) {
+          if (!isVisible(m.lng, m.lat, rot)) continue;
+          const pt = proj([m.lng, m.lat]);
+          if (!pt) continue;
+          const dx = mx - pt[0];
+          const dy = my - pt[1];
+          if (Math.sqrt(dx * dx + dy * dy) < 18) { hit = m; break; }
+        }
+
+        if (hit !== prevHoverRef.current) {
+          prevHoverRef.current = hit;
+          const rect = ctr.getBoundingClientRect();
+          onMarkerHoverRef.current(hit, rect.left + mx, rect.top + my);
+        }
+      }
+
       rafRef.current = requestAnimationFrame(loop);
     };
 
@@ -393,17 +438,28 @@ export default function Globe({
   }, []);
 
   const onMouseMove = useCallback((e: React.MouseEvent) => {
+    // Always track mouse position for hover hit-test
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (rect) {
+      mouseCanvasRef.current = [e.clientX - rect.left, e.clientY - rect.top];
+    }
     if (!dragRef.current.active) return;
     const dx = e.clientX - dragRef.current.sx;
     const dy = e.clientY - dragRef.current.sy;
     rotRef.current = [
-      dragRef.current.sr[0] + dx * SENSITIVITY,                            // [6] + not −
+      dragRef.current.sr[0] + dx * SENSITIVITY,
       Math.max(-90, Math.min(90, dragRef.current.sr[1] - dy * SENSITIVITY)),
     ];
   }, []);
 
   const endDrag = useCallback(() => {
     dragRef.current.active = false;
+    // Clear hover when mouse leaves
+    mouseCanvasRef.current = null;
+    if (prevHoverRef.current) {
+      prevHoverRef.current = null;
+      onMarkerHoverRef.current?.(null, 0, 0);
+    }
   }, []);
 
   /* Touch equivalents */
@@ -471,10 +527,11 @@ export default function Globe({
       ref={containerRef}
       className={`relative w-full h-full overflow-hidden select-none ${className}`}
       style={{
-        // Deep-space background — radial so centre is lighter (galaxy core feel)
         background: "radial-gradient(ellipse at 50% 42%, #0d0d2b 0%, #050510 80%)",
+        cursor: interactive ? "grab" : "default",
+        ...style,
       }}
-      onMouseDown={onMouseDown}
+      onMouseDown={interactive ? onMouseDown : undefined}
       onMouseMove={onMouseMove}
       onMouseUp={endDrag}
       onMouseLeave={endDrag}

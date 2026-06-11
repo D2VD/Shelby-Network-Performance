@@ -1,6 +1,6 @@
 "use client";
 /**
- * components/world-map-inner.tsx — v8.1
+ * components/world-map-inner.tsx — v8.2
  *
  * Changes vs v8.0:
  *  6. SP marker color: Healthy #ff77c9 → #ffffff (white) so markers contrast
@@ -119,10 +119,14 @@ function ClusterMarker({
   cluster,
   isDark,
   onClick,
+  onHover,
+  onLeave,
 }: {
   cluster: Cluster;
   isDark: boolean;
-  onClick: (c: Cluster) => void;
+  onClick:  (c: Cluster) => void;
+  onHover:  (c: Cluster) => void;
+  onLeave:  () => void;
 }) {
   const [hovered, setHovered] = useState(false);
   const color  = HEALTH_COLOR[cluster.health] ?? "#94a3b8";
@@ -133,8 +137,8 @@ function ClusterMarker({
     <Marker
       coordinates={[cluster.lng, cluster.lat]}
       onClick={() => onClick(cluster)}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      onMouseEnter={() => { setHovered(true);  onHover(cluster); }}
+      onMouseLeave={() => { setHovered(false); onLeave(); }}
     >
       {/* FIX: Use SVG transform attribute on <g>, NOT CSS style on <rect>.
           CSS rotate() on an SVG element rotates around the SVG viewport
@@ -253,13 +257,20 @@ export default function WorldMapInner({
     };
   }, [scale]);
 
-  // ── Handle cluster click → show tooltip or fire onProviderClick ─────────
+  // ── Cluster hover → show tooltip immediately; click for single SP ───────
+  const handleClusterHover = useCallback((cluster: Cluster) => {
+    setTooltip({ cluster, x: 0, y: 0 });
+  }, []);
+
+  const handleClusterLeave = useCallback(() => {
+    setTooltip(null);
+  }, []);
+
   const handleClusterClick = useCallback((cluster: Cluster) => {
     if (cluster.providers.length === 1) {
       onProviderClick?.(cluster.providers[0]);
-      return;
     }
-    setTooltip(prev => prev?.cluster.key === cluster.key ? null : { cluster, x: 0, y: 0 });
+    // multi-node clusters: tooltip already shown on hover; click is a no-op
   }, [onProviderClick]);
 
   const landColor  = isDark ? "rgba(255,100,180,0.75)"  : "#ec4899";
@@ -316,6 +327,8 @@ export default function WorldMapInner({
             cluster={cluster}
             isDark={isDark}
             onClick={handleClusterClick}
+            onHover={handleClusterHover}
+            onLeave={handleClusterLeave}
           />
         ))}
 

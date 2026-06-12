@@ -1,5 +1,5 @@
 "use client";
-// components/ui/globe.tsx — v8.3
+// components/ui/globe.tsx — v8.4
 // v8.1 → v8.2: Hoàng Sa + Trường Sa rendered as per-island dot scatter
 //   (replaces single circle per group; matches actual archipelago layout)
 //   [1] Full sphere visible — radius = min(W,H) × 0.46, translate to canvas center
@@ -212,7 +212,16 @@ export default function Globe({
   });
 
   const rafRef  = useRef<number>(0);
-  const t0Ref   = useRef(Date.now());           // animation start time
+  const t0Ref   = useRef(Date.now());
+
+  // Smooth zoom — lerped each frame toward the target
+  const zoomRef       = useRef(1);         // current (smoothed) zoom
+  const zoomTargetRef = useRef(1);         // desired zoom (set by wheel)
+
+  // Rotation momentum — accumulated during drag, damped each frame
+  const velRef        = useRef<[number, number]>([0, 0]);
+  const lastMouseRef  = useRef<[number, number] | null>(null);
+
   const [loaded, setLoaded] = useState(false);
 
   /* ── Load world atlas TopoJSON ─────────────────────────────────────────── */
@@ -250,7 +259,7 @@ export default function Globe({
     if (!ctx) return;
 
     // [1] Radius: fit full sphere in both dimensions
-    const radius = Math.min(W, H) * 0.46;
+    const radius = Math.min(W, H) * 0.46 * zoomRef.current;
     const rot    = rotRef.current;
 
     const proj = geoOrthographic()
@@ -372,10 +381,20 @@ export default function Globe({
     if (!loaded) return;
 
     const loop = () => {
-      // Auto-rotate when idle
-      if (autoRotate && !dragRef.current.active) {
-        rotRef.current = [rotRef.current[0] + AUTO_RPM, rotRef.current[1]];
+      // ── Smooth zoom interpolation ───────────────────────────────────────
+      zoomRef.current += (zoomTargetRef.current - zoomRef.current) * 0.12;
+
+      // ── Rotation: auto-rotate OR momentum after drag ────────────────────
+      if (!dragRef.current.active) {
+        // Apply momentum velocity (damped each frame)
+        rotRef.current = [
+          rotRef.current[0] + (autoRotate ? AUTO_RPM : 0) + velRef.current[0],
+          Math.max(-90, Math.min(90, rotRef.current[1] + velRef.current[1])),
+        ];
+        // Dampen velocity
+        velRef.current = [velRef.current[0] * 0.92, velRef.current[1] * 0.92];
       }
+
       draw();
 
       // ── Hover hit-test (runs every frame, O(n) markers) ──────────────────
@@ -385,7 +404,7 @@ export default function Globe({
         const ctr = containerRef.current;
         const W = ctr.clientWidth;
         const H = ctr.clientHeight;
-        const radius = Math.min(W, H) * 0.46;
+        const radius = Math.min(W, H) * 0.46 * zoomRef.current;
         const rot    = rotRef.current;
         const proj   = geoOrthographic()
           .scale(radius).translate([W / 2, H / 2])
@@ -424,26 +443,56 @@ export default function Globe({
     return () => ro.disconnect();
   }, [draw]);
 
+  /* ── Scroll-wheel zoom (non-passive so preventDefault works) ─────────── */
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || !interactive) return;
+    const handler = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const factor = e.ctrlKey ? 0.05 : 0.09; // trackpad pinch vs mouse wheel
+      const dir    = e.deltaY < 0 ? 1 : -1;
+      zoomTargetRef.current = Math.max(0.35, Math.min(3.5,
+        zoomTargetRef.current * (1 + dir * factor)
+      ));
+    };
+    el.addEventListener("wheel", handler, { passive: false });
+    return () => el.removeEventListener("wheel", handler);
+  }, [interactive]);
+
   /* ── [6] Drag: RIGHT drag → positive Δlambda → globe rotates RIGHT ──────
      Previous bug: rotRef.current[0] -= dx * SENSITIVITY  (inverted)
      Fixed:        rotRef.current[0] += dx * SENSITIVITY  (natural)        */
 
   const onMouseDown = useCallback((e: React.MouseEvent) => {
+    if (!interactive) return;
     dragRef.current = {
       active: true,
       sx: e.clientX,
       sy: e.clientY,
       sr: [...rotRef.current] as [number, number],
     };
-  }, []);
+    velRef.current = [0, 0];         // kill momentum on new drag
+    lastMouseRef.current = [e.clientX, e.clientY];
+  }, [interactive]);
 
   const onMouseMove = useCallback((e: React.MouseEvent) => {
-    // Always track mouse position for hover hit-test
+    // Always track canvas position for hover hit-test (even without drag)
     const rect = canvasRef.current?.getBoundingClientRect();
     if (rect) {
       mouseCanvasRef.current = [e.clientX - rect.left, e.clientY - rect.top];
     }
     if (!dragRef.current.active) return;
+
+    // Track per-frame velocity for momentum after drag ends
+    if (lastMouseRef.current) {
+      velRef.current = [
+        (e.clientX - lastMouseRef.current[0]) * SENSITIVITY * 0.25,
+        -(e.clientY - lastMouseRef.current[1]) * SENSITIVITY * 0.25,
+      ];
+    }
+    lastMouseRef.current = [e.clientX, e.clientY];
+
     const dx = e.clientX - dragRef.current.sx;
     const dy = e.clientY - dragRef.current.sy;
     rotRef.current = [
@@ -454,7 +503,9 @@ export default function Globe({
 
   const endDrag = useCallback(() => {
     dragRef.current.active = false;
-    // Clear hover when mouse leaves
+    lastMouseRef.current = null;
+    // velocity carries through → globe coasts naturally after release
+    // clear hover state
     mouseCanvasRef.current = null;
     if (prevHoverRef.current) {
       prevHoverRef.current = null;
@@ -464,6 +515,7 @@ export default function Globe({
 
   /* Touch equivalents */
   const onTouchStart = useCallback((e: React.TouchEvent) => {
+    if (!interactive) return;
     const t = e.touches[0];
     dragRef.current = {
       active: true,
@@ -471,18 +523,27 @@ export default function Globe({
       sy: t.clientY,
       sr: [...rotRef.current] as [number, number],
     };
-  }, []);
+    velRef.current = [0, 0];
+    lastMouseRef.current = [t.clientX, t.clientY];
+  }, [interactive]);
 
   const onTouchMove = useCallback((e: React.TouchEvent) => {
     if (!dragRef.current.active) return;
     const t  = e.touches[0];
+    if (lastMouseRef.current) {
+      velRef.current = [
+        (t.clientX - lastMouseRef.current[0]) * SENSITIVITY * 0.25,
+        -(t.clientY - lastMouseRef.current[1]) * SENSITIVITY * 0.25,
+      ];
+    }
+    lastMouseRef.current = [t.clientX, t.clientY];
     const dx = t.clientX - dragRef.current.sx;
     const dy = t.clientY - dragRef.current.sy;
     rotRef.current = [
-      dragRef.current.sr[0] + dx * SENSITIVITY,                            // [6] + not −
+      dragRef.current.sr[0] + dx * SENSITIVITY,
       Math.max(-90, Math.min(90, dragRef.current.sr[1] - dy * SENSITIVITY)),
     ];
-  }, []);
+  }, [interactive]);
 
   /* Click → hit-test markers */
   const onClick = useCallback(
@@ -497,7 +558,7 @@ export default function Globe({
       const my     = e.clientY - rect.top;
       const W      = ctr.clientWidth;
       const H      = ctr.clientHeight;
-      const radius = Math.min(W, H) * 0.46;
+      const radius = Math.min(W, H) * 0.46 * zoomRef.current;
       const rot    = rotRef.current;
 
       const proj = geoOrthographic()

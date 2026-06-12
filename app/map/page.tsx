@@ -24,14 +24,13 @@ interface GlobeHandle {
 // compiles without ts2769 "no overload matches this call".
 type GlobeWithRef = React.ForwardRefExoticComponent<
   {
-    markers?:       GlobeMarker[];
-    autoRotate?:    boolean;
-    interactive?:   boolean;
-    onMarkerClick?: (m: GlobeMarker) => void;
-    /* NEW LOGIC: Bổ sung định nghĩa cho onMarkerHover để sửa lỗi ts(2322) */
-    onMarkerHover?: (m: GlobeMarker | null, x: number, y: number) => void;
-    className?:     string;
-    style?:         React.CSSProperties;
+    markers?:        GlobeMarker[];
+    autoRotate?:     boolean;
+    interactive?:    boolean;
+    onMarkerClick?:  (m: GlobeMarker) => void;
+    onMarkerHover?:  (marker: GlobeMarker | null, screenX: number, screenY: number) => void;
+    className?:      string;
+    style?:          React.CSSProperties;
   } & React.RefAttributes<GlobeHandle>
 >;
 
@@ -562,9 +561,9 @@ export default function MapPage() {
       </div>
 
       {/* ── Map area ─────────────────────────────────────────────────────────
-          No explicit box frame — map bleeds edge-to-edge like gMonads.
-          flex:"0 0 62vh" → directory gets ~38vh which shows 6-8 SP rows.     */}
-      <div style={{ flex:"0 0 62vh", position:"relative", touchAction:"none", overflow:"hidden" }}>
+          52vh → directory gets ~48vh (topbar 40px + stats 80px + 6-8 SP rows).
+          clamp bounds it so it never shrinks below 300px or grows beyond 500px. */}
+      <div style={{ flex:"0 0 clamp(300px,52vh,500px)", position:"relative", touchAction:"none", overflow:"hidden" }}>
         {error && (
           <div style={{
             position:"absolute", top:10, left:"50%", transform:"translateX(-50%)", zIndex:30,
@@ -594,7 +593,7 @@ export default function MapPage() {
               fontFamily:"var(--font-mono,'Roboto Mono',monospace)", fontSize:9,
               color:"rgba(255,119,201,0.45)",
             }}>
-              🇲🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
+              🇻🇳 Hoàng Sa · Trường Sa — Chủ quyền Việt Nam
             </div>
 
             {/* Gradient fade at bottom — removes hard rectangular frame edge */}

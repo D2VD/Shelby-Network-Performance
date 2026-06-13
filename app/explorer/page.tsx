@@ -1,32 +1,50 @@
 "use client";
 /**
- * app/explorer/page.tsx — v2.1
+ * app/explorer/page.tsx — v3.0
  *
- * Changes vs v2.0:
- *  - handleSearch: 0x addresses now route to Transactions tab (were wrongly
- *    routing to SP Directory / leaderboard tab — root cause of "wallet search
- *    shows SP list" bug)
- *  - TransactionsTab: accepts optional `address` prop; includes it in the
- *    fetch URL so the VPS can filter transactions by sender address
- *  - TransactionsTab + BlobsTab: content-type guard added before r.json() so
- *    a 502/HTML response shows "Server returned 502" instead of
- *    "Unexpected token '<', <!DOCTYPE..."
+ * Two-flow architecture (pure Aptos Node REST API — no indexer required):
+ *
+ * FLOW 1 — 0x address (≥66 chars):
+ *   1.1 GET /api/node/account?address=&network=   → sequence_number (total tx count)
+ *   1.2 GET /api/node/transactions?address=&network=&limit=&cursor=  → tx list
+ *   Gas fee = (gas_used × gas_unit_price) / 100_000_000 APT
+ *
+ * FLOW 2 — version number (pure digits):
+ *   GET /api/node/transactions?version=&network=  → single tx + BlobRegisteredEvent parse
+ *   Also triggered by clicking any version link in Flow 1 results.
+ *
+ * Input rules (Fail Fast):
+ *   • starts with "0x" AND length ≥ 10  → Flow 1
+ *   • pure digits                        → Flow 2
+ *   • anything else                      → validation error
  */
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useNetwork } from "@/components/network-context";
 import { useTheme }   from "@/components/theme-context";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-interface TxRecord {
-  hash: string; version: string; type: string; sender: string;
-  success: boolean; timestamp: string; gasUsed: number;
+
+interface NormTx {
+  version:   string;
+  hash:      string;
+  type:      string;
+  fullFn:    string;
+  sender:    string;
+  success:   boolean;
+  gasFeeApt: string;
+  timestamp: string;
+  isShelby:  boolean;
 }
 
-interface BlobRecord {
-  blobId: string; owner: string; size: number;
-  status: "active" | "pending" | "deleted" | "unknown";
-  registeredAt: string;
+interface BlobEvent {
+  blobName:       string;
+  sizeBytes:      number;
+  sizeKB:         string;
+  encoding:       string;
+  chunksetCount:  string;
+  blobCommitment: string;
+  expiryDate:     string;
 }
 
 interface SpRecord {
@@ -35,607 +53,599 @@ interface SpRecord {
   ip?: string; geo?: { city?: string; countryCode?: string } | null;
 }
 
-type ExplorerTab = "transactions" | "blobs" | "leaderboard";
+type Tab = "transactions" | "blobs" | "directory";
 
-const PAGE_SIZE = 20;
+const PAGE = 25;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function addrShort(a: string): string {
-  return !a || a.length < 10 ? a : `${a.slice(0, 8)}…${a.slice(-5)}`;
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function short(s: string, head = 8, tail = 6): string {
+  if (!s || s.length <= head + tail + 3) return s;
+  return `${s.slice(0, head)}…${s.slice(-tail)}`;
 }
 
-function fmtBytes(b: number): string {
-  if (!b || b <= 0) return "—";
-  if (b >= 1e9) return `${(b / 1e9).toFixed(2)} GB`;
-  if (b >= 1e6) return `${(b / 1e6).toFixed(2)} MB`;
-  if (b >= 1e3) return `${(b / 1e3).toFixed(1)} KB`;
-  return `${b} B`;
+function fmtTime(microsStr: string): string {
+  const ms = parseInt(microsStr ?? "0");
+  if (!ms) return "—";
+  return new Date(ms / 1000).toLocaleString("en-GB", {
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    day: "2-digit", month: "2-digit", year: "numeric",
+  });
 }
 
-function fmtDate(ts: string): string {
-  if (!ts) return "—";
-  try {
-    return new Date(ts).toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-  } catch { return ts.slice(0, 16); }
-}
-
-function txTypeLabel(type: string): { label: string; color: string } {
-  if (type.includes("register_multiple_blobs")) return { label: "multi-blob",  color: "#2563eb" };
-  if (type.includes("register_blob"))           return { label: "register",    color: "#16a34a" };
-  if (type.includes("stage_code_chunk"))        return { label: "stage",       color: "#9333ea" };
-  if (type.includes("delete") || type.includes("unregister")) return { label: "delete", color: "#ef4444" };
-  if (type.includes("update_epoch"))            return { label: "epoch",       color: "#d97706" };
-  if (type.includes("join") || type.includes("register_sp"))  return { label: "join SP", color: "#0891b2" };
-  return { label: type.split("::").pop()?.slice(0, 16) ?? type.slice(0, 16), color: "#6b7280" };
-}
-
-// ─── Sub-components ───────────────────────────────────────────────────────────
-function CopyBtn({ text }: { text: string }) {
-  const [ok, setOk] = useState(false);
+function CopyBtn({ value }: { value: string }) {
+  const [done, setDone] = useState(false);
   return (
     <button
-      onClick={e => {
-        e.stopPropagation();
-        navigator.clipboard.writeText(text)
-          .then(() => { setOk(true); setTimeout(() => setOk(false), 1500); })
-          .catch(() => {});
-      }}
-      style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: ok ? "#22c55e" : "var(--text-dim)", padding: "0 3px" }}
-    >
-      {ok ? "✓" : "⧉"}
-    </button>
+      onClick={() => { navigator.clipboard.writeText(value).then(() => { setDone(true); setTimeout(() => setDone(false), 1500); }); }}
+      style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11,
+               color: done ? "#22c55e" : "var(--text-dim)", padding: "0 3px" }}
+      title="Copy full value"
+    >{done ? "✓" : "⎘"}</button>
   );
 }
 
-function StatusChip({ status }: { status: BlobRecord["status"] }) {
-  const MAP = {
-    active:  { bg: "rgba(34,197,94,0.1)",   color: "#22c55e", label: "Active"  },
-    pending: { bg: "rgba(245,158,11,0.1)",  color: "#f59e0b", label: "Pending" },
-    deleted: { bg: "rgba(239,68,68,0.1)",   color: "#ef4444", label: "Deleted" },
-    unknown: { bg: "rgba(100,116,139,0.1)", color: "#94a3b8", label: "?"       },
-  };
-  const s = MAP[status] ?? MAP.unknown;
+function Badge({ ok }: { ok: boolean }) {
   return (
-    <span style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 5, fontSize: 11, fontWeight: 600, background: s.bg, color: s.color, whiteSpace: "nowrap" }}>
-      <span style={{ width: 5, height: 5, borderRadius: "50%", background: s.color, display: "inline-block", flexShrink: 0 }} />
-      {s.label}
+    <span style={{ fontSize: 10, fontFamily: "var(--font-mono,'Roboto Mono',monospace)",
+                   fontWeight: 600, padding: "2px 7px", borderRadius: 4,
+                   background: ok ? "rgba(34,197,94,0.12)" : "rgba(239,68,68,0.12)",
+                   color: ok ? "#22c55e" : "#ef4444" }}>
+      {ok ? "Success" : "Failed"}
     </span>
-  );
-}
-
-function HealthChip({ health }: { health: string }) {
-  const color =
-    health === "Healthy"   ? "#22c55e" :
-    health === "Faulty" || health === "Unhealthy" ? "#ef4444" :
-    health === "Frozen"    ? "#3b82f6" :
-    "#f59e0b";
-  return (
-    <span style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 5, fontSize: 11, fontWeight: 600, background: `${color}18`, color, whiteSpace: "nowrap" }}>
-      <span style={{ width: 5, height: 5, borderRadius: "50%", background: color, flexShrink: 0 }} />
-      {health}
-    </span>
-  );
-}
-
-function Spinner() {
-  return (
-    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 48 }}>
-      <div style={{ width: 24, height: 24, borderRadius: "50%", border: "2px solid var(--border)", borderTopColor: "var(--accent)", animation: "exspin 0.8s linear infinite" }} />
-      <style>{`@keyframes exspin{to{transform:rotate(360deg)}}`}</style>
-    </div>
-  );
-}
-
-function SkeletonRows({ cols, rows = 8 }: { cols: number; rows?: number }) {
-  return (
-    <>
-      {Array.from({ length: rows }).map((_, i) => (
-        <tr key={i} style={{ borderBottom: "1px solid var(--border-soft)" }}>
-          {Array.from({ length: cols }).map((_, j) => (
-            <td key={j} style={{ padding: "10px 14px" }}>
-              <div
-                className="skeleton"
-                style={{ height: 14, borderRadius: 4, width: j === 0 ? "60%" : j === 1 ? "80%" : "70%" }}
-              />
-            </td>
-          ))}
-        </tr>
-      ))}
-    </>
   );
 }
 
 function EmptyState({ icon, title, sub }: { icon: string; title: string; sub?: string }) {
   return (
-    <div style={{ padding: "56px 20px", textAlign: "center", color: "var(--text-muted)" }}>
-      <div style={{ fontSize: 34, marginBottom: 10 }}>{icon}</div>
-      <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-secondary)", marginBottom: 4 }}>{title}</div>
-      {sub && <div style={{ fontSize: 12, color: "var(--text-dim)", maxWidth: 360, margin: "0 auto", lineHeight: 1.6 }}>{sub}</div>}
+    <div style={{ padding: "48px 24px", textAlign: "center" }}>
+      <div style={{ fontSize: 36, marginBottom: 12 }}>{icon}</div>
+      <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)", marginBottom: 6 }}>{title}</div>
+      {sub && <div style={{ fontSize: 12, color: "var(--text-muted)", maxWidth: 380, margin: "0 auto" }}>{sub}</div>}
     </div>
   );
 }
 
-function Pager({ hasPrev, hasNext, onPrev, onNext, loading }: {
-  hasPrev: boolean; hasNext: boolean; onPrev: () => void; onNext: () => void; loading: boolean;
-}) {
-  const btn = (disabled: boolean) => ({
-    padding: "6px 16px", borderRadius: 8, border: "1px solid var(--border)",
-    background: "var(--bg-card)", fontSize: 12, fontWeight: 600, cursor: disabled ? "not-allowed" : "pointer",
-    color: disabled ? "var(--text-dim)" : "var(--text-primary)", opacity: disabled ? 0.5 : 1,
-  });
+function Spinner() {
   return (
-    <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, padding: "12px 20px", borderTop: "1px solid var(--border)" }}>
-      <button onClick={onPrev} disabled={!hasPrev || loading} style={btn(!hasPrev || loading)}>← Prev</button>
-      <button onClick={onNext} disabled={!hasNext || loading} style={btn(!hasNext || loading)}>Next →</button>
+    <div style={{ padding: "48px 24px", textAlign: "center" }}>
+      <div style={{ width: 28, height: 28, border: "2px solid var(--border)",
+                    borderTopColor: "#ff77c9", borderRadius: "50%",
+                    animation: "spin 0.8s linear infinite", margin: "0 auto 12px" }}/>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+      <div style={{ fontSize: 12, color: "var(--text-muted)" }}>Loading…</div>
     </div>
   );
 }
 
-// ─── Transactions Tab ─────────────────────────────────────────────────────────
-function TransactionsTab({ network, address }: { network: string; address?: string }) {
-  const [txs,     setTxs]     = useState<TxRecord[]>([]);
+// ─── Flow 1: Account + Transactions ──────────────────────────────────────────
+
+function AccountPanel({ address, network, onVersionClick }: {
+  address: string;
+  network: string;
+  onVersionClick: (v: string) => void;
+}) {
+  const [seqNum,  setSeqNum]  = useState<string | null>(null);
+  const [txs,     setTxs]     = useState<NormTx[]>([]);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState<string | null>(null);
-  const cursorStack            = useRef<string[]>([""]);
-  const [cursorIdx, setCursorIdx] = useState(0);
+  const [cursor,  setCursor]  = useState("");
+  const [nextCursor, setNext] = useState("");
+  const [cursorHistory, setHistory] = useState<string[]>([""]);
   const alive = useRef(true);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
-  const load = useCallback(async (cursor: string) => {
-    if (alive.current) { setLoading(true); setError(null); }
+  const load = useCallback(async (cur: string) => {
+    if (!alive.current) return;
+    setLoading(true); setError(null);
     try {
-      const params = new URLSearchParams({ network, cursor });
-      if (address) params.set("address", address);
-      const r = await fetch(
-        `/api/network/transactions?${params}`,
-        { signal: AbortSignal.timeout(15_000) }
-      );
-      // Guard: if the proxy returns HTML (e.g. 404/502 page), surface a clean error
-      const ct = r.headers.get("content-type") ?? "";
-      if (!ct.includes("application/json")) {
-        throw new Error(`Server returned ${r.status} — check VPS connection`);
-      }
-      const j = await r.json() as { ok: boolean; txs?: TxRecord[]; nextCursor?: string; error?: string };
+      // 1.1 — account info (sequence_number)
+      const accRes  = await fetch(`/api/node/account?address=${address}&network=${network}`);
+      const accJson = await accRes.json() as { ok: boolean; sequenceNumber?: string; error?: string; activated?: boolean };
       if (!alive.current) return;
-      if (!j.ok) throw new Error(j.error ?? "Request failed");
-      setTxs(j.txs ?? []);
-      if ((j.nextCursor ?? "") && cursorStack.current[cursorIdx + 1] !== j.nextCursor) {
-        cursorStack.current = [...cursorStack.current.slice(0, cursorIdx + 1), j.nextCursor!];
+
+      if (!accJson.ok && accJson.activated === false) {
+        setError(accJson.error ?? "Account not activated");
+        setLoading(false);
+        return;
       }
+      if (accJson.ok) setSeqNum(accJson.sequenceNumber ?? null);
+
+      // 1.2 — transaction list
+      const params = new URLSearchParams({ address, network, limit: String(PAGE) });
+      if (cur) params.set("cursor", cur);
+      const txRes  = await fetch(`/api/node/transactions?${params}`);
+      const txJson = await txRes.json() as { ok: boolean; txs?: NormTx[]; nextCursor?: string; note?: string; error?: string };
+      if (!alive.current) return;
+
+      if (!txJson.ok) throw new Error(txJson.error ?? "Failed to load transactions");
+      setTxs(txJson.txs ?? []);
+      setNext(txJson.nextCursor ?? "");
     } catch (e: unknown) {
       if (alive.current) setError((e as Error).message);
     } finally {
       if (alive.current) setLoading(false);
     }
-  }, [network, address, cursorIdx]);
+  }, [address, network]);
 
-  useEffect(() => {
-    cursorStack.current = [""];
-    setCursorIdx(0);
-    setTxs([]);
-    load("");
-  }, [network, address]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setSeqNum(null); setTxs([]); setCursor(""); setNext(""); setHistory([""]); load(""); },
+    [address, network]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const goNext = () => {
-    const next = cursorStack.current[cursorIdx + 1];
-    if (next !== undefined) { setCursorIdx(i => i + 1); load(next); }
+    if (!nextCursor) return;
+    setHistory(h => [...h, nextCursor]);
+    setCursor(nextCursor);
+    load(nextCursor);
   };
   const goPrev = () => {
-    const prev = cursorStack.current[cursorIdx - 1];
-    if (prev !== undefined) { setCursorIdx(i => i - 1); load(prev); }
+    const prev = cursorHistory.at(-2) ?? "";
+    setHistory(h => h.slice(0, -1));
+    setCursor(prev);
+    load(prev);
   };
 
-  if (error) return <EmptyState icon="⚠️" title="Failed to load transactions" sub={error} />;
+  if (error) return <EmptyState icon="⚠️" title="Account lookup failed" sub={error}/>;
+  if (loading) return <Spinner/>;
+
+  const mono: React.CSSProperties = { fontFamily: "var(--font-mono,'Roboto Mono',monospace)" };
 
   return (
     <div>
-      <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-          <thead>
-            <tr style={{ background: "var(--bg-card2)", borderBottom: "1px solid var(--border)" }}>
-              {["VERSION", "TYPE", "SENDER", "STATUS", "GAS", "TIME"].map(h => (
-                <th key={h} style={{ padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.07em", whiteSpace: "nowrap" }}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {loading
-              ? <SkeletonRows cols={6} />
-              : txs.length === 0
-              ? <tr><td colSpan={6}><EmptyState icon="📭" title="No transactions found" sub="The indexer may still be syncing." /></td></tr>
-              : txs.map((tx, i) => {
-                  const { label, color } = txTypeLabel(tx.type);
-                  return (
-                    <tr key={tx.version || i} style={{ borderBottom: "1px solid var(--border-soft)", background: i % 2 === 0 ? "var(--bg-card)" : "var(--bg-card2)" }}>
-                      <td style={{ padding: "10px 14px" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                          <span style={{ fontFamily: "monospace", fontSize: 12, color: "var(--accent)" }}>v{tx.version}</span>
-                          <CopyBtn text={tx.version} />
-                        </div>
-                      </td>
-                      <td style={{ padding: "10px 14px" }}>
-                        <span style={{ fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 4, background: `${color}18`, color }}>{label}</span>
-                      </td>
-                      <td style={{ padding: "10px 14px" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                          <span style={{ fontFamily: "monospace", fontSize: 11, color: "var(--text-muted)" }}>{addrShort(tx.sender)}</span>
-                          {tx.sender && <CopyBtn text={tx.sender} />}
-                        </div>
-                      </td>
-                      <td style={{ padding: "10px 14px" }}>
-                        <span style={{ fontSize: 11, fontWeight: 600, color: tx.success ? "#22c55e" : "#ef4444" }}>
-                          {tx.success ? "✓ OK" : "✗ Fail"}
-                        </span>
-                      </td>
-                      <td style={{ padding: "10px 14px", fontFamily: "monospace", fontSize: 12, color: "var(--text-muted)" }}>
-                        {tx.gasUsed ? tx.gasUsed.toLocaleString("en-US") : "—"}
-                      </td>
-                      <td style={{ padding: "10px 14px", fontSize: 11, color: "var(--text-dim)", fontFamily: "monospace", whiteSpace: "nowrap" }}>
-                        {fmtDate(tx.timestamp)}
-                      </td>
-                    </tr>
-                  );
-                })
-            }
-          </tbody>
-        </table>
+      {/* Account info bar */}
+      <div style={{ display: "flex", alignItems: "center", gap: 24, padding: "10px 16px",
+                    background: "var(--bg-card)", borderBottom: "1px solid var(--border)",
+                    flexWrap: "wrap" }}>
+        <div>
+          <div style={{ ...mono, fontSize: 10, color: "var(--text-muted)", marginBottom: 2 }}>ADDRESS</div>
+          <div style={{ ...mono, fontSize: 12, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: 4 }}>
+            {short(address, 10, 8)}<CopyBtn value={address}/>
+          </div>
+        </div>
+        {seqNum !== null && (
+          <div>
+            <div style={{ ...mono, fontSize: 10, color: "var(--text-muted)", marginBottom: 2 }}>TOTAL TXS</div>
+            <div style={{ ...mono, fontSize: 14, fontWeight: 700, color: "#ff77c9" }}>
+              {parseInt(seqNum).toLocaleString("en-US")}
+            </div>
+          </div>
+        )}
+        <div style={{ marginLeft: "auto", ...mono, fontSize: 10, color: "var(--text-muted)" }}>
+          Showing last {PAGE} · click version to inspect blob data
+        </div>
       </div>
-      <Pager
-        hasPrev={cursorIdx > 0}
-        hasNext={!!cursorStack.current[cursorIdx + 1]}
-        onPrev={goPrev}
-        onNext={goNext}
-        loading={loading}
-      />
+
+      {/* Transaction table */}
+      {txs.length === 0 ? (
+        <EmptyState icon="📭" title="No transactions found"
+          sub="This address has not submitted any transactions on this network."/>
+      ) : (
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+            <thead>
+              <tr style={{ background: "var(--bg-card2)" }}>
+                {["VERSION","TYPE","GAS (APT)","STATUS","TIME"].map(h => (
+                  <th key={h} style={{ ...mono, fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                       letterSpacing: "0.07em", color: "var(--text-muted)",
+                                       padding: "8px 12px", textAlign: "left",
+                                       borderBottom: "1px solid var(--border)" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {txs.map((tx, i) => (
+                <tr key={tx.version}
+                    style={{ borderBottom: "1px solid var(--border)",
+                             background: i % 2 ? "var(--bg-card2)" : "transparent" }}>
+                  <td style={{ padding: "9px 12px" }}>
+                    <button onClick={() => onVersionClick(tx.version)}
+                      style={{ ...mono, background: "none", border: "none", cursor: "pointer",
+                               color: "#ff77c9", fontSize: 12, fontWeight: 600, padding: 0,
+                               textDecoration: "underline dotted" }}>
+                      v{tx.version}
+                    </button>
+                  </td>
+                  <td style={{ padding: "9px 12px" }}>
+                    <span style={{ ...mono, fontSize: 11,
+                                   color: tx.isShelby ? "var(--text-primary)" : "var(--text-muted)" }}>
+                      {tx.type || "System Block"}
+                    </span>
+                    {tx.isShelby && (
+                      <span style={{ marginLeft: 6, fontSize: 9, background: "rgba(255,119,201,0.15)",
+                                     color: "#ff77c9", borderRadius: 3, padding: "1px 5px", ...mono }}>
+                        SHELBY
+                      </span>
+                    )}
+                  </td>
+                  <td style={{ ...mono, padding: "9px 12px", fontSize: 11, color: "var(--text-primary)" }}>
+                    {tx.gasFeeApt === "0.00000000" ? "—" : tx.gasFeeApt}
+                  </td>
+                  <td style={{ padding: "9px 12px" }}><Badge ok={tx.success}/></td>
+                  <td style={{ ...mono, padding: "9px 12px", fontSize: 10, color: "var(--text-muted)" }}>
+                    {fmtTime(tx.timestamp)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Pagination */}
+      <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 16px",
+                    borderTop: "1px solid var(--border)" }}>
+        <button onClick={goPrev} disabled={cursorHistory.length <= 1}
+          style={{ ...mono, fontSize: 11, padding: "5px 14px", borderRadius: 6,
+                   border: "1px solid var(--border)", background: "var(--bg-card)",
+                   color: "var(--text-muted)", cursor: cursorHistory.length <= 1 ? "not-allowed" : "pointer",
+                   opacity: cursorHistory.length <= 1 ? 0.4 : 1 }}>← Prev</button>
+        <button onClick={goNext} disabled={!nextCursor}
+          style={{ ...mono, fontSize: 11, padding: "5px 14px", borderRadius: 6,
+                   border: "1px solid var(--border)", background: "var(--bg-card)",
+                   color: "var(--text-muted)", cursor: !nextCursor ? "not-allowed" : "pointer",
+                   opacity: !nextCursor ? 0.4 : 1 }}>Next →</button>
+      </div>
     </div>
   );
 }
 
-// ─── Blobs Tab ────────────────────────────────────────────────────────────────
-function BlobsTab({ network }: { network: string }) {
-  const [blobs,        setBlobs]        = useState<BlobRecord[]>([]);
-  const [loading,      setLoading]      = useState(true);
-  const [error,        setError]        = useState<string | null>(null);
-  const [statusFilter, setStatusFilter] = useState<string>("active");
-  const cursorStack                     = useRef<string[]>([""]);
-  const [cursorIdx,    setCursorIdx]    = useState(0);
-  const alive = useRef(true);
-  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+// ─── Flow 2: Single Transaction + Blob Events ─────────────────────────────────
 
-  const load = useCallback(async (cursor: string, sf: string) => {
-    if (alive.current) { setLoading(true); setError(null); }
-    try {
-      const r = await fetch(
-        `/api/network/blobs-data?network=${network}&status=${sf}&cursor=${cursor}`,
-        { signal: AbortSignal.timeout(15_000) }
-      );
-      // Guard: HTML response means proxy/VPS error — show meaningful message
-      const ct = r.headers.get("content-type") ?? "";
-      if (!ct.includes("application/json")) {
-        throw new Error(`Server returned ${r.status} — the VPS blob endpoint may be unavailable`);
-      }
-      const j = await r.json() as { ok: boolean; blobs?: BlobRecord[]; nextCursor?: string; note?: string; error?: string };
-      if (!alive.current) return;
-      if (!j.ok) throw new Error(j.error ?? "Request failed");
-      setBlobs(j.blobs ?? []);
-      if ((j.nextCursor ?? "") && cursorStack.current[cursorIdx + 1] !== j.nextCursor) {
-        cursorStack.current = [...cursorStack.current.slice(0, cursorIdx + 1), j.nextCursor!];
-      }
-    } catch (e: unknown) {
-      if (alive.current) setError((e as Error).message);
-    } finally {
-      if (alive.current) setLoading(false);
-    }
-  }, [network, cursorIdx]);
+function TxDetailPanel({ version, network }: { version: string; network: string }) {
+  const [tx,     setTx]     = useState<NormTx | null>(null);
+  const [blobs,  setBlobs]  = useState<BlobEvent[]>([]);
+  const [note,   setNote]   = useState("");
+  const [loading,setLoading]= useState(true);
+  const [error,  setError]  = useState<string | null>(null);
 
   useEffect(() => {
-    cursorStack.current = [""];
-    setCursorIdx(0);
-    setBlobs([]);
-    load("", statusFilter);
-  }, [network, statusFilter]); // eslint-disable-line react-hooks/exhaustive-deps
+    let cancelled = false;
+    setLoading(true); setError(null); setTx(null); setBlobs([]); setNote("");
+    fetch(`/api/node/transactions?version=${version}&network=${network}`)
+      .then(r => r.json())
+      .then((j: { ok: boolean; tx?: NormTx; blobEvents?: BlobEvent[]; note?: string; error?: string }) => {
+        if (cancelled) return;
+        if (!j.ok) { setError(j.error ?? "Failed"); return; }
+        setTx(j.tx ?? null);
+        setBlobs(j.blobEvents ?? []);
+        setNote(j.note ?? "");
+      })
+      .catch(e => { if (!cancelled) setError((e as Error).message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [version, network]);
 
-  if (network === "testnet") {
-    return (
-      <EmptyState
-        icon="⚗"
-        title="Blob table not available on Testnet"
-        sub="Testnet uses the generic Aptos V3 indexer which does not expose a blobs table. Switch to Shelbynet to explore blobs."
-      />
-    );
-  }
+  if (loading) return <Spinner/>;
+  if (error)   return <EmptyState icon="⚠️" title="Transaction not found" sub={error}/>;
+  if (!tx)     return null;
+
+  const mono: React.CSSProperties = { fontFamily: "var(--font-mono,'Roboto Mono',monospace)" };
+  const row = (label: string, value: React.ReactNode) => (
+    <div key={label} style={{ display: "flex", gap: 12, padding: "8px 0",
+                               borderBottom: "1px solid var(--border)" }}>
+      <div style={{ ...mono, fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                     letterSpacing: "0.07em", color: "var(--text-muted)", width: 140, flexShrink: 0 }}>{label}</div>
+      <div style={{ ...mono, fontSize: 12, color: "var(--text-primary)", wordBreak: "break-all" }}>{value}</div>
+    </div>
+  );
 
   return (
-    <div>
-      {/* Status filter */}
-      <div style={{ display: "flex", gap: 4, padding: "14px 20px", borderBottom: "1px solid var(--border)", background: "var(--bg-card2)" }}>
-        {(["active", "pending", "deleted", "all"] as const).map(f => (
-          <button key={f} onClick={() => setStatusFilter(f)} style={{
-            padding: "5px 13px", borderRadius: 7, border: "none", fontSize: 12, fontWeight: statusFilter === f ? 700 : 400,
-            cursor: "pointer", background: statusFilter === f ? "var(--accent)" : "transparent",
-            color: statusFilter === f ? "#fff" : "var(--text-muted)", textTransform: "capitalize",
-          }}>{f}</button>
-        ))}
+    <div style={{ padding: 16 }}>
+      {/* TX summary card */}
+      <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)",
+                    borderRadius: 10, padding: 16, marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+          <span style={{ ...mono, fontWeight: 700, fontSize: 14, color: "#ff77c9" }}>v{tx.version}</span>
+          <Badge ok={tx.success}/>
+          {tx.isShelby && (
+            <span style={{ fontSize: 10, background: "rgba(255,119,201,0.15)", color: "#ff77c9",
+                           borderRadius: 4, padding: "2px 7px", ...mono }}>SHELBY PROTOCOL</span>
+          )}
+        </div>
+        {row("Hash",      <>{short(tx.hash, 12, 8)}<CopyBtn value={tx.hash}/></>)}
+        {row("Sender",    <>{short(tx.sender, 10, 8)}<CopyBtn value={tx.sender}/></>)}
+        {row("Function",  tx.fullFn || "System transaction")}
+        {row("Gas fee",   `${tx.gasFeeApt} APT`)}
+        {row("Timestamp", fmtTime(tx.timestamp))}
+        {note && (
+          <div style={{ marginTop: 10, padding: "8px 12px", background: "rgba(251,191,36,0.08)",
+                        border: "1px solid rgba(251,191,36,0.3)", borderRadius: 6,
+                        ...mono, fontSize: 11, color: "#fbbf24" }}>ℹ {note}</div>
+        )}
       </div>
 
-      {error
-        ? <EmptyState icon="⚠️" title="Failed to load blobs" sub={error} />
-        : (
-          <>
-            <div style={{ overflowX: "auto" }}>
-              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                <thead>
-                  <tr style={{ background: "var(--bg-card2)", borderBottom: "1px solid var(--border)" }}>
-                    {["BLOB ID", "OWNER", "SIZE", "STATUS", "REGISTERED"].map(h => (
-                      <th key={h} style={{ padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.07em", whiteSpace: "nowrap" }}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {loading
-                    ? <SkeletonRows cols={5} />
-                    : blobs.length === 0
-                    ? <tr><td colSpan={5}><EmptyState icon="📭" title={`No ${statusFilter} blobs found`} sub="Try a different filter or wait for the indexer to sync." /></td></tr>
-                    : blobs.map((blob, i) => (
-                        <tr key={blob.blobId || i} style={{ borderBottom: "1px solid var(--border-soft)", background: i % 2 === 0 ? "var(--bg-card)" : "var(--bg-card2)" }}>
-                          <td style={{ padding: "10px 14px" }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                              <span style={{ fontFamily: "monospace", fontSize: 11, color: "var(--accent)" }}>{addrShort(blob.blobId)}</span>
-                              {blob.blobId && <CopyBtn text={blob.blobId} />}
-                            </div>
-                          </td>
-                          <td style={{ padding: "10px 14px" }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                              <span style={{ fontFamily: "monospace", fontSize: 11, color: "var(--text-muted)" }}>{addrShort(blob.owner)}</span>
-                              {blob.owner && <CopyBtn text={blob.owner} />}
-                            </div>
-                          </td>
-                          <td style={{ padding: "10px 14px", fontFamily: "monospace", fontSize: 12, color: "var(--text-secondary)" }}>{fmtBytes(blob.size)}</td>
-                          <td style={{ padding: "10px 14px" }}><StatusChip status={blob.status} /></td>
-                          <td style={{ padding: "10px 14px", fontSize: 11, color: "var(--text-dim)", fontFamily: "monospace" }}>{fmtDate(blob.registeredAt)}</td>
-                        </tr>
-                      ))
-                  }
-                </tbody>
-              </table>
+      {/* Blob events */}
+      {blobs.length > 0 ? (
+        <div>
+          <div style={{ ...mono, fontSize: 11, fontWeight: 700, textTransform: "uppercase",
+                        letterSpacing: "0.1em", color: "var(--text-muted)", marginBottom: 10 }}>
+            🗂 Blob Metadata ({blobs.length} blob{blobs.length > 1 ? "s" : ""} registered)
+          </div>
+          {blobs.map((b, i) => (
+            <div key={i} style={{ background: "var(--bg-card)", border: "1px solid rgba(255,119,201,0.25)",
+                                   borderRadius: 10, padding: 16, marginBottom: 12 }}>
+              <div style={{ ...mono, fontWeight: 700, fontSize: 13, color: "#ff77c9", marginBottom: 10 }}>
+                {b.blobName || `Blob #${i + 1}`}
+              </div>
+              {row("Size",        `${b.sizeKB} KB (${b.sizeBytes.toLocaleString("en-US")} bytes)`)}
+              {row("Encoding",    b.encoding)}
+              {row("Chunksets",   b.chunksetCount)}
+              {row("Commitment",  <>{short(b.blobCommitment, 12, 8)}<CopyBtn value={b.blobCommitment}/></>)}
+              {row("Expires",     b.expiryDate)}
             </div>
-            <Pager
-              hasPrev={cursorIdx > 0}
-              hasNext={!!cursorStack.current[cursorIdx + 1]}
-              onPrev={() => { const p = cursorStack.current[cursorIdx - 1]; if (p !== undefined) { setCursorIdx(i => i - 1); load(p, statusFilter); } }}
-              onNext={() => { const n = cursorStack.current[cursorIdx + 1]; if (n !== undefined) { setCursorIdx(i => i + 1); load(n, statusFilter); } }}
-              loading={loading}
-            />
-          </>
-        )
-      }
+          ))}
+        </div>
+      ) : (
+        <div style={{ padding: "16px", background: "var(--bg-card2)", borderRadius: 8,
+                      ...mono, fontSize: 12, color: "var(--text-muted)", textAlign: "center" }}>
+          No BlobRegisteredEvent found — this is a regular Shelby transaction.
+        </div>
+      )}
     </div>
   );
 }
 
-// ─── SP Leaderboard Tab ───────────────────────────────────────────────────────
-function LeaderboardTab({ network }: { network: string }) {
+// ─── SP Directory Tab (unchanged logic) ───────────────────────────────────────
+
+function DirectoryTab({ network }: { network: string }) {
   const [sps,     setSps]     = useState<SpRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState<string | null>(null);
-  const [sort,    setSort]    = useState<"az" | "health" | "state">("az");
   const alive = useRef(true);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
   useEffect(() => {
-    if (alive.current) { setLoading(true); setError(null); setSps([]); }
-    fetch(`/api/network/providers?network=${network}`, { signal: AbortSignal.timeout(25_000) })
+    setLoading(true); setError(null);
+    fetch(`/api/network/providers?network=${network}`, { signal: AbortSignal.timeout(15_000) })
       .then(r => r.json())
-      .then((j: any) => {
+      .then((j: { ok: boolean; providers?: SpRecord[]; error?: string }) => {
         if (!alive.current) return;
-        const raw = j?.data?.providers ?? [];
-        setSps(raw.map((sp: any) => ({
-          address:      String(sp.address ?? ""),
-          addressShort: String(sp.addressShort ?? ""),
-          az:           String(sp.availabilityZone ?? "unknown"),
-          health:       String(sp.health ?? "Unknown"),
-          state:        String(sp.state ?? "Active"),
-          blsKey:       sp.blsKey ? String(sp.blsKey) : undefined,
-          ip:           sp.ipAddress ? String(sp.ipAddress) : undefined,
-          geo:          sp.geo ?? null,
-        })));
-        setLoading(false);
+        if (!j.ok) throw new Error(j.error ?? "Failed");
+        setSps(j.providers ?? []);
       })
-      .catch((e: unknown) => { if (alive.current) { setError((e as Error).message); setLoading(false); } });
+      .catch(e => { if (alive.current) setError((e as Error).message); })
+      .finally(() => { if (alive.current) setLoading(false); });
   }, [network]);
 
-  const sorted = [...sps].sort((a, b) =>
-    sort === "health" ? a.health.localeCompare(b.health) :
-    sort === "state"  ? a.state.localeCompare(b.state)   :
-    a.az.localeCompare(b.az)
-  );
+  const mono: React.CSSProperties = { fontFamily: "var(--font-mono,'Roboto Mono',monospace)" };
+
+  if (error)   return <EmptyState icon="⚠️" title="Failed to load providers" sub={error}/>;
+  if (loading) return <Spinner/>;
+  if (!sps.length) return <EmptyState icon="📭" title="No storage providers found"/>;
 
   return (
-    <div>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 20px", borderBottom: "1px solid var(--border)", background: "var(--bg-card2)", flexWrap: "wrap", gap: 8 }}>
-        <div style={{ display: "flex", gap: 16, fontSize: 12, color: "var(--text-muted)" }}>
-          <span>Total: <strong style={{ color: "var(--text-primary)" }}>{sps.length}</strong></span>
-          <span>Healthy: <strong style={{ color: "#22c55e" }}>{sps.filter(s => s.health === "Healthy").length}</strong></span>
-        </div>
-        <div style={{ display: "flex", gap: 4 }}>
-          {(["az", "health", "state"] as const).map(s => (
-            <button key={s} onClick={() => setSort(s)} style={{
-              padding: "4px 11px", borderRadius: 6, border: "1px solid var(--border)", fontSize: 11, fontWeight: sort === s ? 700 : 400,
-              background: sort === s ? "var(--accent)" : "var(--bg-card)", color: sort === s ? "#fff" : "var(--text-muted)", cursor: "pointer",
-            }}>
-              {s === "az" ? "Zone" : s.charAt(0).toUpperCase() + s.slice(1)}
-            </button>
+    <div style={{ overflowX: "auto" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+        <thead>
+          <tr style={{ background: "var(--bg-card2)" }}>
+            {["ADDRESS","LOCATION","AZ","HEALTH","STATE","BLS KEY"].map(h => (
+              <th key={h} style={{ ...mono, fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                    letterSpacing: "0.07em", color: "var(--text-muted)",
+                                    padding: "8px 12px", textAlign: "left",
+                                    borderBottom: "1px solid var(--border)" }}>{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {sps.map((sp, i) => (
+            <tr key={sp.address} style={{ borderBottom: "1px solid var(--border)",
+                                           background: i % 2 ? "var(--bg-card2)" : "transparent" }}>
+              <td style={{ padding: "9px 12px" }}>
+                <div style={{ ...mono, fontSize: 12, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: 4 }}>
+                  <span style={{ width: 6, height: 6, display: "inline-block", transform: "rotate(45deg)",
+                                  background: sp.health === "Healthy" ? "#22c55e" : sp.health === "Faulty" ? "#ef4444" : "#a855f7",
+                                  flexShrink: 0 }}/>
+                  {sp.addressShort ?? short(sp.address)}
+                  <CopyBtn value={sp.address}/>
+                </div>
+              </td>
+              <td style={{ ...mono, padding: "9px 12px", fontSize: 11, color: "var(--text-muted)" }}>
+                {sp.geo?.city ?? "—"}{sp.geo?.countryCode ? `, ${sp.geo.countryCode}` : ""}
+              </td>
+              <td style={{ ...mono, padding: "9px 12px", fontSize: 10, color: "var(--text-muted)" }}>
+                {sp.az ?? "—"}
+              </td>
+              <td style={{ padding: "9px 12px" }}>
+                <span style={{ ...mono, fontSize: 11, fontWeight: 600,
+                               color: sp.health === "Healthy" ? "#22c55e" : sp.health === "Faulty" ? "#ef4444" : "#a855f7" }}>
+                  ◆ {sp.health}
+                </span>
+              </td>
+              <td style={{ padding: "9px 12px" }}>
+                <span style={{ ...mono, fontSize: 11, color: sp.state === "Active" ? "#22c55e" : "var(--text-muted)" }}>
+                  ◆ {sp.state}
+                </span>
+              </td>
+              <td style={{ ...mono, padding: "9px 12px", fontSize: 10, color: "var(--text-dim)" }}>
+                {sp.blsKey ? <>{short(sp.blsKey, 8, 4)}<CopyBtn value={sp.blsKey}/></> : "—"}
+              </td>
+            </tr>
           ))}
-        </div>
-      </div>
-      {error
-        ? <EmptyState icon="⚠️" title="Failed to load providers" sub={error} />
-        : (
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-              <thead>
-                <tr style={{ background: "var(--bg-card2)", borderBottom: "1px solid var(--border)" }}>
-                  {["#", "ADDRESS", "ZONE / DC", "HEALTH", "STATE", "LOCATION", "BLS KEY"].map(h => (
-                    <th key={h} style={{ padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.07em", whiteSpace: "nowrap" }}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {loading
-                  ? <SkeletonRows cols={7} />
-                  : sorted.length === 0
-                  ? <tr><td colSpan={7}><EmptyState icon="📭" title="No storage providers found" /></td></tr>
-                  : sorted.map((sp, i) => (
-                      <tr key={sp.address || i} style={{ borderBottom: "1px solid var(--border-soft)", background: i % 2 === 0 ? "var(--bg-card)" : "var(--bg-card2)" }}>
-                        <td style={{ padding: "10px 14px", fontFamily: "monospace", fontSize: 11, color: "var(--text-dim)" }}>#{i + 1}</td>
-                        <td style={{ padding: "10px 14px" }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                            <span style={{ fontFamily: "monospace", fontSize: 12, color: "var(--text-primary)", fontWeight: 600 }}>{sp.addressShort}</span>
-                            {sp.address && <CopyBtn text={sp.address} />}
-                          </div>
-                        </td>
-                        <td style={{ padding: "10px 14px", fontSize: 12, color: "var(--text-secondary)" }}>{sp.az}</td>
-                        <td style={{ padding: "10px 14px" }}><HealthChip health={sp.health} /></td>
-                        <td style={{ padding: "10px 14px" }}>
-                          <span style={{ fontSize: 11, fontWeight: 600, color: sp.state === "Active" ? "#0891b2" : sp.state === "Waitlisted" ? "#f59e0b" : sp.state === "Frozen" ? "#3b82f6" : "#9ca3af" }}>
-                            {sp.state}
-                          </span>
-                        </td>
-                        <td style={{ padding: "10px 14px", fontSize: 11, color: "var(--text-dim)" }}>
-                          {sp.geo?.city ? `${sp.geo.city}${sp.geo.countryCode ? ", " + sp.geo.countryCode : ""}` : (sp.ip ?? "—")}
-                        </td>
-                        <td style={{ padding: "10px 14px" }}>
-                          {sp.blsKey ? (
-                            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                              <span style={{ fontFamily: "monospace", fontSize: 10, color: "var(--text-muted)" }}>{sp.blsKey.slice(0, 14)}…</span>
-                              <CopyBtn text={sp.blsKey} />
-                            </div>
-                          ) : <span style={{ color: "var(--text-dim)" }}>—</span>}
-                        </td>
-                      </tr>
-                    ))
-                }
-              </tbody>
-            </table>
-          </div>
-        )
-      }
+        </tbody>
+      </table>
     </div>
   );
 }
 
-// ─── Search bar ───────────────────────────────────────────────────────────────
-function SearchBar({ onSearch }: { onSearch: (q: string) => void }) {
-  const [q, setQ] = useState("");
-  return (
-    <div style={{ display: "flex", gap: 8 }}>
-      <input
-        value={q}
-        onChange={e => setQ(e.target.value)}
-        onKeyDown={e => { if (e.key === "Enter") onSearch(q.trim()); }}
-        placeholder="Search: blob_id / tx_version (v12345) / owner address…"
-        style={{
-          flex: 1, padding: "10px 16px", borderRadius: 10,
-          border: "1px solid var(--border)", background: "var(--bg-card)",
-          color: "var(--text-primary)", fontSize: 14, outline: "none",
-          fontFamily: "monospace",
-        }}
-      />
-      <button
-        onClick={() => onSearch(q.trim())}
-        style={{ padding: "10px 22px", borderRadius: 10, border: "none", background: "var(--accent)", color: "#fff", fontSize: 14, fontWeight: 600, cursor: "pointer" }}
-      >
-        Search
-      </button>
-    </div>
-  );
-}
+// ─── Main Explorer Page ───────────────────────────────────────────────────────
 
-// ─── Main Page ────────────────────────────────────────────────────────────────
 export default function ExplorerPage() {
-  const { network, config } = useNetwork();
-  const isTestnet            = network === "testnet";
-  const [tab, setTab]        = useState<ExplorerTab>("transactions");
-  const [searchResult, setSearchResult] = useState<string | null>(null);
+  const { network }  = useNetwork();
+  const { isDark }   = useTheme();
 
-  useEffect(() => { setTab("transactions"); setSearchResult(null); }, [network]);
+  const [query,   setQuery]   = useState("");
+  const [input,   setInput]   = useState("");
+  const [tab,     setTab]     = useState<Tab>("directory");
+  const [inputErr,setInputErr]= useState("");
 
-  const handleSearch = (q: string) => {
+  // Flow 1 state
+  const [searchAddr, setSearchAddr] = useState("");
+
+  // Flow 2 state — version selected (from input OR by clicking a tx row)
+  const [selectedVersion, setSelectedVersion] = useState("");
+
+  const networkLabel = network === "shelbynet" ? "Shelbynet" : "Testnet";
+
+  const handleSearch = () => {
+    const q = query.trim();
     if (!q) return;
-    setSearchResult(q);
-    // Routing heuristic (fixed):
-    //   "v12345" or digits  → transactions (version lookup)
-    //   0x address          → transactions filtered by address (was: leaderboard — BUG FIXED)
-    //   anything else       → blobs
-    if (q.startsWith("v") || /^\d+$/.test(q))      setTab("transactions");
-    else if (q.startsWith("0x"))                     setTab("transactions");
-    else                                              setTab("blobs");
+    setInputErr("");
+
+    // Classify input
+    if (q.startsWith("0x") && q.length >= 10) {
+      // Flow 1 — wallet address
+      setSearchAddr(q);
+      setSelectedVersion("");
+      setTab("transactions");
+    } else if (/^\d+$/.test(q)) {
+      // Flow 2 — transaction version number
+      setSelectedVersion(q);
+      setSearchAddr("");
+      setTab("transactions");
+    } else {
+      // Invalid — fail fast
+      setInputErr("Invalid input — enter a wallet address (0x…) or a transaction version number.");
+    }
   };
 
-  const TABS: { id: ExplorerTab; label: string; icon: string }[] = [
-    { id: "transactions", label: "Transactions", icon: "↯" },
-    { id: "blobs",        label: "Blobs",        icon: "◈" },
-    { id: "leaderboard",  label: "SP Directory", icon: "◎" },
+  const onVersionClick = (v: string) => {
+    setSelectedVersion(v);
+    // Scroll to top
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const clearSearch = () => {
+    setQuery(""); setSearchAddr(""); setSelectedVersion(""); setInputErr("");
+  };
+
+  const mono: React.CSSProperties = { fontFamily: "var(--font-mono,'Roboto Mono',monospace)" };
+
+  const TABS: { id: Tab; label: string; icon: string }[] = [
+    { id: "transactions", label: "Transactions", icon: "⚡" },
+    { id: "directory",    label: "SP Directory", icon: "◎" },
   ];
 
   return (
-    <div style={{ maxWidth: 1400, margin: "0 auto", padding: "0 4px" }}>
+    <div style={{ minHeight: "100vh", background: "var(--bg-primary)",
+                  fontFamily: "var(--font-body,'Inter',system-ui,sans-serif)" }}>
       {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20, flexWrap: "wrap", gap: 12 }}>
-        <div>
-          <h1 style={{ fontSize: 26, fontWeight: 800, color: "var(--text-primary)", margin: 0, letterSpacing: -0.8 }}>Explorer</h1>
-          <p style={{ fontSize: 13, color: "var(--text-muted)", margin: "5px 0 0" }}>
-            {isTestnet ? "Aptos Testnet · Shelby Protocol" : "Shelbynet"} · Browse transactions, blobs, and providers
-          </p>
-        </div>
-        <span style={{ fontSize: 11, padding: "3px 9px", borderRadius: 5, fontWeight: 600, background: isTestnet ? "rgba(147,51,234,0.1)" : "rgba(34,197,94,0.1)", color: isTestnet ? "#9333ea" : "#16a34a" }}>
-          {config.label}
-        </span>
-      </div>
-
-      {/* Search */}
-      <div style={{ marginBottom: 20 }}>
-        <SearchBar onSearch={handleSearch} />
-        {searchResult && (
-          <div style={{ marginTop: 8, fontSize: 12, color: "var(--text-muted)", fontFamily: "monospace" }}>
-            Filtering for: <strong style={{ color: "var(--text-primary)" }}>{searchResult}</strong>
-            <button onClick={() => setSearchResult(null)} style={{ marginLeft: 8, background: "none", border: "none", cursor: "pointer", color: "var(--text-dim)", fontSize: 11 }}>× clear</button>
+      <div style={{ padding: "28px 24px 0", borderBottom: "1px solid var(--border)" }}>
+        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between",
+                      flexWrap: "wrap", gap: 12, marginBottom: 20 }}>
+          <div>
+            <h1 style={{ margin: 0, fontSize: 28, fontWeight: 800, letterSpacing: -0.5,
+                         fontFamily: "var(--font-headline,'Britti Sans','DM Sans',sans-serif)",
+                         color: "var(--text-primary)" }}>Explorer</h1>
+            <p style={{ margin: "4px 0 0", fontSize: 13, color: "var(--text-muted)" }}>
+              {networkLabel} · Browse transactions, blobs, and providers
+            </p>
           </div>
-        )}
-      </div>
+          <span style={{ ...mono, fontSize: 11, padding: "4px 12px", borderRadius: 20,
+                         background: "rgba(255,119,201,0.1)", color: "#ff77c9",
+                         border: "1px solid rgba(255,119,201,0.2)" }}>
+            {networkLabel}
+          </span>
+        </div>
 
-      {/* Tab card */}
-      <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 14, overflow: "hidden" }}>
-        <div style={{ display: "flex", borderBottom: "1px solid var(--border)", background: "var(--bg-card2)", overflowX: "auto" }}>
+        {/* Search bar */}
+        <div style={{ maxWidth: 720, marginBottom: 16 }}>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={query}
+              onChange={e => { setQuery(e.target.value); setInputErr(""); }}
+              onKeyDown={e => e.key === "Enter" && handleSearch()}
+              placeholder="Wallet address (0x…) or transaction version number…"
+              style={{ flex: 1, padding: "11px 14px", borderRadius: 8,
+                       border: `1px solid ${inputErr ? "#ef4444" : "var(--border)"}`,
+                       background: "var(--bg-card)", color: "var(--text-primary)",
+                       fontSize: 13, outline: "none",
+                       fontFamily: "var(--font-mono,'Roboto Mono',monospace)" }}
+            />
+            <button onClick={handleSearch} style={{
+              padding: "11px 22px", borderRadius: 8, border: "none",
+              background: "#ff77c9", color: "#fff", fontWeight: 700, fontSize: 13,
+              cursor: "pointer", whiteSpace: "nowrap",
+              fontFamily: "var(--font-mono,'Roboto Mono',monospace)",
+            }}>Search</button>
+          </div>
+          {inputErr && (
+            <div style={{ ...mono, fontSize: 11, color: "#ef4444", marginTop: 6 }}>⚠ {inputErr}</div>
+          )}
+          {(searchAddr || selectedVersion) && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+              <span style={{ ...mono, fontSize: 11, color: "var(--text-muted)" }}>
+                {searchAddr ? `Address: ` : `Version: `}
+              </span>
+              <span style={{ ...mono, fontSize: 11, color: "#ff77c9" }}>
+                {searchAddr ? short(searchAddr, 12, 10) : `v${selectedVersion}`}
+              </span>
+              <button onClick={clearSearch}
+                style={{ ...mono, fontSize: 10, background: "none", border: "none",
+                         color: "var(--text-dim)", cursor: "pointer", padding: "0 4px" }}>
+                × clear
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Tabs */}
+        <div style={{ display: "flex", gap: 0 }}>
           {TABS.map(t => (
             <button key={t.id} onClick={() => setTab(t.id)} style={{
-              padding: "13px 22px", fontSize: 13, fontWeight: tab === t.id ? 700 : 500,
-              border: "none", cursor: "pointer", whiteSpace: "nowrap",
-              background: tab === t.id ? "var(--bg-card)" : "transparent",
-              color: tab === t.id ? "var(--text-primary)" : "var(--text-muted)",
-              borderBottom: tab === t.id ? "2px solid var(--accent)" : "2px solid transparent",
-              display: "flex", alignItems: "center", gap: 6,
+              padding: "10px 20px", border: "none", background: "transparent",
+              cursor: "pointer", fontSize: 13, fontWeight: tab === t.id ? 700 : 400,
+              color: tab === t.id ? "#ff77c9" : "var(--text-muted)",
+              borderBottom: tab === t.id ? "2px solid #ff77c9" : "2px solid transparent",
+              fontFamily: "var(--font-mono,'Roboto Mono',monospace)",
+              transition: "color 0.15s",
             }}>
-              <span style={{ opacity: 0.7 }}>{t.icon}</span> {t.label}
+              {t.icon} {t.label}
             </button>
           ))}
         </div>
-
-        {tab === "transactions" && (
-          <TransactionsTab
-            network={network}
-            address={searchResult?.startsWith("0x") ? searchResult : undefined}
-          />
-        )}
-        {tab === "blobs"        && <BlobsTab        network={network} />}
-        {tab === "leaderboard"  && <LeaderboardTab  network={network} />}
       </div>
 
-      {/* Source footer */}
-      <div style={{ marginTop: 14, fontSize: 11, color: "var(--text-dim)", fontFamily: "monospace", textAlign: "right" }}>
-        {isTestnet
-          ? "Source: Aptos Testnet Indexer V3 · proxied server-side"
-          : "Source: Shelby Dedicated Indexer (GraphQL) · proxied server-side"}
+      {/* Tab content */}
+      <div style={{ background: "var(--bg-card)", minHeight: 400 }}>
+        {tab === "transactions" && (
+          <>
+            {/* Flow 2: single tx detail view */}
+            {selectedVersion && (
+              <div style={{ borderBottom: "2px solid rgba(255,119,201,0.3)" }}>
+                <div style={{ ...mono, padding: "10px 16px", fontSize: 11, fontWeight: 700,
+                               background: "rgba(255,119,201,0.06)",
+                               textTransform: "uppercase", letterSpacing: "0.1em",
+                               color: "#ff77c9", borderBottom: "1px solid var(--border)" }}>
+                  ⬢ Transaction Detail · v{selectedVersion}
+                  <button onClick={() => setSelectedVersion("")}
+                    style={{ float: "right", background: "none", border: "none",
+                             color: "var(--text-muted)", cursor: "pointer", fontSize: 12 }}>
+                    ✕ close
+                  </button>
+                </div>
+                <TxDetailPanel version={selectedVersion} network={network}/>
+              </div>
+            )}
+
+            {/* Flow 1: account tx list */}
+            {searchAddr && (
+              <AccountPanel address={searchAddr} network={network} onVersionClick={onVersionClick}/>
+            )}
+
+            {/* Default: no search yet */}
+            {!searchAddr && !selectedVersion && (
+              <EmptyState icon="🔍" title="Search to explore"
+                sub="Enter a wallet address to see its transaction history, or a version number to inspect a specific transaction and its blob data."/>
+            )}
+          </>
+        )}
+
+        {tab === "directory" && <DirectoryTab network={network}/>}
+      </div>
+
+      {/* Footer attribution */}
+      <div style={{ padding: "10px 16px", borderTop: "1px solid var(--border)",
+                    ...mono, fontSize: 10, color: "var(--text-dim)", textAlign: "right" }}>
+        Source: Aptos Node REST API · proxied server-side
       </div>
     </div>
   );

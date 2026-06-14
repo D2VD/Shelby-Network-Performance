@@ -29,6 +29,7 @@ function normTx(tx: Record<string, unknown>) {
     sender:     (tx.sender   as string) ?? "",
     success:    (tx.success  as boolean) ?? false,
     gasFeeApt:  gasFeeApt.toFixed(8),
+    gasFeeRaw:  gasFeeApt,          // numeric — used for client-side sort
     timestamp:  (tx.timestamp as string) ?? "",
     isShelby:   fn.startsWith(CONTRACT),
   };

@@ -1,12 +1,13 @@
-// app/api/node/account/route.ts
-// Proxies GET /v1/accounts/{address}/resources from Aptos Node REST API.
-// Server-side = no CSP restriction on calling the node URL directly.
+// app/api/node/account/route.ts — v2
+// Adds: balanceApt (APT coin balance, fetched from the same /resources call)
 export const runtime = "edge";
 
 const NODE: Record<string, string> = {
   shelbynet: (process.env.SHELBY_NODE_URL ?? "https://api.shelbynet.shelby.xyz/v1").replace(/\/$/, ""),
   testnet:   "https://api.testnet.aptoslabs.com/v1",
 };
+
+const APT_COIN_TYPE = "0x1::coin::CoinStore<0x1::aptos_coin::AptosCoin>";
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
@@ -40,7 +41,15 @@ export async function GET(req: Request) {
     const acct = resources.find(r => r.type === "0x1::account::Account");
     const sequenceNumber = (acct?.data?.sequence_number as string) ?? "0";
 
-    return Response.json({ ok: true, sequenceNumber, activated: true });
+    // APT balance — CoinStore resource holds { coin: { value: "..." } }, in Octas (1 APT = 1e8 Octas)
+    const coinStore = resources.find(r => r.type === APT_COIN_TYPE);
+    let balanceApt: string | undefined;
+    if (coinStore) {
+      const octas = BigInt(((coinStore.data?.coin as Record<string, unknown>)?.value as string) ?? "0");
+      balanceApt = (Number(octas) / 1e8).toFixed(4);
+    }
+
+    return Response.json({ ok: true, sequenceNumber, balanceApt, activated: true });
   } catch (e: unknown) {
     return Response.json({ ok: false, error: (e as Error).message }, { status: 500 });
   }

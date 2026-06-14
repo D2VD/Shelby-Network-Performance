@@ -13,7 +13,7 @@
  */
 
 import React, {
-  useState, useEffect, useCallback, useRef, useMemo,
+  useState, useEffect, useCallback, useRef, useMemo, Suspense,
 } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useNetwork } from "@/components/network-context";
@@ -639,7 +639,7 @@ function BlobSearchPanel({ blobName, network, onVersionClick }: {
 
 // ─── Main page ────────────────────────────────────────────────────────────────
 
-export default function ExplorerPage() {
+function ExplorerContent() {
   const { network } = useNetwork();
   const router       = useRouter();
   const searchParams = useSearchParams();
@@ -843,5 +843,27 @@ export default function ExplorerPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+// ─── Suspense wrapper ──────────────────────────────────────────────────────────
+// useSearchParams() requires a Suspense boundary in the App Router — without
+// this, `next build` fails with "useSearchParams() should be wrapped in a
+// suspense boundary" during static page generation (even with runtime='edge').
+
+function ExplorerFallback() {
+  return (
+    <div style={{ minHeight: "100vh", background: "var(--bg-primary)",
+                  display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <Spinner label="Loading Explorer…"/>
+    </div>
+  );
+}
+
+export default function ExplorerPage() {
+  return (
+    <Suspense fallback={<ExplorerFallback/>}>
+      <ExplorerContent/>
+    </Suspense>
   );
 }

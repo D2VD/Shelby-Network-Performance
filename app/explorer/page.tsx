@@ -1,6 +1,14 @@
 "use client";
 /**
- * app/explorer/page.tsx — v3.2
+ * app/explorer/page.tsx — v3.3
+ *
+ * Changes vs v3.2:
+ *  7. aptosExplorerTxn/Account — use Aptos Explorer's built-in "shelbynet"
+ *     network preset (?network=shelbynet) instead of custom params, which
+ *     caused "Transaction not found" 404s on the txn page
+ *  8. BlobSearchPanel — content-type guard before .json() so a 502/HTML
+ *     response from the VPS shows a clean error instead of
+ *     "Unexpected token '<', <!DOCTYPE..."
  *
  * Changes vs v3.1:
  *  1. Hash link fix — Shelbynet uses ?network=custom&customNetworkUrl=… so
@@ -20,8 +28,8 @@ import { useNetwork } from "@/components/network-context";
 
 // ─── Env / constants ──────────────────────────────────────────────────────────
 
-const SHELBY_NODE    = (process.env.NEXT_PUBLIC_SHELBY_NODE_URL    ?? "https://api.shelbynet.shelby.xyz/v1").replace(/\/$/, "");
-const SHELBY_INDEXER = (process.env.NEXT_PUBLIC_SHELBY_INDEXER_URL ?? `${SHELBY_NODE}/graphql`);
+// (SHELBY_NODE / SHELBY_INDEXER env vars no longer needed for explorer links —
+//  Aptos Explorer's "shelbynet" preset is used directly, see below.)
 const PAGE = 25;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -40,28 +48,18 @@ type SortKey = "newest" | "gas_desc" | "gas_asc";
 
 // ─── Aptos Explorer URLs ──────────────────────────────────────────────────────
 
+// Aptos Explorer has "Shelbynet" as a built-in network preset (visible in its
+// network dropdown) — ?network=custom&customNetworkUrl=… caused 404s because
+// the explorer's hash lookup path doesn't resolve through custom params the
+// same way the account page does. Using the preset name directly is reliable.
 function aptosExplorerTxn(hash: string, network: string): string {
-  if (network === "shelbynet") {
-    return [
-      "https://explorer.aptoslabs.com/txn/", hash,
-      "?network=custom",
-      "&customNetworkUrl=", encodeURIComponent(SHELBY_NODE),
-      "&customIndexerUrl=", encodeURIComponent(SHELBY_INDEXER),
-    ].join("");
-  }
-  return `https://explorer.aptoslabs.com/txn/${hash}?network=testnet`;
+  const net = network === "shelbynet" ? "shelbynet" : "testnet";
+  return `https://explorer.aptoslabs.com/txn/${hash}?network=${net}`;
 }
 
 function aptosExplorerAccount(addr: string, network: string): string {
-  if (network === "shelbynet") {
-    return [
-      "https://explorer.aptoslabs.com/account/", addr,
-      "?network=custom",
-      "&customNetworkUrl=", encodeURIComponent(SHELBY_NODE),
-      "&customIndexerUrl=", encodeURIComponent(SHELBY_INDEXER),
-    ].join("");
-  }
-  return `https://explorer.aptoslabs.com/account/${addr}?network=testnet`;
+  const net = network === "shelbynet" ? "shelbynet" : "testnet";
+  return `https://explorer.aptoslabs.com/account/${addr}?network=${net}`;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -595,10 +593,16 @@ function BlobSearchPanel({ blobName, network, onVersionClick }: {
     setLoading(true); setError(null);
     const params = new URLSearchParams({ network, name: blobName, limit: "20" });
     fetch(`/api/network/blobs-data?${params}`, { signal: AbortSignal.timeout(15_000) })
-      .then(r => r.json())
-      .then((j: { ok: boolean; blobs?: typeof blobs; error?: string }) => {
+      .then(async r => {
+        const ct = r.headers.get("content-type") ?? "";
+        if (!ct.includes("application/json")) {
+          throw new Error(`Server returned ${r.status} — blob search endpoint unavailable`);
+        }
+        return r.json();
+      })
+      .then((j: { ok: boolean; blobs?: typeof blobs; error?: string; note?: string }) => {
         if (cancelled) return;
-        if (!j.ok) throw new Error(j.error ?? "Search failed");
+        if (!j.ok) throw new Error(j.note ?? j.error ?? "Search failed");
         setBlobs(j.blobs ?? []);
       })
       .catch(e => { if (!cancelled) setError((e as Error).message); })

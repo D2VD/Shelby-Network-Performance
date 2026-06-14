@@ -1,120 +1,54 @@
-/**
- * app/api/network/blobs-data/route.ts — v2.1
- *
- * Fix: order_by field changed from { id: desc } → { created_at: desc }
- *      "field 'id' not found in type: 'blobs_order_by'" — the blobs_order_by
- *      GQL type does not expose an `id` column; created_at is orderable.
- */
-
-import { NextRequest, NextResponse } from "next/server";
-
+// app/api/network/blobs-data/route.ts
+// Proxies to VPS /network/blobs-data — handles both:
+//   ?status=active|failed|all&address=…&cursor=…   (paged blob list)
+//   ?name=…                                          (blob name search)
 export const runtime = "edge";
 
-const SHELBYNET_INDEXER = "https://api.shelbynet.shelby.xyz/v1/graphql";
-const TESTNET_INDEXER   = "https://api.testnet.aptoslabs.com/v1/graphql";
-const PAGE_SIZE         = 30;
+const VPS_BASE = (process.env.VPS_API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "").replace(/\/$/, "");
+const INTERNAL_KEY = process.env.INTERNAL_API_KEY ?? "";
 
-function buildQuery(
-  status: string | null,
-  owner: string | null,
-  cursor: number,
-): string {
-  const conditions: string[] = [];
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url);
 
-  if (status && status !== "all") {
-    if (status === "active")  conditions.push("is_deleted: { _eq: false }, is_written: { _eq: true }");
-    if (status === "pending") conditions.push("is_written: { _eq: false }");
-    if (status === "deleted") conditions.push("is_deleted: { _eq: true }");
-  }
-  if (owner) conditions.push(`owner: { _eq: "${owner}" }`);
-
-  const where = conditions.length ? `where: { ${conditions.join(", ")} }` : "";
-
-  return `{
-    blobs(
-      ${where}
-      order_by: { created_at: desc }
-      limit: ${PAGE_SIZE}
-      offset: ${cursor}
-    ) {
-      id
-      owner
-      size
-      is_written
-      is_deleted
-      created_at
-    }
-    blobs_aggregate(${where ? where : ""}) {
-      aggregate { count }
-    }
-  }`;
-}
-
-export async function GET(req: NextRequest) {
-  const { searchParams } = req.nextUrl;
-  const network = searchParams.get("network") ?? "shelbynet";
-  const status  = searchParams.get("status");
-  const owner   = searchParams.get("owner");
-  const cursor  = parseInt(searchParams.get("cursor") ?? "0", 10);
-
-  const apiKey  = network === "testnet"
-    ? process.env.SHELBY_TESTNET_API_KEY
-    : process.env.SHELBY_API_KEY;
-  const url     = network === "testnet" ? TESTNET_INDEXER : SHELBYNET_INDEXER;
-
-  if (!apiKey) {
-    return NextResponse.json(
-      { ok: false, error: `Missing API key for ${network}` },
-      { status: 500 },
+  if (!VPS_BASE) {
+    return Response.json(
+      { ok: false, error: "VPS_API_URL is not configured", blobs: [] },
+      { status: 503 }
     );
   }
 
-  if (network === "testnet") {
-    // Testnet blobs indexer not available — return empty with note
-    return NextResponse.json({
-      ok: true, network, blobs: [], total: 0, cursor: 0, nextCursor: null,
-      note: "Blob data not available on testnet indexer",
-    });
-  }
+  // Forward all query params as-is (network, status, address, name, cursor, limit)
+  const target = `${VPS_BASE}/network/blobs-data?${searchParams.toString()}`;
 
   try {
-    const r = await fetch(url, {
-      method:  "POST",
+    const upstream = await fetch(target, {
       headers: {
+        "Authorization": `Bearer ${INTERNAL_KEY}`,
         "Content-Type":  "application/json",
-        "Authorization": `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({ query: buildQuery(status, owner, cursor) }),
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(20_000),
     });
 
-    if (!r.ok) {
-      const text = await r.text().catch(() => r.statusText);
-      return NextResponse.json(
-        { ok: false, error: `Indexer responded ${r.status}: ${text}` },
-        { status: 502 },
+    // Guard: VPS down / 502 HTML page → don't pass HTML to the client
+    const ct = upstream.headers.get("content-type") ?? "";
+    if (!ct.includes("application/json")) {
+      const text = await upstream.text();
+      console.error("[/api/network/blobs-data] non-JSON from VPS:", text.slice(0, 300));
+      return Response.json(
+        { ok: false, error: `Upstream returned ${upstream.status}`, blobs: [] },
+        { status: 502 }
       );
     }
 
-    const j = await r.json() as any;
+    const data = await upstream.json();
+    return Response.json(data, { status: upstream.status });
 
-    // Surface GraphQL errors clearly
-    if (j.errors?.length) {
-      return NextResponse.json(
-        { ok: false, error: j.errors.map((e: any) => e.message).join("; ") },
-        { status: 502 },
-      );
-    }
-
-    const blobs = j?.data?.blobs ?? [];
-    const total = j?.data?.blobs_aggregate?.aggregate?.count ?? 0;
-    const nextCursor = blobs.length === PAGE_SIZE ? cursor + PAGE_SIZE : null;
-
-    return NextResponse.json({ ok: true, network, blobs, total, cursor, nextCursor });
-  } catch (err: any) {
-    return NextResponse.json(
-      { ok: false, error: err?.message ?? String(err) },
-      { status: 500 },
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[/api/network/blobs-data]", msg);
+    return Response.json(
+      { ok: false, error: msg.includes("abort") ? "Request timed out" : msg, blobs: [] },
+      { status: 500 }
     );
   }
 }

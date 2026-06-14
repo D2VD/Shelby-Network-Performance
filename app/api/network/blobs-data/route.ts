@@ -1,23 +1,24 @@
-// app/api/network/blobs-data/route.ts — v2.0
-// FIX: use the same env vars + fallback chain as app/api/network/providers/route.ts
-//   (SHELBY_API_URL → SHELBY_WORKER_URL → SHELBY_BENCHMARK_WORKER_URL)
-// No Authorization header — auth is handled at the Cloudflare Tunnel level,
-// same as the providers route. VPS_API_URL / INTERNAL_API_KEY do not exist
-// in this project's env and were a mistaken guess in v1.
+// app/api/network/blobs-data/route.ts — v3.0
+// FIX vs v2: dropped SHELBY_BENCHMARK_WORKER_URL from the fallback chain —
+// it's a different service and was producing a confusing "last tried" error
+// (e.g. "Non-JSON response (404) from https://…/api/benchmark"). Errors from
+// every attempted URL are now collected and reported together so it's clear
+// whether the problem is "VPS route not deployed yet" (404, text/plain) vs
+// "VPS unreachable" (network error).
 
 import { type NextRequest, NextResponse } from "next/server";
 
 export const runtime = "edge";
 
+// Only the main API + its load-balanced worker handle /api/network/*.
+// SHELBY_BENCHMARK_WORKER_URL is a separate service (benchmark results only)
+// and never has this route — including it just produced misleading errors.
 const VPS_URLS = [
   process.env.SHELBY_API_URL,
   process.env.SHELBY_WORKER_URL,
-  process.env.SHELBY_BENCHMARK_WORKER_URL,
 ].filter(Boolean) as string[];
 
 export async function GET(req: NextRequest) {
-  // Forward all incoming query params as-is:
-  //   network, status, address, name, cursor, limit
   const params = req.nextUrl.searchParams;
 
   if (VPS_URLS.length === 0) {
@@ -27,7 +28,7 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  let lastError = "";
+  const attempts: string[] = [];
 
   for (const vpsUrl of VPS_URLS) {
     try {
@@ -41,11 +42,11 @@ export async function GET(req: NextRequest) {
 
       clearTimeout(timeoutId);
 
-      // Guard: VPS route not yet deployed → may return HTML 404 page.
-      // Don't pass that through — try the next URL / surface a clean error.
       const ct = r.headers.get("content-type") ?? "";
       if (!ct.includes("application/json")) {
-        lastError = `Non-JSON response (${r.status}) from ${vpsUrl}`;
+        // Most common cause: route not yet mounted on this backend (Hono's
+        // default 404 handler returns text/plain, not JSON)
+        attempts.push(`${vpsUrl} → HTTP ${r.status} (${ct || "no content-type"})`);
         continue;
       }
 
@@ -58,12 +59,18 @@ export async function GET(req: NextRequest) {
         },
       });
     } catch (e: any) {
-      lastError = e.message ?? String(e);
+      attempts.push(`${vpsUrl} → ${e.message ?? String(e)}`);
     }
   }
 
   return NextResponse.json(
-    { ok: false, error: `VPS unreachable: ${lastError}`, blobs: [] },
+    {
+      ok: false,
+      error: "Blob search endpoint not available on any backend yet",
+      detail: attempts,
+      note: "If all attempts show 'HTTP 404 (no content-type)', the /api/network/blobs-data route hasn't been deployed/mounted on the VPS yet.",
+      blobs: [],
+    },
     { status: 503 }
   );
 }

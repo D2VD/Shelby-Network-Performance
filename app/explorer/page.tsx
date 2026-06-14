@@ -1,6 +1,11 @@
 "use client";
 /**
- * app/explorer/page.tsx — v3.3
+ * app/explorer/page.tsx — v3.4
+ *
+ * Changes vs v3.3:
+ *  9. EmptyState: new optional `mono` prop — renders multi-line, monospace,
+ *     left-aligned sub-text. Used for the blob-search error so the per-backend
+ *     attempt list (from blobs-data v3) is readable instead of one run-on line.
  *
  * Changes vs v3.2:
  *  7. aptosExplorerTxn/Account — use Aptos Explorer's built-in "shelbynet"
@@ -133,13 +138,19 @@ function Badge({ ok }: { ok: boolean }) {
     </span>
   );
 }
-function EmptyState({ icon, title, sub }: { icon: string; title: string; sub?: string }) {
+function EmptyState({ icon, title, sub, mono }: { icon: string; title: string; sub?: string; mono?: boolean }) {
   return (
     <div style={{ padding: "56px 24px", textAlign: "center" }}>
       <div style={{ fontSize: 40, marginBottom: 14 }}>{icon}</div>
       <div style={{ fontSize: 17, fontWeight: 700, color: "var(--text-primary)", marginBottom: 8 }}>{title}</div>
-      {sub && <div style={{ fontSize: 14, color: "var(--text-muted)", maxWidth: 440,
-                             margin: "0 auto", lineHeight: 1.6 }}>{sub}</div>}
+      {sub && (
+        <div style={mono
+          ? { fontSize: 12, color: "var(--text-muted)", maxWidth: 480, margin: "0 auto",
+              lineHeight: 1.7, whiteSpace: "pre-line", textAlign: "left", ...MONO }
+          : { fontSize: 14, color: "var(--text-muted)", maxWidth: 440, margin: "0 auto",
+              lineHeight: 1.6 }
+        }>{sub}</div>
+      )}
     </div>
   );
 }
@@ -600,9 +611,12 @@ function BlobSearchPanel({ blobName, network, onVersionClick }: {
         }
         return r.json();
       })
-      .then((j: { ok: boolean; blobs?: typeof blobs; error?: string; note?: string }) => {
+      .then((j: { ok: boolean; blobs?: typeof blobs; error?: string; note?: string; detail?: string[] }) => {
         if (cancelled) return;
-        if (!j.ok) throw new Error(j.note ?? j.error ?? "Search failed");
+        if (!j.ok) {
+          const msg = [j.error, j.note, ...(j.detail ?? [])].filter(Boolean).join("\n");
+          throw new Error(msg || "Search failed");
+        }
         setBlobs(j.blobs ?? []);
       })
       .catch(e => { if (!cancelled) setError((e as Error).message); })
@@ -611,7 +625,7 @@ function BlobSearchPanel({ blobName, network, onVersionClick }: {
   }, [blobName, network]);
 
   if (loading) return <Spinner label={`Searching for "${blobName}"…`}/>;
-  if (error)   return <EmptyState icon="⚠️" title="Search failed" sub={error}/>;
+  if (error)   return <EmptyState icon="⚠️" title="Search failed" sub={error} mono/>;
   if (!blobs.length) return <EmptyState icon="🔍" title="Blob not found" sub={`No blob matching "${blobName}" was found in the indexed data.`}/>;
 
   return (

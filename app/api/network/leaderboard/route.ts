@@ -1,58 +1,52 @@
-// app/api/network/leaderboard/route.ts — v1.0
-// Edge proxy: forwards leaderboard requests to VPS.
-// Uses SHELBY_API_URL (general base) — never SHELBY_WORKER_URL.
+// app/api/network/leaderboard/route.ts
+// Edge proxy → VPS /api/network/leaderboard
+// v1.0
 
 import { NextRequest, NextResponse } from "next/server";
 
-const VPS_BASE = process.env.SHELBY_API_URL;
+const VPS_BASE = process.env.SHELBY_API_URL ?? "";
 
 export const runtime = "edge";
 
-export async function GET(request: NextRequest): Promise<NextResponse> {
+export async function GET(req: NextRequest) {
   if (!VPS_BASE) {
     return NextResponse.json(
-      { error: "SHELBY_API_URL is not configured" },
-      { status: 500 }
+      { error: "SHELBY_API_URL not configured" },
+      { status: 503 }
     );
   }
 
-  const { searchParams } = new URL(request.url);
+  // Forward only the params we care about
+  const incoming = req.nextUrl.searchParams;
+  const params = new URLSearchParams();
 
-  // Whitelist params forwarded upstream — no passthrough of arbitrary params
-  const network = searchParams.get("network") ?? "shelbynet";
-  const sort = searchParams.get("sort") ?? "score";
-  const limit = searchParams.get("limit") ?? "50";
+  const network = incoming.get("network") ?? "testnet";
+  const sort    = incoming.get("sort")    ?? "score";
+  const limit   = incoming.get("limit")   ?? "50";
 
-  const upstream = `${VPS_BASE}/api/network/leaderboard?network=${encodeURIComponent(network)}&sort=${encodeURIComponent(sort)}&limit=${encodeURIComponent(limit)}`;
+  params.set("network", network);
+  params.set("sort",    sort);
+  params.set("limit",   limit);
+
+  const upstream = `${VPS_BASE}/api/network/leaderboard?${params.toString()}`;
 
   try {
     const res = await fetch(upstream, {
-      headers: { "Content-Type": "application/json" },
-      // 60s revalidation — leaderboard data doesn't change faster than sync interval
-      next: { revalidate: 60 },
+      headers: { "x-shelby-internal": "1" },
+      next: { revalidate: 300 }, // 5-min edge cache
     });
 
-    if (!res.ok) {
-      const text = await res.text();
-      return NextResponse.json(
-        { error: `Upstream error ${res.status}: ${text}` },
-        { status: res.status }
-      );
-    }
+    const body = await res.text();
 
-    const data = await res.json();
-
-    return NextResponse.json(data, {
+    return new NextResponse(body, {
+      status: res.status,
       headers: {
-        // Allow CDN/browser to cache for 60s
-        "Cache-Control": "public, s-maxage=60, stale-while-revalidate=30",
+        "content-type": res.headers.get("content-type") ?? "application/json",
+        "cache-control": "public, s-maxage=300, stale-while-revalidate=60",
       },
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    return NextResponse.json(
-      { error: `Upstream unreachable: ${message}` },
-      { status: 502 }
-    );
+    const msg = err instanceof Error ? err.message : "upstream error";
+    return NextResponse.json({ error: msg }, { status: 502 });
   }
 }

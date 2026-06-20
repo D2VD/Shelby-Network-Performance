@@ -1,512 +1,328 @@
+// components/leaderboard-tab.tsx
+// SP Performance Leaderboard — Phase 3 Week 4 (B1)
+// v1.0
+
 "use client";
-// components/leaderboard-tab.tsx — v1.0
-// SP Performance Leaderboard (Roadmap B1 — Phase 4 simplified)
-// Self-contained: fetches /api/network/leaderboard, renders ranked SP table.
-// Reputation score formula: uptime(70%) + stake_normalized(30%)
-// Drop into /explorer?tab=leaderboard or any other page.
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { RefreshCw, Trophy, TrendingUp, Zap } from "lucide-react";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ── Types ──────────────────────────────────────────────────────────────────────
 
 type SortKey = "score" | "uptime" | "stake";
-type Network = "shelbynet" | "testnet";
 
-interface SpLeaderboardEntry {
+interface LeaderboardEntry {
   rank: number;
   address: string;
   az: string;
-  uptime_pct: number;
-  healthy_snapshots: number;
-  total_snapshots: number;
-  current_health: string;
-  stake_octas: string;
-  stake_apt: string;
-  last_seen: string;
-  reputation_score: number;
+  condition: number;
+  stake: string;
+  uptimePct: number;
+  reputationScore: number;
+  firstSeen: string;
+  lastSeen: string;
 }
 
 interface LeaderboardResponse {
-  leaderboard: SpLeaderboardEntry[];
-  count: number;
-  total: number;
   network: string;
-  sort: string;
+  sort: SortKey;
+  count: number;
   generatedAt: string;
+  leaderboard: LeaderboardEntry[];
 }
 
-// ─── Props ────────────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
-interface LeaderboardTabProps {
-  /** Network selected externally (e.g. from a shared network context). */
-  initialNetwork?: Network;
+function str(v: unknown): string {
+  if (v === null || v === undefined) return "—";
+  return String(v);
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+function num(v: unknown, decimals = 0): string {
+  const n = Number(v);
+  if (isNaN(n)) return "—";
+  return n.toLocaleString("en-US", {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+}
 
-function truncateAddress(addr: string): string {
-  if (addr.length <= 14) return addr;
+function shortAddress(addr: string): string {
+  if (!addr || addr.length < 12) return addr;
   return `${addr.slice(0, 8)}…${addr.slice(-6)}`;
 }
 
-function relativeTime(isoString: string): string {
-  const diff = Date.now() - new Date(isoString).getTime();
-  const mins = Math.floor(diff / 60_000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  return `${Math.floor(hrs / 24)}d ago`;
+function stakeToApt(octas: string): string {
+  const n = Number(octas);
+  if (isNaN(n)) return "—";
+  return num(n / 1e8, 2) + " APT";
 }
 
 function scoreColor(score: number): string {
-  if (score >= 90) return "text-emerald-600 bg-emerald-50 border-emerald-200";
-  if (score >= 75) return "text-blue-600 bg-blue-50 border-blue-200";
-  if (score >= 55) return "text-yellow-600 bg-yellow-50 border-yellow-200";
-  return "text-red-600 bg-red-50 border-red-200";
+  if (score >= 80) return "text-emerald-600";
+  if (score >= 60) return "text-yellow-600";
+  return "text-red-500";
 }
 
-function rankBadge(rank: number): string {
-  if (rank === 1) return "🥇";
-  if (rank === 2) return "🥈";
-  if (rank === 3) return "🥉";
-  return String(rank);
+function scoreBadgeVariant(score: number): "default" | "secondary" | "destructive" {
+  if (score >= 80) return "default";
+  if (score >= 60) return "secondary";
+  return "destructive";
 }
 
-// Derive a consistent pastel background for an AZ name
-function azColor(az: string): string {
-  const colors: Record<string, string> = {
-    "AR-0":       "bg-purple-100 text-purple-700",
-    "AR-1":       "bg-purple-100 text-purple-700",
-    "Duoro-0":    "bg-cyan-100 text-cyan-700",
-    "Jump-AMS-0": "bg-orange-100 text-orange-700",
-    "Jump-AMS-1": "bg-orange-100 text-orange-700",
-    "Jump-LON-0": "bg-rose-100 text-rose-700",
-    "Jump-LON-1": "bg-rose-100 text-rose-700",
-    "Nova-0":     "bg-indigo-100 text-indigo-700",
-    "Republic-0": "bg-teal-100 text-teal-700",
-    "Stakely-0":  "bg-green-100 text-green-700",
-  };
-  return colors[az] ?? "bg-gray-100 text-gray-700";
+function rankIcon(rank: number) {
+  if (rank === 1) return <Trophy className="inline h-4 w-4 text-yellow-500 mr-1" />;
+  if (rank === 2) return <Trophy className="inline h-4 w-4 text-gray-400 mr-1" />;
+  if (rank === 3) return <Trophy className="inline h-4 w-4 text-amber-700 mr-1" />;
+  return null;
 }
 
-// ─── Sub-components ───────────────────────────────────────────────────────────
-
-function UptimeBar({ pct }: { pct: number }) {
-  const color =
-    pct >= 95
-      ? "bg-emerald-500"
-      : pct >= 80
-      ? "bg-blue-500"
-      : pct >= 60
-      ? "bg-yellow-500"
-      : "bg-red-500";
-
-  return (
-    <div className="flex items-center gap-2 min-w-[110px]">
-      <div className="flex-1 h-1.5 bg-gray-100 rounded-full overflow-hidden">
-        <div
-          className={`h-full rounded-full ${color} transition-all duration-500`}
-          style={{ width: `${Math.min(100, pct)}%` }}
-        />
-      </div>
-      <span className="text-xs tabular-nums text-gray-600 w-12 text-right">
-        {pct.toFixed(1)}%
-      </span>
-    </div>
-  );
+function conditionLabel(condition: number): { label: string; variant: "default" | "secondary" | "destructive" } {
+  // condition=0 → Healthy; condition=1 → Faulty (per project rules: no grace period)
+  if (condition === 0) return { label: "Healthy", variant: "default" };
+  return { label: "Faulty", variant: "destructive" };
 }
 
-function HealthBadge({ health }: { health: string }) {
-  const isHealthy = health === "Healthy";
-  return (
-    <span
-      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium border ${
-        isHealthy
-          ? "text-emerald-700 bg-emerald-50 border-emerald-200"
-          : "text-red-700 bg-red-50 border-red-200"
-      }`}
-    >
-      <span
-        className={`w-1.5 h-1.5 rounded-full ${
-          isHealthy ? "bg-emerald-500" : "bg-red-500"
-        }`}
-      />
-      {health}
-    </span>
-  );
+// ── Component ──────────────────────────────────────────────────────────────────
+
+interface LeaderboardTabProps {
+  initialNetwork?: "shelbynet" | "testnet";
 }
 
-function SortButton({
-  label,
-  active,
-  onClick,
-}: {
-  label: string;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`px-3 py-1.5 text-sm rounded-md border transition-colors ${
-        active
-          ? "bg-gray-900 text-white border-gray-900"
-          : "bg-white text-gray-600 border-gray-200 hover:border-gray-400 hover:text-gray-900"
-      }`}
-    >
-      {label}
-    </button>
-  );
-}
-
-function NetworkToggle({
-  value,
-  onChange,
-}: {
-  value: Network;
-  onChange: (n: Network) => void;
-}) {
-  return (
-    <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1">
-      {(["shelbynet", "testnet"] as Network[]).map((n) => (
-        <button
-          key={n}
-          onClick={() => onChange(n)}
-          className={`px-3 py-1 text-sm rounded-md transition-colors capitalize ${
-            value === n
-              ? "bg-white text-gray-900 shadow-sm font-medium"
-              : "text-gray-500 hover:text-gray-700"
-          }`}
-        >
-          {n === "shelbynet" ? "Shelbynet" : "Testnet"}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-// ─── Skeleton loader ──────────────────────────────────────────────────────────
-
-function SkeletonRows() {
-  return (
-    <>
-      {Array.from({ length: 8 }).map((_, i) => (
-        <tr key={i} className="border-b border-gray-50">
-          {Array.from({ length: 7 }).map((_, j) => (
-            <td key={j} className="px-4 py-3">
-              <div className="h-4 bg-gray-100 rounded animate-pulse w-full" />
-            </td>
-          ))}
-        </tr>
-      ))}
-    </>
-  );
-}
-
-// ─── Main component ───────────────────────────────────────────────────────────
-
-export function LeaderboardTab({ initialNetwork = "shelbynet" }: LeaderboardTabProps) {
-  const [network, setNetwork] = useState<Network>(initialNetwork);
+export function LeaderboardTab({ initialNetwork = "testnet" }: LeaderboardTabProps) {
+  const [network, setNetwork] = useState<"shelbynet" | "testnet">(initialNetwork);
   const [sort, setSort] = useState<SortKey>("score");
   const [data, setData] = useState<LeaderboardResponse | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [copiedAddr, setCopiedAddr] = useState<string | null>(null);
-  const [lastRefreshed, setLastRefreshed] = useState<string>("");
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [lastRefresh, setLastRefresh] = useState<string>("");
 
-  const fetchLeaderboard = useCallback(
-    async (net: Network, sortKey: SortKey, signal: AbortSignal) => {
-      setLoading(true);
-      setError(null);
-      try {
-        const res = await fetch(
-          `/api/network/leaderboard?network=${net}&sort=${sortKey}&limit=50`,
-          { signal }
-        );
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-          throw new Error(body.error ?? `HTTP ${res.status}`);
-        }
-        const json: LeaderboardResponse = await res.json();
-        setData(json);
-        setLastRefreshed(new Date().toLocaleTimeString("en-US", { hour12: false }));
-      } catch (err) {
-        if ((err as Error).name === "AbortError") return;
-        setError(err instanceof Error ? err.message : "Failed to load leaderboard");
-      } finally {
-        setLoading(false);
+  const fetchLeaderboard = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(
+        `/api/network/leaderboard?network=${network}&sort=${sort}&limit=50`
+      );
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}${body ? `: ${body}` : ""}`);
       }
-    },
-    []
-  );
+      const json: LeaderboardResponse = await res.json();
+      setData(json);
+      setLastRefresh(new Date().toLocaleTimeString("en-US"));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  }, [network, sort]);
 
-  // Fetch on network/sort change; refresh every 5 minutes
+  // Fetch on mount and when filters change
   useEffect(() => {
-    const controller = new AbortController();
+    fetchLeaderboard();
+  }, [fetchLeaderboard]);
 
-    fetchLeaderboard(network, sort, controller.signal);
-
-    if (intervalRef.current) clearInterval(intervalRef.current);
-    intervalRef.current = setInterval(
-      () => fetchLeaderboard(network, sort, controller.signal),
-      5 * 60 * 1000
-    );
-
-    return () => {
-      controller.abort();
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, [network, sort, fetchLeaderboard]);
-
-  // Copy address to clipboard
-  const copyAddress = useCallback((addr: string) => {
-    navigator.clipboard.writeText(addr).then(() => {
-      setCopiedAddr(addr);
-      setTimeout(() => setCopiedAddr(null), 1500);
-    });
-  }, []);
-
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Render ───────────────────────────────────────────────────────────────────
 
   return (
     <div className="space-y-4">
-      {/* Header row */}
+      {/* Controls */}
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-lg font-semibold text-gray-900">
-            SP Performance Leaderboard
-          </h2>
-          <p className="text-sm text-gray-500 mt-0.5">
-            Ranked by reputation score — 30-day uptime window
-            {lastRefreshed && (
-              <span className="ml-2 text-gray-400">· Refreshed {lastRefreshed}</span>
-            )}
-          </p>
+        <div className="flex items-center gap-2">
+          <Select
+            value={network}
+            onValueChange={(v) => setNetwork(v as "shelbynet" | "testnet")}
+          >
+            <SelectTrigger className="w-36 h-8 text-sm">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="shelbynet">Shelbynet</SelectItem>
+              <SelectItem value="testnet">Testnet</SelectItem>
+            </SelectContent>
+          </Select>
+
+          <Select value={sort} onValueChange={(v) => setSort(v as SortKey)}>
+            <SelectTrigger className="w-44 h-8 text-sm">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="score">
+                <span className="flex items-center gap-1">
+                  <Zap className="h-3.5 w-3.5" /> Sort: Reputation Score
+                </span>
+              </SelectItem>
+              <SelectItem value="uptime">
+                <span className="flex items-center gap-1">
+                  <TrendingUp className="h-3.5 w-3.5" /> Sort: Uptime %
+                </span>
+              </SelectItem>
+              <SelectItem value="stake">
+                <span className="flex items-center gap-1">
+                  <Trophy className="h-3.5 w-3.5" /> Sort: Stake
+                </span>
+              </SelectItem>
+            </SelectContent>
+          </Select>
         </div>
 
-        <div className="flex items-center gap-3">
-          <NetworkToggle value={network} onChange={setNetwork} />
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          {lastRefresh && <span>Updated {lastRefresh}</span>}
+          {data && <span>· {data.count} providers</span>}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2"
+            onClick={fetchLeaderboard}
+            disabled={loading}
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
+          </Button>
         </div>
       </div>
 
-      {/* Sort controls */}
-      <div className="flex items-center gap-2">
-        <span className="text-sm text-gray-500">Sort by:</span>
-        <SortButton
-          label="Reputation Score"
-          active={sort === "score"}
-          onClick={() => setSort("score")}
-        />
-        <SortButton
-          label="Uptime"
-          active={sort === "uptime"}
-          onClick={() => setSort("uptime")}
-        />
-        <SortButton
-          label="Stake"
-          active={sort === "stake"}
-          onClick={() => setSort("stake")}
-        />
-
-        {data && !loading && (
-          <span className="ml-auto text-sm text-gray-400">
-            {data.count} of {data.total} providers
-          </span>
-        )}
+      {/* Score formula callout */}
+      <div className="rounded-md bg-muted/50 border px-3 py-2 text-xs text-muted-foreground">
+        <span className="font-semibold text-foreground">Reputation Score</span>
+        {" "}= Uptime % × 0.70 + Normalized Stake × 0.30 · Updated every 5 min from sp_snapshots
       </div>
 
-      {/* Error state */}
-      {error && !loading && (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          <strong>Error loading leaderboard:</strong> {error}
+      {/* Error */}
+      {error && (
+        <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Failed to load leaderboard: {error}
+        </div>
+      )}
+
+      {/* Loading skeleton */}
+      {loading && !data && (
+        <div className="space-y-2">
+          {Array.from({ length: 8 }).map((_, i) => (
+            <div key={i} className="h-10 rounded-md bg-muted animate-pulse" />
+          ))}
         </div>
       )}
 
       {/* Table */}
-      <div className="rounded-xl border border-gray-200 bg-white overflow-hidden shadow-sm">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="bg-gray-50 border-b border-gray-200 text-left">
-                <th className="px-4 py-3 font-medium text-gray-500 text-center w-12">
-                  Rank
-                </th>
-                <th className="px-4 py-3 font-medium text-gray-500">Address</th>
-                <th className="px-4 py-3 font-medium text-gray-500">Zone</th>
-                <th className="px-4 py-3 font-medium text-gray-500 text-center">
-                  Score
-                </th>
-                <th className="px-4 py-3 font-medium text-gray-500">
-                  Uptime (30d)
-                </th>
-                <th className="px-4 py-3 font-medium text-gray-500 text-right">
-                  Stake (APT)
-                </th>
-                <th className="px-4 py-3 font-medium text-gray-500">Status</th>
-                <th className="px-4 py-3 font-medium text-gray-500 text-right pr-5">
-                  Last Seen
-                </th>
-              </tr>
-            </thead>
-
-            <tbody className="divide-y divide-gray-50">
-              {loading ? (
-                <SkeletonRows />
-              ) : !data || data.leaderboard.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={8}
-                    className="px-4 py-12 text-center text-gray-400 text-sm"
-                  >
-                    No data available for{" "}
-                    <span className="font-medium">{network}</span>
-                  </td>
-                </tr>
-              ) : (
-                data.leaderboard.map((sp) => (
-                  <tr
-                    key={sp.address}
-                    className="hover:bg-gray-50/60 transition-colors"
+      {data && (
+        <div className="rounded-md border overflow-hidden">
+          <Table>
+            <TableHeader>
+              <TableRow className="bg-muted/30">
+                <TableHead className="w-12 text-center">#</TableHead>
+                <TableHead>Address</TableHead>
+                <TableHead>AZ</TableHead>
+                <TableHead className="text-center">Status</TableHead>
+                <TableHead className="text-right">Stake</TableHead>
+                <TableHead className="text-right">Uptime (30d)</TableHead>
+                <TableHead className="text-right font-semibold">Score</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.leaderboard.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={7} className="text-center text-muted-foreground py-8">
+                    No data available. sp_snapshots may still be populating.
+                  </TableCell>
+                </TableRow>
+              )}
+              {data.leaderboard.map((entry) => {
+                const cond = conditionLabel(entry.condition);
+                return (
+                  <TableRow
+                    key={entry.address}
+                    className="hover:bg-muted/20 transition-colors"
                   >
                     {/* Rank */}
-                    <td className="px-4 py-3 text-center font-mono text-gray-600">
-                      {sp.rank <= 3 ? (
-                        <span className="text-base">{rankBadge(sp.rank)}</span>
-                      ) : (
-                        <span className="text-xs text-gray-400 tabular-nums">
-                          #{sp.rank}
-                        </span>
-                      )}
-                    </td>
+                    <TableCell className="text-center font-mono text-sm font-medium">
+                      {rankIcon(entry.rank)}
+                      {entry.rank}
+                    </TableCell>
 
                     {/* Address */}
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-2">
-                        <span className="font-mono text-xs text-gray-700">
-                          {truncateAddress(sp.address)}
-                        </span>
-                        <button
-                          onClick={() => copyAddress(sp.address)}
-                          title="Copy full address"
-                          className="text-gray-300 hover:text-gray-600 transition-colors"
-                        >
-                          {copiedAddr === sp.address ? (
-                            <CheckIcon />
-                          ) : (
-                            <CopyIcon />
-                          )}
-                        </button>
-                      </div>
-                    </td>
-
-                    {/* AZ badge */}
-                    <td className="px-4 py-3">
-                      <span
-                        className={`inline-block px-2 py-0.5 rounded text-[11px] font-medium ${azColor(
-                          sp.az
-                        )}`}
+                    <TableCell className="font-mono text-xs">
+                      <a
+                        href={`https://explorer.aptoslabs.com/account/${entry.address}?network=testnet`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="hover:underline text-blue-600 dark:text-blue-400"
+                        title={entry.address}
                       >
-                        {sp.az}
-                      </span>
-                    </td>
+                        {shortAddress(str(entry.address))}
+                      </a>
+                    </TableCell>
 
-                    {/* Reputation score */}
-                    <td className="px-4 py-3 text-center">
-                      <span
-                        className={`inline-block min-w-[42px] px-2 py-0.5 rounded border text-xs font-semibold tabular-nums ${scoreColor(
-                          sp.reputation_score
-                        )}`}
-                      >
-                        {sp.reputation_score}
+                    {/* AZ */}
+                    <TableCell className="text-sm">
+                      <span className="font-mono text-xs bg-muted rounded px-1.5 py-0.5">
+                        {str(entry.az) || "—"}
                       </span>
-                    </td>
+                    </TableCell>
 
-                    {/* Uptime bar */}
-                    <td className="px-4 py-3">
-                      <UptimeBar pct={sp.uptime_pct} />
-                      <span className="text-[10px] text-gray-400 tabular-nums">
-                        {sp.healthy_snapshots.toLocaleString("en-US")} /{" "}
-                        {sp.total_snapshots.toLocaleString("en-US")} checks
-                      </span>
-                    </td>
+                    {/* Status */}
+                    <TableCell className="text-center">
+                      <Badge variant={cond.variant} className="text-xs">
+                        {cond.label}
+                      </Badge>
+                    </TableCell>
 
                     {/* Stake */}
-                    <td className="px-4 py-3 text-right tabular-nums text-gray-700 font-mono text-xs">
-                      {sp.stake_apt}
-                    </td>
+                    <TableCell className="text-right text-sm font-mono">
+                      {stakeToApt(str(entry.stake))}
+                    </TableCell>
 
-                    {/* Health */}
-                    <td className="px-4 py-3">
-                      <HealthBadge health={sp.current_health} />
-                    </td>
+                    {/* Uptime */}
+                    <TableCell className="text-right text-sm">
+                      <span className={entry.uptimePct >= 95 ? "text-emerald-600" : entry.uptimePct >= 80 ? "text-yellow-600" : "text-red-500"}>
+                        {num(entry.uptimePct, 1)}%
+                      </span>
+                    </TableCell>
 
-                    {/* Last seen */}
-                    <td className="px-4 py-3 text-right pr-5 text-xs text-gray-400">
-                      {relativeTime(sp.last_seen)}
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        {/* Footer */}
-        {data && !loading && data.leaderboard.length > 0 && (
-          <div className="px-4 py-3 bg-gray-50 border-t border-gray-100 flex items-center justify-between text-xs text-gray-400">
-            <span>
-              Score = uptime (70%) + normalized stake (30%) · Updates every 5 minutes
-            </span>
-            <span>
-              Generated {new Date(data.generatedAt).toLocaleTimeString("en-US", {
-                hour12: false,
+                    {/* Score */}
+                    <TableCell className="text-right">
+                      <Badge
+                        variant={scoreBadgeVariant(entry.reputationScore)}
+                        className="tabular-nums font-semibold"
+                      >
+                        <span className={scoreColor(entry.reputationScore)}>
+                          {num(entry.reputationScore, 0)}
+                        </span>
+                      </Badge>
+                    </TableCell>
+                  </TableRow>
+                );
               })}
-            </span>
-          </div>
-        )}
-      </div>
+            </TableBody>
+          </Table>
+        </div>
+      )}
+
+      {/* Footer meta */}
+      {data && (
+        <p className="text-xs text-muted-foreground text-right">
+          {data.generatedAt
+            ? `Data as of ${new Date(data.generatedAt).toLocaleString("en-US")}`
+            : ""}
+        </p>
+      )}
     </div>
-  );
-}
-
-// ─── Inline micro-icons (no lucide-react dependency) ─────────────────────────
-
-function CopyIcon() {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      width="12"
-      height="12"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-    </svg>
-  );
-}
-
-function CheckIcon() {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      width="12"
-      height="12"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="text-emerald-500"
-    >
-      <polyline points="20 6 9 17 4 12" />
-    </svg>
   );
 }

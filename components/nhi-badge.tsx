@@ -1,10 +1,13 @@
-// components/nhi-badge.tsx
-// Network Health Index — badge (nav) + card (landing/network page)
-// Priority 1: Network Health Index
+// components/nhi-badge.tsx — v1.1
+// CHANGES:
+//   - Theme-aware color maps (light mode: darker text + opaque bg, dark mode: existing translucent)
+//   - NHI card footer timestamp → UTC (matches dashboard header clock)
+//   - useTheme import for isDark detection
 
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { useTheme } from "./theme-context";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -22,19 +25,50 @@ interface NHIData {
   updatedAt: string;
 }
 
-// ── Shared helpers ────────────────────────────────────────────────────────────
+type ColorKey = "green" | "yellow" | "red";
 
-const COLOR = {
-  green:  { bg: "bg-green-500/10",  border: "border-green-500/25",  text: "text-green-400",  dot: "bg-green-400",  bar: "bg-green-400"  },
-  yellow: { bg: "bg-yellow-500/10", border: "border-yellow-500/25", text: "text-yellow-400", dot: "bg-yellow-400", bar: "bg-yellow-400" },
-  red:    { bg: "bg-red-500/10",    border: "border-red-500/25",    text: "text-red-400",    dot: "bg-red-400",    bar: "bg-red-400"    },
-} as const;
+// ── Theme-aware color maps ────────────────────────────────────────────────────
+// Dark: translucent tints work well on dark backgrounds
+// Light: fully opaque tints + darker text for WCAG contrast
 
-function scoreColor(score: number): string {
-  if (score >= 80) return "bg-green-400";
-  if (score >= 60) return "bg-yellow-400";
-  return "bg-red-400";
+const DARK_COLOR: Record<ColorKey, { bg: string; border: string; text: string; dot: string }> = {
+  green:  { bg: "bg-green-500/10",  border: "border-green-500/25",  text: "text-green-400",  dot: "bg-green-400"  },
+  yellow: { bg: "bg-yellow-500/10", border: "border-yellow-500/25", text: "text-yellow-400", dot: "bg-yellow-400" },
+  red:    { bg: "bg-red-500/10",    border: "border-red-500/25",    text: "text-red-400",    dot: "bg-red-400"    },
+};
+
+const LIGHT_COLOR: Record<ColorKey, { bg: string; border: string; text: string; dot: string }> = {
+  green:  { bg: "bg-green-50",  border: "border-green-300",  text: "text-green-700",  dot: "bg-green-500"  },
+  yellow: { bg: "bg-amber-50",  border: "border-amber-300",  text: "text-amber-700",  dot: "bg-amber-500"  },
+  red:    { bg: "bg-red-50",    border: "border-red-300",    text: "text-red-700",    dot: "bg-red-500"    },
+};
+
+// Progress bar: slightly more saturated in light mode for visibility
+function scoreBarColor(score: number, isDark: boolean): string {
+  if (isDark) {
+    if (score >= 80) return "bg-green-400";
+    if (score >= 60) return "bg-yellow-400";
+    return "bg-red-400";
+  } else {
+    if (score >= 80) return "bg-green-500";
+    if (score >= 60) return "bg-amber-500";
+    return "bg-red-500";
+  }
 }
+
+// ── UTC timestamp formatter ───────────────────────────────────────────────────
+
+function fmtUTC(iso: string): string {
+  return new Date(iso).toLocaleTimeString("en-US", {
+    hour:       "2-digit",
+    minute:     "2-digit",
+    second:     "2-digit",
+    timeZone:   "UTC",
+    hour12:     false,
+  }) + " UTC";
+}
+
+// ── Data fetcher ──────────────────────────────────────────────────────────────
 
 async function fetchNHI(network: string): Promise<NHIData> {
   const res = await fetch(`/api/network/nhi?network=${encodeURIComponent(network)}`);
@@ -43,8 +77,10 @@ async function fetchNHI(network: string): Promise<NHIData> {
 }
 
 // ── NHIBadge — compact pill for nav bar ──────────────────────────────────────
+// Note: nav.tsx has its own inline NhiBadge; this export is for other consumers.
 
 export function NHIBadge({ network = "shelbynet" }: { network?: string }) {
+  const { isDark } = useTheme();
   const [data, setData] = useState<NHIData | null>(null);
 
   const load = useCallback(async () => {
@@ -57,17 +93,19 @@ export function NHIBadge({ network = "shelbynet" }: { network?: string }) {
     return () => clearInterval(id);
   }, [load]);
 
-  // Skeleton
   if (!data) {
     return (
-      <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-xs text-white/30 font-mono select-none">
-        <span className="w-1.5 h-1.5 rounded-full bg-white/20" />
+      <div
+        className="flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-mono select-none"
+        style={{ borderColor: "var(--border)", background: "var(--bg-card)", color: "var(--text-muted)" }}
+      >
+        <span className="w-1.5 h-1.5 rounded-full opacity-30" style={{ background: "currentColor" }} />
         NHI —
       </div>
     );
   }
 
-  const cls = COLOR[data.color];
+  const cls = isDark ? DARK_COLOR[data.color] : LIGHT_COLOR[data.color];
 
   return (
     <div
@@ -83,6 +121,7 @@ export function NHIBadge({ network = "shelbynet" }: { network?: string }) {
 // ── NHICard — full stat card for landing / network page ──────────────────────
 
 export function NHICard({ network = "shelbynet" }: { network?: string }) {
+  const { isDark } = useTheme();
   const [data,    setData]    = useState<NHIData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState(false);
@@ -104,17 +143,20 @@ export function NHICard({ network = "shelbynet" }: { network?: string }) {
     return () => clearInterval(id);
   }, [load]);
 
-  // Skeleton
+  // Skeleton — uses CSS vars so it respects both themes
   if (loading) {
     return (
-      <div className="rounded-2xl border border-white/10 bg-white/5 p-6 animate-pulse">
-        <div className="h-3 bg-white/10 rounded w-2/5 mb-4" />
-        <div className="h-14 bg-white/10 rounded w-1/4 mb-6" />
+      <div
+        className="rounded-2xl border p-6 animate-pulse"
+        style={{ borderColor: "var(--border)", background: "var(--bg-card)" }}
+      >
+        <div className="h-3 rounded w-2/5 mb-4" style={{ background: "var(--bg-hover)" }} />
+        <div className="h-14 rounded w-1/4 mb-6" style={{ background: "var(--bg-hover)" }} />
         <div className="space-y-3">
           {[1, 2, 3, 4].map((i) => (
             <div key={i}>
-              <div className="h-2 bg-white/10 rounded w-3/4 mb-1" />
-              <div className="h-1 bg-white/10 rounded-full" />
+              <div className="h-2 rounded w-3/4 mb-1" style={{ background: "var(--bg-hover)" }} />
+              <div className="h-1 rounded-full" style={{ background: "var(--bg-hover)" }} />
             </div>
           ))}
         </div>
@@ -125,14 +167,31 @@ export function NHICard({ network = "shelbynet" }: { network?: string }) {
   // Error
   if (error || !data) {
     return (
-      <div className="rounded-2xl border border-white/10 bg-white/5 p-6">
-        <p className="text-xs text-white/40 uppercase tracking-wider mb-1">Network Health Index</p>
-        <p className="text-white/30 text-sm">Unavailable</p>
+      <div
+        className="rounded-2xl border p-6"
+        style={{ borderColor: "var(--border)", background: "var(--bg-card)" }}
+      >
+        <p className="text-xs uppercase tracking-wider mb-1" style={{ color: "var(--text-muted)" }}>
+          Network Health Index
+        </p>
+        <p className="text-sm" style={{ color: "var(--text-muted)" }}>Unavailable</p>
       </div>
     );
   }
 
-  const cls = COLOR[data.color];
+  const cls = isDark ? DARK_COLOR[data.color] : LIGHT_COLOR[data.color];
+
+  // Label row text: slightly muted variant relative to the accent color
+  const labelTextCls  = isDark ? "opacity-90" : "opacity-80";
+  // Detail sub-text
+  const detailCls     = isDark ? "text-white/30" : "text-black/35";
+  // Score meta text
+  const scoreCls      = isDark ? "text-white/50" : "text-black/50";
+  const scoreMultiCls = isDark ? "text-white/25" : "text-black/25";
+  // Track background
+  const trackStyle    = isDark ? { background: "rgba(255,255,255,0.08)" } : { background: "rgba(0,0,0,0.08)" };
+  // Footer text
+  const footerCls     = isDark ? "text-white/25" : "text-black/35";
 
   const breakdown = [
     {
@@ -166,13 +225,13 @@ export function NHICard({ network = "shelbynet" }: { network?: string }) {
       {/* Header */}
       <div className="flex items-start justify-between mb-5">
         <div>
-          <p className="text-xs text-white/50 uppercase tracking-wider mb-1.5">
+          <p className={`text-xs uppercase tracking-wider mb-1.5 ${cls.text} ${labelTextCls}`}>
             Network Health Index
           </p>
           <div className={`text-5xl font-bold font-mono leading-none ${cls.text}`}>
             {data.nhi}
           </div>
-          <p className={`text-sm mt-1.5 font-medium ${cls.text}`}>{data.label}</p>
+          <p className={`text-sm mt-1.5 font-semibold ${cls.text}`}>{data.label}</p>
         </div>
         <span className={`w-2.5 h-2.5 rounded-full ${cls.dot} animate-pulse mt-0.5 shrink-0`} />
       </div>
@@ -183,19 +242,19 @@ export function NHICard({ network = "shelbynet" }: { network?: string }) {
           <div key={label}>
             <div className="flex justify-between items-baseline mb-1">
               <div className="flex items-baseline gap-1.5">
-                <span className="text-xs text-white/60">{label}</span>
+                <span className={`text-xs ${cls.text} ${labelTextCls}`}>{label}</span>
                 {detail && (
-                  <span className="text-xs text-white/30">— {detail}</span>
+                  <span className={`text-xs ${detailCls}`}>— {detail}</span>
                 )}
               </div>
-              <span className="text-xs font-mono text-white/50">
+              <span className={`text-xs font-mono ${scoreCls}`}>
                 {score}
-                <span className="text-white/25"> ×{weight}</span>
+                <span className={scoreMultiCls}> ×{weight}</span>
               </span>
             </div>
-            <div className="h-1 bg-white/10 rounded-full overflow-hidden">
+            <div className="h-1 rounded-full overflow-hidden" style={trackStyle}>
               <div
-                className={`h-full rounded-full transition-all duration-700 ${scoreColor(score)}`}
+                className={`h-full rounded-full transition-all duration-700 ${scoreBarColor(score, isDark)}`}
                 style={{ width: `${score}%` }}
               />
             </div>
@@ -203,13 +262,9 @@ export function NHICard({ network = "shelbynet" }: { network?: string }) {
         ))}
       </div>
 
-      {/* Footer */}
-      <p className="text-xs text-white/25 mt-4 font-mono">
-        {new Date(data.updatedAt).toLocaleTimeString("en-US", {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-        })}
+      {/* Footer — UTC timestamp to match dashboard header */}
+      <p className={`text-xs mt-4 font-mono ${footerCls}`}>
+        Updated {fmtUTC(data.updatedAt)}
       </p>
     </div>
   );

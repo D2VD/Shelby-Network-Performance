@@ -193,18 +193,38 @@ export function NHICard({ network = "shelbynet" }: { network?: string }) {
   // Footer text
   const footerCls     = isDark ? "text-white/25" : "text-black/35";
 
+  // ── Quorum detail: "16 healthy / 2 faulty" ──
+  const q = data.components.quorum as Record<string, unknown>;
+  const healthySPs = (q["healthySPs"] as number | undefined) ?? (q["activeProviders"] as number | undefined) ?? 0;
+  const totalSPs   = (q["totalSPs"]   as number | undefined) ?? healthySPs;
+  const faultySPs  = (q["faultySPs"]  as number | undefined) ?? (totalSPs - healthySPs);
+  const quorumDetail =
+    faultySPs > 0
+      ? `${healthySPs} healthy · ${faultySPs} faulty`
+      : `${healthySPs}/${totalSPs} healthy`;
+
+  // ── Blob detail: show count or "no blobs" ──
+  const activeBlobs = data.components.blobAvailability.activeBlobs;
+  const totalBlobs  = data.components.blobAvailability.totalBlobs;
+  const blobDetail =
+    activeBlobs > 0
+      ? `${activeBlobs.toLocaleString("en-US")} active`
+      : totalBlobs === 0
+        ? "no blobs registered"
+        : "0 active blobs";
+
   const breakdown = [
     {
       label:  "SP Quorum",
       score:  data.components.quorum.score,
       weight: "30%",
-      detail: `${data.components.quorum.activeProviders}/${data.components.quorum.maxProviders} active`,
+      detail: quorumDetail,
     },
     {
       label:  "Blob Availability",
       score:  data.components.blobAvailability.score,
       weight: "25%",
-      detail: `${data.components.blobAvailability.activeBlobs.toLocaleString("en-US")} active`,
+      detail: blobDetail,
     },
     {
       label:  "Epoch Health",

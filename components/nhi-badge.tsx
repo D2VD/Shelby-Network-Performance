@@ -1,171 +1,216 @@
-"use client";
-/**
- * components/nhi-badge.tsx — v1.0
- * Network Health Index badge — shown in Nav bar
- *
- * Displays: NHI score 0–100 with color coding
- *   🟢 ≥80 = healthy   → green
- *   🟡 60–79 = degraded → amber
- *   🔴 <60  = critical  → red
- *
- * Fetches from /api/network/health every 60s
- * Shows tooltip on hover with component breakdown
- */
+// components/nhi-badge.tsx
+// Network Health Index — badge (nav) + card (landing/network page)
+// Priority 1: Network Health Index
 
-import { useEffect, useState, useRef, useCallback } from "react";
-import { useNetwork } from "./network-context";
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface NHIData {
-  nhi:    number;
-  status: "healthy" | "degraded" | "critical";
-  detail: string;
-  components?: {
-    spQuorum:          number;
-    nodeAvailability:  number;
-    epochHealth:       number;
-    storageUtilization:number;
+  nhi: number;
+  label: "Healthy" | "Degraded" | "Critical";
+  color: "green" | "yellow" | "red";
+  components: {
+    quorum:             { score: number; weight: number; activeProviders: number; maxProviders: number };
+    blobAvailability:   { score: number; weight: number; activeBlobs: number; totalBlobs: number };
+    epochHealth:        { score: number; weight: number };
+    storageUtilization: { score: number; weight: number };
   };
+  network: string;
+  updatedAt: string;
 }
 
-const STATUS_COLOR: Record<string, string> = {
-  healthy:  "#22c55e",
-  degraded: "#f59e0b",
-  critical: "#ef4444",
-};
+// ── Shared helpers ────────────────────────────────────────────────────────────
 
-const STATUS_BG: Record<string, string> = {
-  healthy:  "rgba(34,197,94,0.12)",
-  degraded: "rgba(245,158,11,0.12)",
-  critical: "rgba(239,68,68,0.12)",
-};
+const COLOR = {
+  green:  { bg: "bg-green-500/10",  border: "border-green-500/25",  text: "text-green-400",  dot: "bg-green-400",  bar: "bg-green-400"  },
+  yellow: { bg: "bg-yellow-500/10", border: "border-yellow-500/25", text: "text-yellow-400", dot: "bg-yellow-400", bar: "bg-yellow-400" },
+  red:    { bg: "bg-red-500/10",    border: "border-red-500/25",    text: "text-red-400",    dot: "bg-red-400",    bar: "bg-red-400"    },
+} as const;
 
-const REFRESH_MS = 60_000;
+function scoreColor(score: number): string {
+  if (score >= 80) return "bg-green-400";
+  if (score >= 60) return "bg-yellow-400";
+  return "bg-red-400";
+}
 
-export function NHIBadge() {
-  const { network }  = useNetwork();
-  const [data,  setData]  = useState<NHIData | null>(null);
-  const [hover, setHover] = useState(false);
-  const alive = useRef(true);
+async function fetchNHI(network: string): Promise<NHIData> {
+  const res = await fetch(`/api/network/nhi?network=${encodeURIComponent(network)}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json() as Promise<NHIData>;
+}
 
-  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+// ── NHIBadge — compact pill for nav bar ──────────────────────────────────────
 
-  const fetch_ = useCallback(async () => {
-    try {
-      const r = await fetch(`/api/network/health?network=${network}`, {
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (!r.ok) return;
-      const j = await r.json() as NHIData & { ok?: boolean };
-      if (alive.current && typeof j.nhi === "number") setData(j);
-    } catch {
-      /* silent — badge is best-effort */
-    }
+export function NHIBadge({ network = "shelbynet" }: { network?: string }) {
+  const [data, setData] = useState<NHIData | null>(null);
+
+  const load = useCallback(async () => {
+    try { setData(await fetchNHI(network)); } catch { /* keep stale */ }
   }, [network]);
 
   useEffect(() => {
-    if (alive.current) setData(null);
-    fetch_();
-    const id = setInterval(fetch_, REFRESH_MS);
+    load();
+    const id = setInterval(load, 60_000);
     return () => clearInterval(id);
-  }, [fetch_]);
+  }, [load]);
 
+  // Skeleton
   if (!data) {
-    // Loading skeleton
     return (
-      <div style={{
-        display: "flex", alignItems: "center", gap: 5,
-        padding: "4px 10px", borderRadius: 7, background: "var(--bg-card2)",
-        border: "1px solid var(--border)", fontSize: 11,
-      }}>
-        <div style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--text-dim)", flexShrink: 0 }} />
-        <span style={{ color: "var(--text-dim)", fontFamily: "monospace" }}>NHI —</span>
+      <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-xs text-white/30 font-mono select-none">
+        <span className="w-1.5 h-1.5 rounded-full bg-white/20" />
+        NHI —
       </div>
     );
   }
 
-  const color  = STATUS_COLOR[data.status] ?? "#9ca3af";
-  const bg     = STATUS_BG[data.status]    ?? "rgba(100,116,139,0.1)";
-  const nhi    = Math.round(Math.max(0, Math.min(100, data.nhi)));
+  const cls = COLOR[data.color];
 
   return (
-    <div style={{ position: "relative" }}>
-      <div
-        onMouseEnter={() => setHover(true)}
-        onMouseLeave={() => setHover(false)}
-        style={{
-          display: "flex", alignItems: "center", gap: 5,
-          padding: "4px 10px", borderRadius: 7,
-          background: bg, border: `1px solid ${color}44`,
-          cursor: "help", userSelect: "none",
-          transition: "all 0.15s",
-        }}
-      >
-        <div style={{
-          width: 6, height: 6, borderRadius: "50%",
-          background: color, flexShrink: 0,
-          boxShadow: data.status === "healthy" ? `0 0 6px ${color}88` : "none",
-        }} />
-        <span style={{
-          fontSize: 11, fontWeight: 700, fontFamily: "monospace",
-          color, letterSpacing: "0.01em",
-        }}>
-          NHI {nhi}
-        </span>
+    <div
+      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full border ${cls.border} ${cls.bg} text-xs ${cls.text} font-mono cursor-default select-none`}
+      title={`Network Health Index: ${data.nhi}/100 — ${data.label}\n\nSP Quorum: ${data.components.quorum.score}/100\nBlob Availability: ${data.components.blobAvailability.score}/100\nEpoch Health: ${data.components.epochHealth.score}/100\nStorage: ${data.components.storageUtilization.score}/100`}
+    >
+      <span className={`w-1.5 h-1.5 rounded-full ${cls.dot} animate-pulse`} />
+      NHI {data.nhi}
+    </div>
+  );
+}
+
+// ── NHICard — full stat card for landing / network page ──────────────────────
+
+export function NHICard({ network = "shelbynet" }: { network?: string }) {
+  const [data,    setData]    = useState<NHIData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error,   setError]   = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setData(await fetchNHI(network));
+      setError(false);
+    } catch {
+      setError(true);
+    } finally {
+      setLoading(false);
+    }
+  }, [network]);
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 60_000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  // Skeleton
+  if (loading) {
+    return (
+      <div className="rounded-2xl border border-white/10 bg-white/5 p-6 animate-pulse">
+        <div className="h-3 bg-white/10 rounded w-2/5 mb-4" />
+        <div className="h-14 bg-white/10 rounded w-1/4 mb-6" />
+        <div className="space-y-3">
+          {[1, 2, 3, 4].map((i) => (
+            <div key={i}>
+              <div className="h-2 bg-white/10 rounded w-3/4 mb-1" />
+              <div className="h-1 bg-white/10 rounded-full" />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // Error
+  if (error || !data) {
+    return (
+      <div className="rounded-2xl border border-white/10 bg-white/5 p-6">
+        <p className="text-xs text-white/40 uppercase tracking-wider mb-1">Network Health Index</p>
+        <p className="text-white/30 text-sm">Unavailable</p>
+      </div>
+    );
+  }
+
+  const cls = COLOR[data.color];
+
+  const breakdown = [
+    {
+      label:  "SP Quorum",
+      score:  data.components.quorum.score,
+      weight: "30%",
+      detail: `${data.components.quorum.activeProviders}/${data.components.quorum.maxProviders} active`,
+    },
+    {
+      label:  "Blob Availability",
+      score:  data.components.blobAvailability.score,
+      weight: "25%",
+      detail: `${data.components.blobAvailability.activeBlobs.toLocaleString("en-US")} active`,
+    },
+    {
+      label:  "Epoch Health",
+      score:  data.components.epochHealth.score,
+      weight: "25%",
+      detail: null,
+    },
+    {
+      label:  "Storage",
+      score:  data.components.storageUtilization.score,
+      weight: "20%",
+      detail: null,
+    },
+  ];
+
+  return (
+    <div className={`rounded-2xl border ${cls.border} ${cls.bg} p-6`}>
+      {/* Header */}
+      <div className="flex items-start justify-between mb-5">
+        <div>
+          <p className="text-xs text-white/50 uppercase tracking-wider mb-1.5">
+            Network Health Index
+          </p>
+          <div className={`text-5xl font-bold font-mono leading-none ${cls.text}`}>
+            {data.nhi}
+          </div>
+          <p className={`text-sm mt-1.5 font-medium ${cls.text}`}>{data.label}</p>
+        </div>
+        <span className={`w-2.5 h-2.5 rounded-full ${cls.dot} animate-pulse mt-0.5 shrink-0`} />
       </div>
 
-      {/* Tooltip */}
-      {hover && (
-        <div style={{
-          position: "absolute", top: "calc(100% + 6px)", right: 0,
-          zIndex: 200, minWidth: 220,
-          background: "var(--bg-card)", border: "1px solid var(--border)",
-          borderRadius: 10, padding: "12px 14px",
-          boxShadow: "0 8px 24px var(--shadow-color)",
-          pointerEvents: "none",
-        }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>
-            Network Health Index
-          </div>
-          {/* Score bar */}
-          <div style={{ marginBottom: 10 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4, fontSize: 12 }}>
-              <span style={{ color: "var(--text-muted)" }}>Overall</span>
-              <span style={{ fontWeight: 700, color, fontFamily: "monospace" }}>{nhi}/100</span>
+      {/* Component breakdown */}
+      <div className="space-y-3">
+        {breakdown.map(({ label, score, weight, detail }) => (
+          <div key={label}>
+            <div className="flex justify-between items-baseline mb-1">
+              <div className="flex items-baseline gap-1.5">
+                <span className="text-xs text-white/60">{label}</span>
+                {detail && (
+                  <span className="text-xs text-white/30">— {detail}</span>
+                )}
+              </div>
+              <span className="text-xs font-mono text-white/50">
+                {score}
+                <span className="text-white/25"> ×{weight}</span>
+              </span>
             </div>
-            <div style={{ height: 5, background: "var(--border)", borderRadius: 3, overflow: "hidden" }}>
-              <div style={{ height: "100%", width: `${nhi}%`, background: color, borderRadius: 3, transition: "width 0.6s ease" }} />
+            <div className="h-1 bg-white/10 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-700 ${scoreColor(score)}`}
+                style={{ width: `${score}%` }}
+              />
             </div>
           </div>
-          {/* Components */}
-          {data.components && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              {([
-                ["SP Quorum",     data.components.spQuorum,           30],
-                ["Node Health",   data.components.nodeAvailability,   25],
-                ["Epoch Health",  data.components.epochHealth,        25],
-                ["Storage Util",  data.components.storageUtilization, 20],
-              ] as [string, number, number][]).map(([label, score, weight]) => (
-                <div key={label}>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--text-muted)", marginBottom: 2 }}>
-                    <span>{label} <span style={{ opacity: 0.5 }}>({weight}%)</span></span>
-                    <span style={{ fontFamily: "monospace", fontWeight: 600, color: score >= 80 ? "#22c55e" : score >= 50 ? "#f59e0b" : "#ef4444" }}>{Math.round(score)}</span>
-                  </div>
-                  <div style={{ height: 3, background: "var(--border)", borderRadius: 2, overflow: "hidden" }}>
-                    <div style={{ height: "100%", width: `${score}%`, background: score >= 80 ? "#22c55e" : score >= 50 ? "#f59e0b" : "#ef4444", borderRadius: 2 }} />
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-          {data.detail && (
-            <div style={{ marginTop: 8, fontSize: 10, color: "var(--text-dim)", fontFamily: "monospace" }}>{data.detail}</div>
-          )}
-          <div style={{ marginTop: 8, fontSize: 9, color: "var(--text-dim)", display: "flex", justifyContent: "space-between" }}>
-            <span>Refreshes every 60s</span>
-            <span style={{ color }}>{data.status}</span>
-          </div>
-        </div>
-      )}
+        ))}
+      </div>
+
+      {/* Footer */}
+      <p className="text-xs text-white/25 mt-4 font-mono">
+        {new Date(data.updatedAt).toLocaleTimeString("en-US", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        })}
+      </p>
     </div>
   );
 }

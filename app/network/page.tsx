@@ -1,18 +1,26 @@
 "use client";
 /**
- * app/network/page.tsx — v3.0
+ * app/network/page.tsx — v3.1
  *
- * FIXES:
+ * FIXES & PATCHES:
  * 1. Epoch NaN: EpochData interface now matches API response shape
- *    {audit:{duration_ms, countdown:{remaining_ms, elapsed_ms, pct_complete, next_epoch_at_ms}}}
+ * {audit:{duration_ms, countdown:{remaining_ms, elapsed_ms, pct_complete, next_epoch_at_ms}}}
  * 2. Live UTC clock: ticks every second via setInterval, independent of data fetch
  * 3. Timeseries tab: +2 charts — Pending/Deleted + Avg Blob Size (matches Figure 3)
  * 4. Benchmark tab: +4 charts — Score/Upload/Latency/TXConfirm history (matches Figure 5)
+ * 5. PATCH v3.1: Added NHICard to Overview tab and ActivityFeed to Explorer tab (Additive)
  */
 
 import { useEffect, useState, useRef, useCallback, Suspense } from "react";
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import { useNetwork } from "@/components/network-context";
+
+// STEP 1 — Add imports from NETWORK PAGE PATCH
+import { NHICard }      from "@/components/nhi-badge";
+import { ActivityFeed } from "@/components/activity-feed";
+
+type TimeRange = "1h" | "24h" | "7d" | "30d";
+type TabId = "overview" | "timeseries" | "epoch" | "benchmark" | "explorer";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface StatsLiveResponse {
@@ -80,9 +88,6 @@ interface NHIData {
   detail: string;
   components?: { spQuorum: number; nodeAvailability: number; epochHealth: number; storageUtilization: number; };
 }
-
-type TabId = "overview" | "timeseries" | "epoch" | "benchmark" | "explorer";
-type TimeRange = "1h" | "24h" | "7d" | "30d";
 
 const POLL_MS    = 30_000;
 const MAX_POINTS = 60;
@@ -358,13 +363,21 @@ function ExplorerEmbed({ network }: { network: string }) {
           </a>
         ))}
       </div>
+
+      {/* STEP 3 — ActivityFeed in the Explorer tab (Additive) */}
+      <div style={{ marginTop: 32 }}>
+        <h3 style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)", marginBottom: 12 }}>
+          Live Activity
+        </h3>
+        <ActivityFeed network={network} height={420} />
+      </div>
     </div>
   );
 }
 
 // ─── Overview Tab ─────────────────────────────────────────────────────────────
-function OverviewTab({ snap, series, loading, nhi, isTestnet, accentColor }: {
-  snap: StatsLiveResponse | null; series: TsPoint[]; loading: boolean;
+function OverviewTab({ network, snap, series, loading, nhi, isTestnet, accentColor }: {
+  network: string; snap: StatsLiveResponse | null; series: TsPoint[]; loading: boolean;
   nhi: NHIData | null; isTestnet: boolean; accentColor: string;
 }) {
   const METRICS = isTestnet ? [
@@ -397,6 +410,11 @@ function OverviewTab({ snap, series, loading, nhi, isTestnet, accentColor }: {
 
   return (
     <div>
+      {/* STEP 2 — NHICard in the Overview tab (Additive) */}
+      <div style={{ marginBottom: 24 }}>
+        <NHICard network={network} />
+      </div>
+
       <QuorumHealthBar nhi={nhi} />
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:18 }}>
         <div style={{ background:"var(--bg-card)", border:"1px solid var(--border)", borderRadius:14, padding:"18px 22px" }}>
@@ -893,7 +911,7 @@ export default function NetworkPage() {
           ))}
         </div>
         <div style={{ padding:"22px 24px" }}>
-          {tab==="overview"   && <OverviewTab snap={snap} series={series} loading={loading} nhi={nhi} isTestnet={isTestnet} accentColor={accentColor} />}
+          {tab==="overview"   && <OverviewTab network={network} snap={snap} series={series} loading={loading} nhi={nhi} isTestnet={isTestnet} accentColor={accentColor} />}
           {tab==="timeseries" && <TimeseriesTab network={network} isTestnet={isTestnet} accentColor={accentColor} />}
           {tab==="epoch"      && <EpochTab network={network} />}
           {tab==="benchmark"  && <BenchmarkTab />}

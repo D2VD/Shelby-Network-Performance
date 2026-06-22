@@ -1,28 +1,12 @@
 "use client";
 /**
- * app/explorer/page.tsx — v3.4
+ * app/explorer/page.tsx — v3.5
  *
- * Changes vs v3.3:
- *  9. EmptyState: new optional `mono` prop — renders multi-line, monospace,
- *     left-aligned sub-text. Used for the blob-search error so the per-backend
- *     attempt list (from blobs-data v3) is readable instead of one run-on line.
- *
- * Changes vs v3.2:
- *  7. aptosExplorerTxn/Account — use Aptos Explorer's built-in "shelbynet"
- *     network preset (?network=shelbynet) instead of custom params, which
- *     caused "Transaction not found" 404s on the txn page
- *  8. BlobSearchPanel — content-type guard before .json() so a 502/HTML
- *     response from the VPS shows a clean error instead of
- *     "Unexpected token '<', <!DOCTYPE..."
- *
- * Changes vs v3.1:
- *  1. Hash link fix — Shelbynet uses ?network=custom&customNetworkUrl=… so
- *     Aptos explorer resolves the tx correctly (was showing mainnet 404)
- *  2. Blob name search — plain filename accepted; VPS searches indexed blobs
- *  3. Sender profile — shows APT balance + link to OUR own explorer
- *  4. URL state — router.push on every navigation so browser Back works
- *  5. Filters — Shelby-only toggle + sort by gas (high→low, low→high)
- *  6. Centered layout — maxWidth 940 centred on all breakpoints
+ * Changes vs v3.4:
+ * - Tích hợp hệ thống quản lý Tab linh hoạt (Transactions, Blobs Explorer, Activity, Export).
+ * - Bổ sung useBlobSearch hook hỗ trợ tự động nhận diện routing cấu trúc Blob ID / Owner / Name.
+ * - Tích hợp Live Network Activity qua SSE Stream component ActivityFeed.
+ * - Thêm tính năng kết xuất dữ liệu nhanh qua ExportPanel.
  */
 
 import React, {
@@ -31,10 +15,20 @@ import React, {
 import { useRouter, useSearchParams } from "next/navigation";
 import { useNetwork } from "@/components/network-context";
 
+// ─── Imports từ EXPLORER_PAGE_PATCH v3.5 ──────────────────────────────────────
+import { ActivityFeed }  from "@/components/activity-feed";
+import { ExportPanel }   from "@/components/export-panel";
+import {
+  BlobSearchBar,
+  BlobStatusFilter,
+  BlobTable,
+  BlobPagination,
+} from "@/components/blob-explorer";
+import { useBlobSearch } from "@/hooks/use-blob-search";
+import { useTheme }      from "@/components/theme-context";
+
 // ─── Env / constants ──────────────────────────────────────────────────────────
 
-// (SHELBY_NODE / SHELBY_INDEXER env vars no longer needed for explorer links —
-//  Aptos Explorer's "shelbynet" preset is used directly, see below.)
 const PAGE = 25;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -53,10 +47,6 @@ type SortKey = "newest" | "gas_desc" | "gas_asc";
 
 // ─── Aptos Explorer URLs ──────────────────────────────────────────────────────
 
-// Aptos Explorer has "Shelbynet" as a built-in network preset (visible in its
-// network dropdown) — ?network=custom&customNetworkUrl=… caused 404s because
-// the explorer's hash lookup path doesn't resolve through custom params the
-// same way the account page does. Using the preset name directly is reliable.
 function aptosExplorerTxn(hash: string, network: string): string {
   const net = network === "shelbynet" ? "shelbynet" : "testnet";
   return `https://explorer.aptoslabs.com/txn/${hash}?network=${net}`;
@@ -111,7 +101,6 @@ function ExtLink({ href, children }: { href: string; children: React.ReactNode }
   );
 }
 
-/** Link to our own explorer (opens that address in same tab) */
 function OurExplorerLink({ addr, label, onClick }: {
   addr: string; label?: string; onClick: (addr: string) => void;
 }) {
@@ -191,7 +180,6 @@ function SenderBalance({ address, network, onAddressClick }: {
 
   return (
     <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
-      {/* Link to our own explorer */}
       <OurExplorerLink addr={address} onClick={onAddressClick}/>
       <CopyBtn value={address}/>
       <ExtLink href={aptosExplorerAccount(address, network)}>Aptos ↗</ExtLink>
@@ -235,7 +223,6 @@ function AccountPanel({ address, network, onVersionClick, onAddressClick }: {
   const alive = useRef(true);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
-  // Client-side sort + filter on the current page
   const displayTxs = useMemo(() => {
     let rows = filter === "shelby" ? rawTxs.filter(t => t.isShelby) : rawTxs;
     if (sortKey === "gas_desc") rows = [...rows].sort((a, b) => b.gasFeeRaw - a.gasFeeRaw);
@@ -310,7 +297,6 @@ function AccountPanel({ address, network, onVersionClick, onAddressClick }: {
 
   return (
     <div>
-      {/* Account info bar */}
       <div style={{ display: "flex", alignItems: "center", gap: 20, padding: "12px 20px",
                     background: "var(--bg-card)", borderBottom: "1px solid var(--border)",
                     flexWrap: "wrap" }}>
@@ -340,7 +326,6 @@ function AccountPanel({ address, network, onVersionClick, onAddressClick }: {
         </div>
       </div>
 
-      {/* Filter bar */}
       <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 20px",
                     background: "var(--bg-card2)", borderBottom: "1px solid var(--border)",
                     flexWrap: "wrap" }}>
@@ -370,7 +355,6 @@ function AccountPanel({ address, network, onVersionClick, onAddressClick }: {
         </span>
       </div>
 
-      {/* Table */}
       {displayTxs.length === 0 ? (
         <EmptyState icon="📭" title="No transactions match"
           sub={rawTxs.length === 0
@@ -433,7 +417,6 @@ function AccountPanel({ address, network, onVersionClick, onAddressClick }: {
         </div>
       )}
 
-      {/* Pagination */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
                     padding: "12px 20px", borderTop: "1px solid var(--border)" }}>
         <button onClick={() => loadPage(page - 1, seqNum)} disabled={!hasPrev || loading}
@@ -662,11 +645,19 @@ function ExplorerContent() {
   const router       = useRouter();
   const searchParams = useSearchParams();
 
+  // ── Khởi tạo hook & theme theo hướng dẫn bản vá ──────────────────────────
+  const themeCtx = (() => { try { return useTheme(); } catch { return { isDark: false }; } })();
+  const isDark = themeCtx.isDark;
+  const [blobState, blobCtrl] = useBlobSearch({ network });
+
+  // ── Quản lý phân vùng Tab điều hướng ──────────────────────────────────────
+  const [activeTab, setActiveTab] = useState<string>("transactions");
+
   const [query,      setQuery]      = useState("");
   const [inputErr,   setInputErr]   = useState("");
   const [searchAddr, setSearchAddr] = useState("");
   const [selectedV,  setSelectedV]  = useState("");
-  const [blobSearch, setBlobSearch] = useState(""); // plain filename search
+  const [blobSearch, setBlobSearch] = useState("");
 
   const networkLabel = network === "shelbynet" ? "Shelbynet" : "Testnet";
 
@@ -690,14 +681,16 @@ function ExplorerContent() {
     // Wallet address
     if (q.startsWith("0x") && q.length >= 10) {
       setSearchAddr(q); setSelectedV(""); setBlobSearch("");
+      setActiveTab("transactions");
       router.push(`/explorer?q=${encodeURIComponent(q)}`);
       return;
     }
-    // "@0x…/path" blob path — extract address
+    // "@0x…/path" blob path
     if (q.startsWith("@0x")) {
       const m = q.match(/^@(0x[0-9a-fA-F]{10,})\//);
       if (m) {
         setSearchAddr(m[1]); setSelectedV(""); setBlobSearch("");
+        setActiveTab("transactions");
         router.push(`/explorer?q=${encodeURIComponent(m[1])}`);
         return;
       }
@@ -705,12 +698,14 @@ function ExplorerContent() {
     // Version number
     if (/^\d+$/.test(q)) {
       setSelectedV(q); setSearchAddr(""); setBlobSearch("");
+      setActiveTab("transactions");
       router.push(`/explorer?q=${encodeURIComponent(q)}`);
       return;
     }
-    // Plain blob name / filename (contains . or /)
+    // Plain blob name / filename
     if (q.includes(".") || q.includes("/") || q.length > 3) {
       setBlobSearch(q); setSearchAddr(""); setSelectedV("");
+      setActiveTab("transactions");
       router.push(`/explorer?b=${encodeURIComponent(q)}`);
       return;
     }
@@ -722,17 +717,13 @@ function ExplorerContent() {
     router.push("/explorer");
   };
 
-  /** Called when user clicks a version number in the tx list */
   const onVersionClick = (v: string) => {
     setSelectedV(v);
-    // Push to URL so browser Back returns to the wallet view
-    const base = searchAddr ? `?q=${encodeURIComponent(searchAddr)}&v=${v}`
-                            : `?q=${v}`;
+    const base = searchAddr ? `?q=${encodeURIComponent(searchAddr)}&v=${v}` : `?q=${v}`;
     router.push(`/explorer${base}`);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  /** Called when user clicks sender address inside a tx detail */
   const onAddressClick = (addr: string) => {
     setSearchAddr(addr); setQuery(addr); setSelectedV(""); setBlobSearch("");
     router.push(`/explorer?q=${encodeURIComponent(addr)}`);
@@ -745,10 +736,9 @@ function ExplorerContent() {
                   fontFamily: "var(--font-body,'Inter',system-ui,sans-serif)" }}>
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
 
-      {/* ── Centred header ────────────────────────────────────────────────── */}
+      {/* ── Header ────────────────────────────────────────────────────────── */}
       <div style={{ maxWidth: 940, margin: "0 auto", padding: "0 24px" }}>
         <div style={{ padding: "36px 0 0", marginBottom: 28 }}>
-          {/* Title row */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
                         marginBottom: 8, flexWrap: "wrap", gap: 10 }}>
             <h1 style={{ margin: 0, fontSize: 32, fontWeight: 900, letterSpacing: -0.8,
@@ -794,8 +784,7 @@ function ExplorerContent() {
                 {searchAddr ? "Address:" : selectedV ? "Version:" : "Blob:"}
               </span>
               <span style={{ ...MONO, fontSize: 12, color: "#ff77c9" }}>
-                {searchAddr ? short(searchAddr, 14, 10)
-                  : selectedV ? `v${selectedV}` : blobSearch}
+                {searchAddr ? short(searchAddr, 14, 10) : selectedV ? `v${selectedV}` : blobSearch}
               </span>
               <button onClick={clearSearch}
                 style={{ ...MONO, fontSize: 11, background: "none", border: "none",
@@ -803,55 +792,125 @@ function ExplorerContent() {
             </div>
           )}
 
-          {/* Tab strip */}
-          <div style={{ display: "flex", marginTop: 20, borderBottom: "1px solid var(--border)" }}>
-            <div style={{ padding: "10px 22px", fontSize: 14, fontWeight: 700,
-                          color: "#ff77c9", borderBottom: "2px solid #ff77c9",
-                          ...MONO }}>⚡ Transactions</div>
+          {/* ── Tích hợp Tab bar từ bản vá (STEP 4 & 5) ────────────────────── */}
+          <div style={{ display: "flex", marginTop: 20, borderBottom: "1px solid var(--border)", gap: 8 }}>
+            {[
+              { id: "transactions", label: "⚡ Transactions" },
+              { id: "blobs", label: "🗂 Blobs Explorer" },
+              { id: "activity", label: "📈 Activity" },
+              { id: "export", label: "↓ Export" }
+            ].map(tab => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                style={{
+                  padding: "10px 20px", fontSize: 14, fontWeight: 700,
+                  color: activeTab === tab.id ? "#ff77c9" : "var(--text-muted)",
+                  borderBottom: activeTab === tab.id ? "2px solid #ff77c9" : "2px solid transparent",
+                  background: "none", border: "none", cursor: "pointer", ...MONO
+                }}
+              >
+                {tab.label}
+              </button>
+            ))}
           </div>
         </div>
       </div>
 
-      {/* ── Content (full width card, but inner padding centred) ──────────── */}
+      {/* ── Vùng hiển thị nội dung động theo Tab ─────────────────────────── */}
       <div style={{ background: "var(--bg-card)", minHeight: 400 }}>
         <div style={{ maxWidth: 940, margin: "0 auto" }}>
-          {/* Tx detail panel */}
-          {selectedV && (
-            <TxDetailPanel
-              version={selectedV} network={network}
-              onClose={() => {
-                setSelectedV("");
-                const back = searchAddr
-                  ? `/explorer?q=${encodeURIComponent(searchAddr)}`
-                  : "/explorer";
-                router.push(back);
-              }}
-              onAddressClick={onAddressClick}
-            />
+          
+          {/* TAB 1: TRANSACTIONS (Logic cũ được giữ nguyên) */}
+          {activeTab === "transactions" && (
+            <>
+              {selectedV && (
+                <TxDetailPanel
+                  version={selectedV} network={network}
+                  onClose={() => {
+                    setSelectedV("");
+                    const back = searchAddr ? `/explorer?q=${encodeURIComponent(searchAddr)}` : "/explorer";
+                    router.push(back);
+                  }}
+                  onAddressClick={onAddressClick}
+                />
+              )}
+
+              {searchAddr && !selectedV && (
+                <AccountPanel
+                  address={searchAddr} network={network}
+                  onVersionClick={onVersionClick}
+                  onAddressClick={onAddressClick}
+                />
+              )}
+
+              {blobSearch && !selectedV && (
+                <BlobSearchPanel
+                  blobName={blobSearch} network={network}
+                  onVersionClick={onVersionClick}
+                />
+              )}
+
+              {!showContent && (
+                <EmptyState icon="🔍" title="Search to explore"
+                  sub="Enter a wallet address to view its transaction history, a version number to inspect a specific transaction and its blob data, or a file name to search blob uploads."/>
+              )}
+            </>
           )}
 
-          {/* Wallet tx list */}
-          {searchAddr && !selectedV && (
-            <AccountPanel
-              address={searchAddr} network={network}
-              onVersionClick={onVersionClick}
-              onAddressClick={onAddressClick}
-            />
+          {/* TAB 2: BLOBS EXPLORER (Thay thế nội dung theo STEP 3) */}
+          {activeTab === "blobs" && (
+            <div style={{ padding: "24px 20px" }}>
+              {/* ── Blob search controls ─────────────────────────── */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 16 }}>
+                <BlobSearchBar
+                  query={blobCtrl.query}
+                  onChange={blobCtrl.setQuery}
+                  loading={blobState.loading}
+                  isDark={isDark}
+                />
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <BlobStatusFilter
+                    status={blobCtrl.status}
+                    onChange={blobCtrl.setStatus}
+                    isDark={isDark}
+                  />
+                  {blobState.loading && (
+                    <span style={{ fontSize: 12, opacity: 0.4, ...MONO }}>Loading…</span>
+                  )}
+                </div>
+              </div>
+
+              {/* ── Results ────────────────────────────────────────── */}
+              <BlobTable state={blobState} isDark={isDark} />
+              <div style={{ marginTop: 16 }}>
+                <BlobPagination
+                  state={blobState}
+                  onPage={blobCtrl.setPage}
+                  pageSize={20}
+                  isDark={isDark}
+                />
+              </div>
+            </div>
           )}
 
-          {/* Blob name search */}
-          {blobSearch && !selectedV && (
-            <BlobSearchPanel
-              blobName={blobSearch} network={network}
-              onVersionClick={onVersionClick}
-            />
+          {/* TAB 3: LIVE NETWORK ACTIVITY (STEP 4) */}
+          {activeTab === "activity" && (
+            <div style={{ padding: "24px 20px" }}>
+              <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: "var(--text-primary)", ...MONO }}>
+                Live Network Activity
+              </h3>
+              <ActivityFeed network={network} height={500} />
+            </div>
           )}
 
-          {/* Default */}
-          {!showContent && (
-            <EmptyState icon="🔍" title="Search to explore"
-              sub="Enter a wallet address to view its transaction history, a version number to inspect a specific transaction and its blob data, or a file name to search blob uploads."/>
+          {/* TAB 4: EXPORT PANEL (STEP 5) */}
+          {activeTab === "export" && (
+            <div style={{ padding: "24px 20px" }}>
+              <ExportPanel network={network} />
+            </div>
           )}
+
         </div>
       </div>
 
@@ -865,9 +924,6 @@ function ExplorerContent() {
 }
 
 // ─── Suspense wrapper ──────────────────────────────────────────────────────────
-// useSearchParams() requires a Suspense boundary in the App Router — without
-// this, `next build` fails with "useSearchParams() should be wrapped in a
-// suspense boundary" during static page generation (even with runtime='edge').
 
 function ExplorerFallback() {
   return (

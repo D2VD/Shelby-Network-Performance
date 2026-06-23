@@ -1,11 +1,10 @@
-// app/api/v1/export/snapshots/route.ts — v1.0
-// Server-side proxy for /api/v1/export/snapshots
-// Streams the VPS response (CSV or JSON) through Next.js — no browser→VPS fetch,
-// so CSP connect-src is never involved.
+// app/api/v1/export/snapshots/route.ts — v1.1
+// FIX: runtime = 'edge' (CF Pages requires all routes to be edge)
+// arrayBuffer() passthrough works fine on edge — no Node.js APIs needed.
 
 import { NextRequest, NextResponse } from "next/server";
 
-export const runtime = "nodejs"; // NOT edge — we stream binary/text bodies
+export const runtime = "edge";
 
 const VPS_URL = process.env.SHELBY_API_URL;
 
@@ -14,12 +13,16 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: "VPS not configured" }, { status: 503 });
   }
 
-  // Forward all query params as-is
-  const qs       = req.nextUrl.searchParams.toString();
-  const upstream = await fetch(`${VPS_URL}/api/v1/export/snapshots?${qs}`, {
-    // No cache — this is a download endpoint
-    cache: "no-store",
-  });
+  const qs = req.nextUrl.searchParams.toString();
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${VPS_URL}/api/v1/export/snapshots?${qs}`, {
+      cache: "no-store",
+    });
+  } catch {
+    return NextResponse.json({ error: "Could not reach export service" }, { status: 502 });
+  }
 
   if (upstream.status === 429) {
     return NextResponse.json(
@@ -29,10 +32,12 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   }
 
   if (!upstream.ok) {
-    return NextResponse.json(
-      { error: `Upstream error (${upstream.status})` },
-      { status: upstream.status }
-    );
+    let message = `Upstream error (${upstream.status})`;
+    try {
+      const err = await upstream.json() as { error?: string };
+      if (err.error) message = err.error;
+    } catch { /* non-JSON */ }
+    return NextResponse.json({ error: message }, { status: upstream.status });
   }
 
   const body        = await upstream.arrayBuffer();

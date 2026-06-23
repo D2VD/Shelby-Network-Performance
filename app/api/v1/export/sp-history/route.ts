@@ -1,10 +1,9 @@
-// app/api/v1/export/sp-history/route.ts — v1.0
-// Server-side proxy for /api/v1/export/sp-history
-// See snapshots/route.ts for rationale (CSP, no-store, binary passthrough).
+// app/api/v1/export/sp-history/route.ts — v1.1
+// FIX: runtime = 'edge' (CF Pages requires all routes to be edge)
 
 import { NextRequest, NextResponse } from "next/server";
 
-export const runtime = "nodejs";
+export const runtime = "edge";
 
 const VPS_URL = process.env.SHELBY_API_URL;
 
@@ -13,16 +12,21 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: "VPS not configured" }, { status: 503 });
   }
 
-  const qs = req.nextUrl.searchParams.toString();
-
-  // Validate address early — avoids unnecessary VPS round-trip
+  // Validate address before hitting the VPS
   if (!req.nextUrl.searchParams.get("address")) {
     return NextResponse.json({ error: "address query param is required" }, { status: 400 });
   }
 
-  const upstream = await fetch(`${VPS_URL}/api/v1/export/sp-history?${qs}`, {
-    cache: "no-store",
-  });
+  const qs = req.nextUrl.searchParams.toString();
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${VPS_URL}/api/v1/export/sp-history?${qs}`, {
+      cache: "no-store",
+    });
+  } catch {
+    return NextResponse.json({ error: "Could not reach export service" }, { status: 502 });
+  }
 
   if (upstream.status === 429) {
     return NextResponse.json(
@@ -32,10 +36,12 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   }
 
   if (!upstream.ok) {
-    return NextResponse.json(
-      { error: `Upstream error (${upstream.status})` },
-      { status: upstream.status }
-    );
+    let message = `Upstream error (${upstream.status})`;
+    try {
+      const err = await upstream.json() as { error?: string };
+      if (err.error) message = err.error;
+    } catch { /* non-JSON */ }
+    return NextResponse.json({ error: message }, { status: upstream.status });
   }
 
   const body        = await upstream.arrayBuffer();

@@ -45,6 +45,7 @@ const nextConfig = {
 
               // Fetch / XHR / WebSocket connections
               // cdn.jsdelivr.net and unpkg.com: react-simple-maps world-atlas JSON
+              // ====== NEW CSP PATCH LOGIC START ======
               "connect-src 'self' " +
                 "https://api.shelbynet.shelby.xyz " +
                 "https://api.testnet.aptoslabs.com " +
@@ -52,10 +53,13 @@ const nextConfig = {
                 "https://cdn.jsdelivr.net " +
                 "https://unpkg.com " +
                 "https://static.cloudflareinsights.com " +
+                "https://api.shelbyanalytics.site " +
+                "wss://api.shelbyanalytics.site " +
                 "wss:",
+              // ====== NEW CSP PATCH LOGIC END ======
 
               // Workers: cobe uses a WebGL worker internally
-              "worker-src 'self' blob:",
+              "worker-src 'self' 'blob:",
             ].join("; "),
           },
         ],

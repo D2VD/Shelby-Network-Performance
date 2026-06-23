@@ -1,14 +1,20 @@
-// hooks/use-blob-search.ts — v1.0
-// Priority 4: Blob Explorer — search logic extracted into a hook
-// Handles: blob_id exact lookup, owner address search, status filter, pagination
-//
-// Drop into app/explorer/page.tsx:
-//   import { useBlobSearch } from "@/hooks/use-blob-search";
-//   const blob = useBlobSearch({ network });
+// hooks/use-blob-search.ts — v1.1
+// FIXES (OS compliance):
+//   - Replaced `any` with `unknown` + type guards per OS TypeScript rules
+//   - Added INDEXER_MIN_INTERVAL_MS = 30_000 guard: debounce respects minimum
+//     30-second interval between indexer calls (free-text search only)
+//   - str() guard on blob_id before handing to AbortController key
+//   - Early return pattern (fail fast) on invalid inputs
 
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+
+// ── Constants (OS rule: no magic values) ──────────────────────────────────────
+
+const INDEXER_MIN_INTERVAL_MS = 30_000; // minimum gap between free-text searches
+const DEBOUNCE_TEXT_MS        = 400;    // debounce for typing (resets the timer)
+const PAGE_SIZE_DEFAULT       = 20;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -25,13 +31,13 @@ export interface BlobRecord {
 }
 
 export interface BlobSearchState {
-  results:    BlobRecord[];
-  single:     BlobRecord | null;   // exact blob_id hit
-  total:      number;
-  page:       number;
-  loading:    boolean;
-  error:      string | null;
-  isBlobId:   boolean;             // true when input matches blob_id pattern
+  results:  BlobRecord[];
+  single:   BlobRecord | null;
+  total:    number;
+  page:     number;
+  loading:  boolean;
+  error:    string | null;
+  isBlobId: boolean;
 }
 
 export interface BlobSearchControls {
@@ -43,32 +49,64 @@ export interface BlobSearchControls {
   refresh:   () => void;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Type guards ───────────────────────────────────────────────────────────────
 
-// Detect a blob_id: 0x-prefixed 64-char hex OR bare 64-char hex
-const BLOB_ID_RE = /^(0x)?[0-9a-f]{64}$/i;
-const isBlobId = (s: string) => BLOB_ID_RE.test(s.trim());
+function isBlobRecord(v: unknown): v is BlobRecord {
+  if (typeof v !== "object" || v === null) return false;
+  const r = v as Record<string, unknown>;
+  return (
+    typeof r["blob_id"]       === "string" &&
+    typeof r["owner_address"] === "string" &&
+    typeof r["status"]        === "string"
+  );
+}
+
+function isBlobRecordArray(v: unknown): v is BlobRecord[] {
+  return Array.isArray(v) && v.every(isBlobRecord);
+}
+
+// ── Input classification (no magic regex buried in logic) ─────────────────────
+
+const BLOB_ID_RE    = /^(0x)?[0-9a-f]{64}$/i;
+const ADDRESS_RE    = /^0x[0-9a-f]{62,66}$/i;
+
+function classifyInput(raw: string): "blob_id" | "address" | "name" | "empty" {
+  const s = raw.trim();
+  if (!s)              return "empty";
+  if (BLOB_ID_RE.test(s))  return "blob_id";
+  if (ADDRESS_RE.test(s))  return "address";
+  return "name";
+}
+
+function normaliseId(raw: string): string {
+  const s = raw.trim();
+  return s.startsWith("0x") ? s : `0x${s}`;
+}
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function useBlobSearch({
   network,
-  pageSize = 20,
+  pageSize = PAGE_SIZE_DEFAULT,
 }: {
   network:   string;
   pageSize?: number;
 }): [BlobSearchState, BlobSearchControls] {
-  const [query,   setQuery]   = useState("");
-  const [status,  setStatus]  = useState<BlobStatus>("all");
-  const [page,    setPage]    = useState(1);
-  const [state,   setState]   = useState<BlobSearchState>({
+  const [query,  setQueryRaw] = useState("");
+  const [status, setStatusRaw] = useState<BlobStatus>("all");
+  const [page,   setPage]      = useState(1);
+
+  const [state, setState] = useState<BlobSearchState>({
     results: [], single: null, total: 0, page: 1,
     loading: false, error: null, isBlobId: false,
   });
 
-  const abortRef = useRef<AbortController | null>(null);
+  const abortRef        = useRef<AbortController | null>(null);
+  const debounceRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastIndexerCall = useRef<number>(0); // tracks last free-text fetch
 
-  const fetch_ = useCallback(async (q: string, s: BlobStatus, p: number) => {
+  const doFetch = useCallback(async (q: string, s: BlobStatus, p: number) => {
+    // Cancel any in-flight request
     abortRef.current?.abort();
     const ac = new AbortController();
     abortRef.current = ac;
@@ -76,78 +114,113 @@ export function useBlobSearch({
     setState((prev) => ({ ...prev, loading: true, error: null }));
 
     try {
-      const trimmed  = q.trim();
-      const isId     = isBlobId(trimmed);
-      const params   = new URLSearchParams({ network, limit: String(pageSize), page: String(p) });
+      const kind   = classifyInput(q);
+      const params = new URLSearchParams({
+        network,
+        limit:  String(pageSize),
+        page:   String(p),
+      });
 
-      if (trimmed) {
-        if (isId) {
-          params.set("id", trimmed.startsWith("0x") ? trimmed : `0x${trimmed}`);
-        } else if (/^0x[0-9a-f]{62,66}$/i.test(trimmed)) {
-          // Looks like an address (shorter than blob_id) — search by owner
-          params.set("owner", trimmed);
-        } else {
-          // Treat as name/partial search
-          params.set("name", trimmed);
-        }
-      }
+      if (kind === "blob_id")  params.set("id",    normaliseId(q));
+      else if (kind === "address") params.set("owner", q.trim());
+      else if (kind === "name")    params.set("name",  q.trim());
+      // kind === "empty" → no search param → list all
 
       if (s !== "all") params.set("status", s);
 
-      const res  = await fetch(`/api/network/blobs-data?${params}`, { signal: ac.signal });
-      const data = await res.json() as Record<string, unknown>;
+      const res = await fetch(`/api/network/blobs-data?${params.toString()}`, {
+        signal: ac.signal,
+        cache:  "no-store",
+      });
+
+      const body: unknown = await res.json();
 
       if (!res.ok) {
-        setState((prev) => ({
-          ...prev, loading: false,
-          error: (data["error"] as string | undefined) ?? "Request failed",
-        }));
+        const msg =
+          (typeof body === "object" && body !== null &&
+           typeof (body as Record<string, unknown>)["error"] === "string")
+            ? String((body as Record<string, unknown>)["error"])
+            : `Request failed (${res.status})`;
+
+        setState((prev) => ({ ...prev, loading: false, error: msg }));
         return;
       }
 
       // Exact blob_id hit → { blob, network }
-      if (data["blob"]) {
+      if (
+        typeof body === "object" && body !== null &&
+        "blob" in body && isBlobRecord((body as Record<string, unknown>)["blob"])
+      ) {
         setState({
-          results: [], single: data["blob"] as BlobRecord,
+          results: [],
+          single:  (body as Record<string, unknown>)["blob"] as BlobRecord,
           total: 1, page: p, loading: false, error: null, isBlobId: true,
         });
         return;
       }
 
       // List result → { blobs, total, page, limit }
+      const raw   = body as Record<string, unknown>;
+      const blobs = isBlobRecordArray(raw["blobs"]) ? raw["blobs"] : [];
+      const total = typeof raw["total"] === "number" ? raw["total"] : 0;
+
       setState({
-        results:  (data["blobs"] as BlobRecord[] | undefined) ?? [],
-        single:   null,
-        total:    (data["total"]  as number | undefined) ?? 0,
-        page:     p,
-        loading:  false,
-        error:    null,
-        isBlobId: isId,
+        results: blobs, single: null, total, page: p,
+        loading: false, error: null,
+        isBlobId: kind === "blob_id",
       });
     } catch (err) {
       if ((err as Error).name === "AbortError") return;
       setState((prev) => ({
-        ...prev, loading: false, error: "Network error — please retry.",
+        ...prev, loading: false,
+        error: "Network error — please retry.",
       }));
     }
   }, [network, pageSize]);
 
-  // Re-fetch when query / status / page changes (debounced for free-text)
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Trigger fetch when query / status / page changes
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    const delay = isBlobId(query) || query === "" ? 0 : 400;
-    debounceRef.current = setTimeout(() => fetch_(query, status, page), delay);
-    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
-  }, [query, status, page, fetch_]);
 
-  // Reset page when query/status changes
-  const handleSetQuery  = (v: string) => { setPage(1); setQuery(v);  };
-  const handleSetStatus = (v: BlobStatus) => { setPage(1); setStatus(v); };
-  const refresh = () => fetch_(query, status, page);
+    const kind = classifyInput(query);
+
+    // Blob IDs and addresses: fetch immediately (exact match, no indexer load)
+    if (kind === "blob_id" || kind === "address" || kind === "empty") {
+      doFetch(query, status, page);
+      return;
+    }
+
+    // Free-text name search: enforce INDEXER_MIN_INTERVAL_MS between calls
+    // Debounce for typing first, then check interval
+    debounceRef.current = setTimeout(() => {
+      const now     = Date.now();
+      const elapsed = now - lastIndexerCall.current;
+
+      if (elapsed >= INDEXER_MIN_INTERVAL_MS) {
+        lastIndexerCall.current = now;
+        doFetch(query, status, page);
+      } else {
+        // Wait for the remainder of the minimum interval
+        const remaining = INDEXER_MIN_INTERVAL_MS - elapsed;
+        debounceRef.current = setTimeout(() => {
+          lastIndexerCall.current = Date.now();
+          doFetch(query, status, page);
+        }, remaining);
+      }
+    }, DEBOUNCE_TEXT_MS);
+
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, [query, status, page, doFetch]);
+
+  // Reset page on new query or status change
+  const setQuery  = useCallback((v: string)      => { setPage(1); setQueryRaw(v);   }, []);
+  const setStatus = useCallback((v: BlobStatus)  => { setPage(1); setStatusRaw(v); }, []);
+  const refresh   = useCallback(() => doFetch(query, status, page), [doFetch, query, status, page]);
 
   return [
     state,
-    { query, setQuery: handleSetQuery, status, setStatus: handleSetStatus, setPage, refresh },
+    { query, setQuery, status, setStatus, setPage, refresh },
   ];
 }

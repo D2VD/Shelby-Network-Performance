@@ -1,12 +1,13 @@
 // app/api/network/leaderboard/route.ts
 // Edge proxy → VPS /api/network/leaderboard
-// v1.0
+// v1.1 — remove next: { revalidate } from fetch() — not supported in CF edge runtime
+//         (same issue as blobs-data v2.0 → v2.2). Cache-control on response only.
 
 import { NextRequest, NextResponse } from "next/server";
 
-const VPS_BASE = process.env.SHELBY_API_URL ?? "";
-
 export const runtime = "edge";
+
+const VPS_BASE = process.env.SHELBY_API_URL ?? "";
 
 export async function GET(req: NextRequest) {
   if (!VPS_BASE) {
@@ -16,32 +17,21 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  // Forward only the params we care about
   const incoming = req.nextUrl.searchParams;
-  const params = new URLSearchParams();
-
-  const network = incoming.get("network") ?? "testnet";
-  const sort    = incoming.get("sort")    ?? "score";
-  const limit   = incoming.get("limit")   ?? "50";
-
-  params.set("network", network);
-  params.set("sort",    sort);
-  params.set("limit",   limit);
+  const params   = new URLSearchParams();
+  params.set("network", incoming.get("network") ?? "testnet");
+  params.set("sort",    incoming.get("sort")    ?? "score");
+  params.set("limit",   incoming.get("limit")   ?? "50");
 
   const upstream = `${VPS_BASE}/api/network/leaderboard?${params.toString()}`;
 
   try {
-    const res = await fetch(upstream, {
-      headers: { "x-shelby-internal": "1" },
-      next: { revalidate: 300 }, // 5-min edge cache
-    });
-
+    const res  = await fetch(upstream);   // no fetch options — edge runtime safe
     const body = await res.text();
-
     return new NextResponse(body, {
       status: res.status,
       headers: {
-        "content-type": res.headers.get("content-type") ?? "application/json",
+        "content-type":  res.headers.get("content-type") ?? "application/json",
         "cache-control": "public, s-maxage=300, stale-while-revalidate=60",
       },
     });

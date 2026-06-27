@@ -1,6 +1,8 @@
-// app/api/network/blobs-data/route.ts — v2.1
-// v2.1: Expose fetch exception detail in 502 response for diagnostics.
-//       Remove after root cause confirmed.
+// app/api/network/blobs-data/route.ts — v2.2
+// v2.1: Exposed fetch exception detail for diagnostics.
+// v2.2: Remove cache: "no-store" from fetch() options — CF Pages edge runtime
+//       does not implement the 'cache' field on RequestInitializerDict and throws.
+//       Cache-Control: no-store is still set on the response headers.
 
 import { NextRequest, NextResponse } from "next/server";
 
@@ -21,12 +23,11 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
   let res: Response;
   try {
-    res = await fetch(upstream, { cache: "no-store" });
+    res = await fetch(upstream);   // no cache option — not supported in CF edge runtime
   } catch (err) {
-    // v2.1: expose exception so we can diagnose CF edge → VPS routing
     const detail = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
-      { error: "Could not reach blob data service", detail, upstream },
+      { error: "Could not reach blob data service", detail },
       { status: 502 }
     );
   }

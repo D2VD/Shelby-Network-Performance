@@ -18,6 +18,7 @@ import { useNetwork } from "@/components/network-context";
 // ─── Imports từ EXPLORER_PAGE_PATCH v3.5 ──────────────────────────────────────
 import { ActivityFeed }  from "@/components/activity-feed";
 import { ExportPanel }   from "@/components/export-panel";
+import { LeaderboardTab } from "@/components/leaderboard-tab";
 import {
   BlobSearchBar,
   BlobStatusFilter,
@@ -798,7 +799,8 @@ function ExplorerContent() {
               { id: "transactions", label: "⚡ Transactions" },
               { id: "blobs", label: "🗂 Blobs Explorer" },
               { id: "activity", label: "📈 Activity" },
-              { id: "export", label: "↓ Export" }
+              { id: "export", label: "↓ Export" },
+              { id: "leaderboard", label: "🏆 Leaderboard" }
             ].map(tab => (
               <button
                 key={tab.id}
@@ -908,6 +910,13 @@ function ExplorerContent() {
           {activeTab === "export" && (
             <div style={{ padding: "24px 20px" }}>
               <ExportPanel network={network} />
+            </div>
+          )}
+
+          {/* TAB 5: SP LEADERBOARD (Phase 3 Week 4 — B1) */}
+          {activeTab === "leaderboard" && (
+            <div style={{ padding: "24px 20px" }}>
+              <LeaderboardTab initialNetwork={network as "shelbynet" | "testnet"} />
             </div>
           )}
 

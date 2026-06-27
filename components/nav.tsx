@@ -9,10 +9,11 @@ import { useNetwork, type NetworkId } from "./network-context";
 import { useTheme } from "./theme-context";
 
 const NAV_TABS = [
-  { href: "/map",       label: "Map",       exact: false },
-  { href: "/network",   label: "Network",   exact: false },
-  { href: "/explorer",  label: "Explorer",  exact: false },
-  { href: "/benchmark", label: "Benchmark", exact: false },
+  { href: "/map",        label: "Map",        exact: false },
+  { href: "/network",    label: "Network",    exact: false },
+  { href: "/explorer",   label: "Explorer",   exact: false },
+  { href: "/calculator", label: "Calculator", exact: false },
+  { href: "/benchmark",  label: "Benchmark",  exact: false },
 ] as const;
 
 const NETWORK_OPTIONS: { id: NetworkId; label: string; sub: string; color: string }[] = [

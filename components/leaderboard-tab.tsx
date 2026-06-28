@@ -1,24 +1,17 @@
 // components/leaderboard-tab.tsx
 // SP Performance Leaderboard — Phase 3 Week 4 (B1)
-// v1.0
+// v1.1 — Defensive field reads: handles both camelCase (v1.2 backend) and
+//   snake_case (older compiled dist), ensuring fields never silently resolve
+//   to undefined. Fixes "all Faulty / all —" display when API naming drifts.
 
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -29,23 +22,55 @@ import { RefreshCw, Trophy, TrendingUp, Zap } from "lucide-react";
 type SortKey = "score" | "uptime" | "stake";
 
 interface LeaderboardEntry {
-  rank: number;
-  address: string;
-  az: string;
-  condition: number;
-  stake: string;
-  uptimePct: number;
+  rank:            number;
+  address:         string;
+  az:              string;
+  condition:       number;       // 0=Healthy, 1=Faulty
+  stake:           string;       // octas string
+  uptimePct:       number;
   reputationScore: number;
-  firstSeen: string;
-  lastSeen: string;
+  firstSeen:       string;
+  lastSeen:        string;
+  // snake_case fallback fields (older dist may still emit these)
+  uptime_pct?:        number;
+  reputation_score?:  number;
+  stake_octas?:       string;
+  current_health?:    string;
 }
 
 interface LeaderboardResponse {
-  network: string;
-  sort: SortKey;
-  count: number;
+  network:     string;
+  sort:        SortKey;
+  count:       number;
   generatedAt: string;
   leaderboard: LeaderboardEntry[];
+}
+
+// ── Defensive field reads ──────────────────────────────────────────────────────
+// API may return camelCase (v1.2) or snake_case (pre-v1.2 dist).
+// Always prefer camelCase; fall back to snake_case; then use safe default.
+
+function getCondition(e: LeaderboardEntry): number {
+  if (e.condition !== undefined) return e.condition;
+  // fall back to string health field if old dist is running
+  if (e.current_health !== undefined) return e.current_health === "Healthy" ? 0 : 1;
+  return 1; // safe default — show Faulty rather than silently hide
+}
+
+function getStake(e: LeaderboardEntry): string {
+  if (e.stake !== undefined && e.stake !== null) return String(e.stake);
+  if (e.stake_octas !== undefined && e.stake_octas !== null) return String(e.stake_octas);
+  return "0";
+}
+
+function getUptimePct(e: LeaderboardEntry): number {
+  const v = e.uptimePct ?? e.uptime_pct;
+  return typeof v === "number" ? v : 0;
+}
+
+function getScore(e: LeaderboardEntry): number {
+  const v = e.reputationScore ?? e.reputation_score;
+  return typeof v === "number" ? v : 0;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -71,7 +96,8 @@ function shortAddress(addr: string): string {
 
 function stakeToApt(octas: string): string {
   const n = Number(octas);
-  if (isNaN(n)) return "—";
+  if (isNaN(n) || octas === "—") return "—";
+  if (n === 0) return "0.00 APT";
   return num(n / 1e8, 2) + " APT";
 }
 
@@ -94,10 +120,9 @@ function rankIcon(rank: number) {
   return null;
 }
 
-function conditionLabel(condition: number): { label: string; variant: "default" | "secondary" | "destructive" } {
-  // condition=0 → Healthy; condition=1 → Faulty (per project rules: no grace period)
-  if (condition === 0) return { label: "Healthy", variant: "default" };
-  return { label: "Faulty", variant: "destructive" };
+function conditionLabel(condition: number) {
+  if (condition === 0) return { label: "Healthy", variant: "default" as const };
+  return { label: "Faulty", variant: "destructive" as const };
 }
 
 // ── Component ──────────────────────────────────────────────────────────────────
@@ -107,11 +132,11 @@ interface LeaderboardTabProps {
 }
 
 export function LeaderboardTab({ initialNetwork = "testnet" }: LeaderboardTabProps) {
-  const [network, setNetwork] = useState<"shelbynet" | "testnet">(initialNetwork);
-  const [sort, setSort] = useState<SortKey>("score");
-  const [data, setData] = useState<LeaderboardResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [network, setNetwork]     = useState<"shelbynet" | "testnet">(initialNetwork);
+  const [sort, setSort]           = useState<SortKey>("score");
+  const [data, setData]           = useState<LeaderboardResponse | null>(null);
+  const [loading, setLoading]     = useState(false);
+  const [error, setError]         = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState<string>("");
 
   const fetchLeaderboard = useCallback(async () => {
@@ -135,22 +160,16 @@ export function LeaderboardTab({ initialNetwork = "testnet" }: LeaderboardTabPro
     }
   }, [network, sort]);
 
-  // Fetch on mount and when filters change
   useEffect(() => {
     fetchLeaderboard();
   }, [fetchLeaderboard]);
-
-  // ── Render ───────────────────────────────────────────────────────────────────
 
   return (
     <div className="space-y-4">
       {/* Controls */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
-          <Select
-            value={network}
-            onValueChange={(v) => setNetwork(v as "shelbynet" | "testnet")}
-          >
+          <Select value={network} onValueChange={(v) => setNetwork(v as "shelbynet" | "testnet")}>
             <SelectTrigger className="w-36 h-8 text-sm">
               <SelectValue />
             </SelectTrigger>
@@ -187,19 +206,14 @@ export function LeaderboardTab({ initialNetwork = "testnet" }: LeaderboardTabPro
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           {lastRefresh && <span>Updated {lastRefresh}</span>}
           {data && <span>· {data.count} providers</span>}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 px-2"
-            onClick={fetchLeaderboard}
-            disabled={loading}
-          >
+          <Button variant="ghost" size="sm" className="h-7 px-2"
+            onClick={fetchLeaderboard} disabled={loading}>
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
           </Button>
         </div>
       </div>
 
-      {/* Score formula callout */}
+      {/* Formula callout */}
       <div className="rounded-md bg-muted/50 border px-3 py-2 text-xs text-muted-foreground">
         <span className="font-semibold text-foreground">Reputation Score</span>
         {" "}= Uptime % × 0.70 + Normalized Stake × 0.30 · Updated every 5 min from sp_snapshots
@@ -245,22 +259,21 @@ export function LeaderboardTab({ initialNetwork = "testnet" }: LeaderboardTabPro
                 </TableRow>
               )}
               {data.leaderboard.map((entry) => {
-                const cond = conditionLabel(entry.condition);
-                return (
-                  <TableRow
-                    key={entry.address}
-                    className="hover:bg-muted/20 transition-colors"
-                  >
-                    {/* Rank */}
-                    <TableCell className="text-center font-mono text-sm font-medium">
-                      {rankIcon(entry.rank)}
-                      {entry.rank}
-                    </TableCell>
+                // Use defensive readers — never undefined regardless of API version
+                const condition     = getCondition(entry);
+                const stakeOctas    = getStake(entry);
+                const uptimePct     = getUptimePct(entry);
+                const score         = getScore(entry);
+                const cond          = conditionLabel(condition);
 
-                    {/* Address */}
+                return (
+                  <TableRow key={entry.address} className="hover:bg-muted/20 transition-colors">
+                    <TableCell className="text-center font-mono text-sm font-medium">
+                      {rankIcon(entry.rank)}{entry.rank}
+                    </TableCell>
                     <TableCell className="font-mono text-xs">
                       <a
-                        href={`https://explorer.aptoslabs.com/account/${entry.address}?network=testnet`}
+                        href={`https://explorer.aptoslabs.com/account/${entry.address}?network=shelbynet`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="hover:underline text-blue-600 dark:text-blue-400"
@@ -269,42 +282,25 @@ export function LeaderboardTab({ initialNetwork = "testnet" }: LeaderboardTabPro
                         {shortAddress(str(entry.address))}
                       </a>
                     </TableCell>
-
-                    {/* AZ */}
                     <TableCell className="text-sm">
                       <span className="font-mono text-xs bg-muted rounded px-1.5 py-0.5">
                         {str(entry.az) || "—"}
                       </span>
                     </TableCell>
-
-                    {/* Status */}
                     <TableCell className="text-center">
-                      <Badge variant={cond.variant} className="text-xs">
-                        {cond.label}
-                      </Badge>
+                      <Badge variant={cond.variant} className="text-xs">{cond.label}</Badge>
                     </TableCell>
-
-                    {/* Stake */}
                     <TableCell className="text-right text-sm font-mono">
-                      {stakeToApt(str(entry.stake))}
+                      {stakeToApt(stakeOctas)}
                     </TableCell>
-
-                    {/* Uptime */}
                     <TableCell className="text-right text-sm">
-                      <span className={entry.uptimePct >= 95 ? "text-emerald-600" : entry.uptimePct >= 80 ? "text-yellow-600" : "text-red-500"}>
-                        {num(entry.uptimePct, 1)}%
+                      <span className={uptimePct >= 95 ? "text-emerald-600" : uptimePct >= 80 ? "text-yellow-600" : "text-red-500"}>
+                        {num(uptimePct, 1)}%
                       </span>
                     </TableCell>
-
-                    {/* Score */}
                     <TableCell className="text-right">
-                      <Badge
-                        variant={scoreBadgeVariant(entry.reputationScore)}
-                        className="tabular-nums font-semibold"
-                      >
-                        <span className={scoreColor(entry.reputationScore)}>
-                          {num(entry.reputationScore, 0)}
-                        </span>
+                      <Badge variant={scoreBadgeVariant(score)} className="tabular-nums font-semibold">
+                        <span className={scoreColor(score)}>{num(score, 0)}</span>
                       </Badge>
                     </TableCell>
                   </TableRow>
@@ -315,7 +311,6 @@ export function LeaderboardTab({ initialNetwork = "testnet" }: LeaderboardTabPro
         </div>
       )}
 
-      {/* Footer meta */}
       {data && (
         <p className="text-xs text-muted-foreground text-right">
           {data.generatedAt

@@ -1,12 +1,5 @@
 // app/calculator/page.tsx
-// Shelby Economics Calculator — v4.1 (Patched)
-// Layout overhaul:
-//   - Card-based mode switcher replaces tab bar (Storage Cost | SP Economics)
-//   - Parameters rendered as a single compact horizontal row, not a tall card
-//   - Estimated Cost/Rewards is the immediate full-width visual payoff
-//   - Network selector in header; constants update per network
-//   - Info bar: 4 stat chips in one row (not 5 separate cards)
-//   - Breakdown, Chart, Comparison, Actions remain full-width below
+// Shelby Economics Calculator — v4.2 (Fully Patched with Live Network Config)
 
 "use client";
 
@@ -58,7 +51,7 @@ const NETWORK_CONSTANTS: Record<NetworkKey, {
   },
 };
 
-const CHUNK_SIZE_BYTES = 1_048_576; // 1 MiB assumed
+const DEFAULT_CHUNK_SIZE_BYTES = 1_048_576; // 1 MiB fallback
 const MAX_STAKE_APT    = 10_000_000;
 
 // ── Duration presets ───────────────────────────────────────────────────────────
@@ -100,6 +93,15 @@ interface LivePricing {
   syncedAt:  string;
 }
 
+interface NetworkConfig {
+  chunkSizeBytes: number;
+  chunkSizeMiB:   number;
+  source:         "on-chain" | "fallback";
+  resourceType:   string | null;
+  fieldName:      string | null;
+  fetchedAt:      string;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 function num(v: number, d = 2): string {
   return v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -117,9 +119,9 @@ interface StorageResult {
   totalMicroSUSD: number; totalSUSD: number;
   perMonthSUSD: number; perGBMonthSUSD: number; gbDecimal: number;
 }
-function calcStorage(sizeBytes: number, days: number, net: NetworkKey): StorageResult {
+function calcStorage(sizeBytes: number, days: number, net: NetworkKey, chunkSizeBytes: number): StorageResult {
   const c = NETWORK_CONSTANTS[net];
-  const chunks         = Math.ceil(sizeBytes / CHUNK_SIZE_BYTES);
+  const chunks         = Math.ceil(sizeBytes / chunkSizeBytes);
   const epochs         = Math.ceil(days / c.paymentEpochDays);
   const totalMicroSUSD = chunks * epochs * c.microSUSDTotal;
   const totalSUSD      = totalMicroSUSD / 1_000_000;
@@ -155,10 +157,9 @@ function usePricing() {
     fetch("/api/pricing/competitors")
       .then((r) => (r.ok ? r.json() : null))
       .then((d: LivePricing | null) => {
-        if (d?.providers && d.providers.length > 0) {
-          setPricing(d);
-          setLastUpdated(d.syncedAt);
-        }
+        if (!d?.providers || d.providers.length === 0) return;
+        setPricing(d);
+        setLastUpdated(d.syncedAt);
       })
       .catch(() => {
         // Network error — silently fall back to hardcoded COMPETITORS constant
@@ -168,10 +169,33 @@ function usePricing() {
   return { pricing, lastUpdated };
 }
 
-// ── Shared sub-components ──────────────────────────────────────────────────────
+function useNetworkConfig(network: NetworkKey) {
+  const [config, setConfig]       = useState<NetworkConfig | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
 
-function StatCard({ label, value, sub, accent }: {
-  label: string; value: string; sub?: string; accent?: boolean;
+  useEffect(() => {
+    setIsLoading(true);
+    setConfig(null);
+
+    fetch(`/api/network/config?network=${network}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: NetworkConfig | null) => {
+        if (d?.chunkSizeBytes) setConfig(d);
+      })
+      .catch(() => {/* fall back to DEFAULT_CHUNK_SIZE_BYTES below */})
+      .finally(() => setIsLoading(false));
+  }, [network]);
+
+  const chunkSizeBytes = config?.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES;
+  const chunkSizeMiB   = chunkSizeBytes / 1_048_576;
+  const isOnChain      = config?.source === "on-chain";
+
+  return { chunkSizeBytes, chunkSizeMiB, isOnChain, isLoading, config };
+}
+
+// ── Shared sub-components ──────────────────────────────────────────────────────
+function StatCard({ label, value, sub, badge, accent }: {
+  label: string; value: string; sub?: string; badge?: React.ReactNode; accent?: boolean;
 }) {
   return (
     <div className={`rounded-lg border p-4 space-y-1 ${accent ? "border-emerald-200 bg-emerald-50 dark:bg-emerald-950/20 dark:border-emerald-800" : "bg-muted/30"}`}>
@@ -180,6 +204,7 @@ function StatCard({ label, value, sub, accent }: {
         {value}
       </p>
       {sub && <p className="text-xs text-muted-foreground">{sub}</p>}
+      {badge && <div className="mt-1">{badge}</div>}
     </div>
   );
 }
@@ -206,7 +231,6 @@ function DurationPills({ days, onChange }: { days: number; onChange: (d: number)
           {p.label}
         </button>
       ))}
-      {/* Custom input — inline, shown always as last option */}
       <div className="flex items-center gap-1.5">
         <Input
           type="number"
@@ -316,13 +340,13 @@ function StorageCostContent({
   const [days, setDays]           = useState(30);
 
   const { pricing, lastUpdated } = usePricing();
+  const { chunkSizeBytes, chunkSizeMiB, isOnChain, isLoading: configLoading } = useNetworkConfig(network);
 
   const unitBytes: Record<"MB" | "GB" | "TB", number> = { MB: 1e6, GB: 1e9, TB: 1e12 };
   const sizeBytes = sizeValue * unitBytes[sizeUnit];
-  const result    = calcStorage(sizeBytes, days, network);
+  const result    = calcStorage(sizeBytes, days, network, chunkSizeBytes);
   const nc        = NETWORK_CONSTANTS[network];
 
-  // Map dynamic live prices to the standard structure expected by charts and tables
   const competitors: Competitor[] = pricing?.providers
     ? pricing.providers.map((p) => ({
         name: p.name,
@@ -381,7 +405,6 @@ function StorageCostContent({
             </p>
           </div>
 
-          {/* Divider */}
           <div className="hidden sm:block w-px h-12 bg-border self-center" />
 
           {/* Duration */}
@@ -442,8 +465,20 @@ function StorageCostContent({
           <BarChart2 className="h-3.5 w-3.5" /> Calculation Breakdown
         </p>
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-          <StatCard label="Storage Size"     value={bytesToDisplay(sizeBytes)} />
-          <StatCard label="Chunk Size"       value="1 MiB" sub="assumed" />
+          <StatCard label="Storage Size" value={bytesToDisplay(sizeBytes)} />
+          <StatCard 
+            label="Chunk Size" 
+            value={`${num(chunkSizeMiB)} MiB`} 
+            badge={
+              configLoading ? (
+                <div className="text-muted-foreground text-xs">fetching...</div>
+              ) : isOnChain ? (
+                <div className="text-green-600 dark:text-green-400 text-xs font-medium">on-chain ✓</div>
+              ) : (
+                <div className="text-orange-500 text-xs font-medium">assumed</div>
+              )
+            }
+          />
           <StatCard label="Chunks"           value={result.chunks.toLocaleString("en-US")} />
           <StatCard label="Epochs"           value={result.epochs.toLocaleString("en-US")} sub={`${nc.paymentEpochDays}d each`} />
           <StatCard label="Rate"             value={`${nc.microSUSDTotal} µsUSD`} sub="per chunk / epoch" />
@@ -527,7 +562,7 @@ function StorageCostContent({
           </p>
         )}
         <p className="text-xs text-muted-foreground mt-2">
-          * ShelbyUSD ≠ USD. Chunk size 1 MiB assumed pending contract confirmation.
+          * ShelbyUSD ≠ USD. Chunk size {num(chunkSizeMiB)} MiB {isOnChain ? "confirmed on-chain" : "assumed pending contract confirmation"}.
         </p>
       </div>
 
@@ -557,6 +592,7 @@ function SPEconomicsContent({ network }: { network: NetworkKey }) {
   const [stakeApt, setStakeApt] = useState(1000);
   const [chunks, setChunks]     = useState(10000);
 
+  const { chunkSizeBytes } = useNetworkConfig(network);
   const result = calcSP(stakeApt, chunks, network);
   const nc     = NETWORK_CONSTANTS[network];
 
@@ -612,7 +648,7 @@ function SPEconomicsContent({ network }: { network: NetworkKey }) {
                 className="w-32 h-9 text-sm"
               />
               <span className="text-xs text-muted-foreground">
-                ≈ {bytesToDisplay(chunks * 1_048_576)}
+                ≈ {bytesToDisplay(chunks * chunkSizeBytes)}
               </span>
             </div>
             <p className="text-xs text-muted-foreground">Depends on network demand</p>
@@ -739,7 +775,6 @@ function SPEconomicsContent({ network }: { network: NetworkKey }) {
 }
 
 // ── Page ────────────────────────────────────────────────────────────────────────
-
 export default function CalculatorPage() {
   const [mode, setMode]       = useState<Mode>("storage");
   const [network, setNetwork] = useState<NetworkKey>("shelbynet");
@@ -771,7 +806,7 @@ export default function CalculatorPage() {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="shelbynet">Shelbynet</SelectItem>
+                <SelectItem value="shelbynet">ShelbyNet</SelectItem>
                 <SelectItem value="testnet">Testnet</SelectItem>
               </SelectContent>
             </Select>

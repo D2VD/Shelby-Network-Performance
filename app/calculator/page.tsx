@@ -1,5 +1,5 @@
 // app/calculator/page.tsx
-// Shelby Economics Calculator — v4.0
+// Shelby Economics Calculator — v4.1 (Patched)
 // Layout overhaul:
 //   - Card-based mode switcher replaces tab bar (Storage Cost | SP Economics)
 //   - Parameters rendered as a single compact horizontal row, not a tall card
@@ -10,7 +10,7 @@
 
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -70,7 +70,7 @@ const DURATION_PRESETS = [
   { label: "1yr", days: 365 },
 ];
 
-// ── Competitor table ───────────────────────────────────────────────────────────
+// ── Competitor table & types ───────────────────────────────────────────────────
 interface Competitor {
   name: string; usdPerGBmo: number | null; model: string; note: string;
 }
@@ -82,6 +82,23 @@ const COMPETITORS: Competitor[] = [
   { name: "Filecoin",      usdPerGBmo: 0.0002, model: "Monthly",  note: "Variable, deal-based" },
   { name: "IPFS (pinned)", usdPerGBmo: 0.10,   model: "Monthly",  note: "Via Pinata / NFT.Storage" },
 ];
+
+interface LivePricingProvider {
+  id:                string;
+  name:              string;
+  storagePerGBMonth: number;
+  egressPerGB:       number;
+  putPer1000:        number;
+  getPer1000:        number;
+  model:             "monthly" | "one-time" | "variable";
+  note:              string;
+  source:            string;
+}
+
+interface LivePricing {
+  providers: LivePricingProvider[];
+  syncedAt:  string;
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 function num(v: number, d = 2): string {
@@ -129,6 +146,28 @@ function calcSP(stakeApt: number, chunks: number, net: NetworkKey): SPResult {
   return { rewardPerEpochSUSD, rewardPerDaySUSD, rewardPerMonthSUSD, rewardPerYearSUSD, breakEvenDays };
 }
 
+// ── Hooks ──────────────────────────────────────────────────────────────────────
+function usePricing() {
+  const [pricing, setPricing]         = useState<LivePricing | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch("/api/pricing/competitors")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: LivePricing | null) => {
+        if (d?.providers && d.providers.length > 0) {
+          setPricing(d);
+          setLastUpdated(d.syncedAt);
+        }
+      })
+      .catch(() => {
+        // Network error — silently fall back to hardcoded COMPETITORS constant
+      });
+  }, []);
+
+  return { pricing, lastUpdated };
+}
+
 // ── Shared sub-components ──────────────────────────────────────────────────────
 
 function StatCard({ label, value, sub, accent }: {
@@ -145,6 +184,7 @@ function StatCard({ label, value, sub, accent }: {
   );
 }
 
+// ── DurationPills ──────────────────────────────────────────────────────────────
 function DurationPills({ days, onChange }: { days: number; onChange: (d: number) => void }) {
   const [custom, setCustom] = useState(false);
   const [customVal, setCustomVal] = useState("");
@@ -188,6 +228,7 @@ function DurationPills({ days, onChange }: { days: number; onChange: (d: number)
   );
 }
 
+// ── CostBarChart ───────────────────────────────────────────────────────────────
 function CostBarChart({ rows }: { rows: { name: string; cost: number; note: string; isShelby: boolean }[] }) {
   const max = Math.max(...rows.map((r) => r.cost), 0.0001);
   return (
@@ -274,14 +315,26 @@ function StorageCostContent({
   const [sizeUnit, setSizeUnit]   = useState<"MB" | "GB" | "TB">("GB");
   const [days, setDays]           = useState(30);
 
+  const { pricing, lastUpdated } = usePricing();
+
   const unitBytes: Record<"MB" | "GB" | "TB", number> = { MB: 1e6, GB: 1e9, TB: 1e12 };
   const sizeBytes = sizeValue * unitBytes[sizeUnit];
   const result    = calcStorage(sizeBytes, days, network);
   const nc        = NETWORK_CONSTANTS[network];
 
+  // Map dynamic live prices to the standard structure expected by charts and tables
+  const competitors: Competitor[] = pricing?.providers
+    ? pricing.providers.map((p) => ({
+        name: p.name,
+        usdPerGBmo: p.storagePerGBMonth,
+        model: p.model.charAt(0).toUpperCase() + p.model.slice(1),
+        note: p.note,
+      }))
+    : COMPETITORS;
+
   const chartRows = [
     { name: "Shelby", cost: result.totalSUSD, note: "sUSD*", isShelby: true },
-    ...COMPETITORS.map((c) => ({
+    ...competitors.map((c) => ({
       name: c.name,
       cost: c.usdPerGBmo !== null
         ? c.usdPerGBmo * result.gbDecimal * (days / 30)
@@ -443,7 +496,7 @@ function StorageCostContent({
                   Decentralised, cryptographic guarantees
                 </TableCell>
               </TableRow>
-              {COMPETITORS.map((c) => {
+              {competitors.map((c) => {
                 const cost = c.usdPerGBmo !== null
                   ? c.usdPerGBmo * result.gbDecimal * (days / 30) : null;
                 return (
@@ -463,6 +516,16 @@ function StorageCostContent({
             </TableBody>
           </Table>
         </div>
+        {lastUpdated && (
+          <p className="text-xs text-muted-foreground mt-2 text-right">
+            Competitor prices last updated:{" "}
+            {new Date(lastUpdated).toLocaleDateString("en-US", {
+              year:  "numeric",
+              month: "long",
+              day:   "numeric",
+            })}
+          </p>
+        )}
         <p className="text-xs text-muted-foreground mt-2">
           * ShelbyUSD ≠ USD. Chunk size 1 MiB assumed pending contract confirmation.
         </p>

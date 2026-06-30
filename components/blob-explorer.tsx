@@ -1,10 +1,9 @@
-// components/blob-explorer.tsx — v1.2
-// CHANGES: Updated all column references to match actual blob_registry schema.
-//   blob_id → blob_name, owner_address → owner
-//   Added tx_hash, tx_version, num_slices, content_hash, content_type to detail
-//   Removed placement_groups (column does not exist)
-//   Size formatted as dual GB decimal + GiB binary per OS display rule
-//   Hint updated: 0x+64hex = "Transaction hash", address = "Owner address"
+// components/blob-explorer.tsx — v1.3
+// CHANGES vs v1.2:
+//   BlobTable: replaced inline expand/collapse with onSelect navigation —
+//   clicking a row now routes to a dedicated detail view (mirrors the
+//   Transactions tab's TxDetailPanel pattern) instead of collapsing on
+//   re-click. BlobDetailExpanded is now exported for reuse by that panel.
 
 "use client";
 
@@ -184,7 +183,7 @@ function StatusPill({ status, isDark }: { status: unknown; isDark: boolean }) {
 
 // ── Blob detail (expanded row) ────────────────────────────────────────────────
 
-function BlobDetailExpanded({ blob, isDark }: { blob: BlobRecord; isDark: boolean }) {
+export function BlobDetailExpanded({ blob, isDark }: { blob: BlobRecord; isDark: boolean }) {
   const rowCls  = isDark ? "text-white/50" : "text-black/50";
   const valCls  = isDark ? "text-white/80 font-mono break-all" : "text-black/75 font-mono break-all";
   const wrapCls = isDark ? "border-white/8 bg-white/3" : "border-black/8 bg-black/2";
@@ -228,9 +227,15 @@ function BlobSkeleton({ isDark }: { isDark: boolean }) {
 
 // ── BlobTable ─────────────────────────────────────────────────────────────────
 
-export function BlobTable({ state, isDark }: { state: BlobSearchState; isDark: boolean }) {
-  const mounted  = useMounted();
-  const [expanded, setExpanded] = useState<string | null>(null);
+export function BlobTable({
+  state, isDark, onSelect,
+}: {
+  state: BlobSearchState; isDark: boolean;
+  /** Called when a row is clicked — parent navigates to the blob detail view
+   *  (mirrors TxDetailPanel's click-through pattern instead of inline expand). */
+  onSelect: (blob: BlobRecord) => void;
+}) {
+  const mounted = useMounted();
 
   if (!mounted) return <BlobSkeleton isDark={isDark} />;
 
@@ -285,13 +290,12 @@ export function BlobTable({ state, isDark }: { state: BlobSearchState; isDark: b
       </div>
 
       {state.results.map((blob) => {
-        const key    = `${str(blob.blob_name)}-${num(blob.tx_version)}`;
-        const isOpen = expanded === key;
+        const key = `${str(blob.blob_name)}-${num(blob.tx_version)}`;
 
         return (
           <div key={key}
             className={`border-b last:border-b-0 ${rowBdr} ${rowHover} cursor-pointer transition-colors`}
-            onClick={() => setExpanded(isOpen ? null : key)}
+            onClick={() => onSelect(blob)}
           >
             <div className="grid grid-cols-[1fr_auto_auto_auto] gap-4 px-4 py-3 items-center">
               <div className="min-w-0">
@@ -306,12 +310,6 @@ export function BlobTable({ state, isDark }: { state: BlobSearchState; isDark: b
                 {fmtDate(blob.registered_at)}
               </span>
             </div>
-
-            {isOpen && (
-              <div className="px-4 pb-4">
-                <BlobDetailExpanded blob={blob} isDark={isDark} />
-              </div>
-            )}
           </div>
         );
       })}

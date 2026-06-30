@@ -21,6 +21,9 @@ type EventKind =
   | "sp_joined"
   | "sp_left"
   | "epoch_transition"
+  | "blob_registered"
+  | "blob_pending"
+  | "blob_deleted"
   | "heartbeat";
 
 interface ActivityEvent {
@@ -81,6 +84,24 @@ const EVENT_CFG: Record<EventKind, EventCfg> = {
     color:   "text-blue-400",
     visible: true,
   },
+  blob_registered: {
+    icon:    "🗂",
+    label:   (p) => `Blob registered: ${String(p["blobName"] ?? "")}`,
+    color:   "text-pink-400",
+    visible: true,
+  },
+  blob_pending: {
+    icon:    "⏳",
+    label:   (p) => `Blob pending: ${String(p["blobName"] ?? "")}`,
+    color:   "text-yellow-400",
+    visible: true,
+  },
+  blob_deleted: {
+    icon:    "🗑",
+    label:   (p) => `Blob deleted: ${String(p["blobName"] ?? "")}`,
+    color:   "text-red-400",
+    visible: true,
+  },
   heartbeat: {
     icon:    "·",
     label:   () => "Heartbeat",
@@ -108,6 +129,11 @@ interface ActivityFeedProps {
   height?:        number;
   /** Extra Tailwind classes on the root element */
   className?:     string;
+  /** Fired for every received event (including filtered-out heartbeats),
+   *  in addition to internal list rendering — lets a parent (e.g. the
+   *  Blobs Explorer tab) react to blob_registered/pending/deleted without
+   *  opening a second EventSource connection. */
+  onEvent?:       (kind: EventKind, payload: Record<string, unknown>) => void;
 }
 
 export function ActivityFeed({
@@ -115,12 +141,15 @@ export function ActivityFeed({
   showHeartbeat = false,
   height        = 400,
   className     = "",
+  onEvent,
 }: ActivityFeedProps) {
   const [events,    setEvents]    = useState<ActivityEvent[]>([]);
   const [connected, setConnected] = useState(false);
   const [retryMsg,  setRetryMsg]  = useState<string | null>(null);
   const esRef   = useRef<EventSource | null>(null);
   const counter = useRef(0);
+  const onEventRef = useRef(onEvent);
+  onEventRef.current = onEvent;
 
   useEffect(() => {
     let mounted = true;
@@ -155,6 +184,8 @@ export function ActivityFeed({
         let payload: Record<string, unknown> = {};
         try { payload = JSON.parse(raw); } catch { payload = { raw }; }
 
+        onEventRef.current?.(kind, payload);
+
         const event: ActivityEvent = {
           id:        String(counter.current++),
           kind,
@@ -170,6 +201,9 @@ export function ActivityFeed({
       es.addEventListener("sp_joined",        (e) => push("sp_joined",        e.data));
       es.addEventListener("sp_left",          (e) => push("sp_left",          e.data));
       es.addEventListener("epoch_transition", (e) => push("epoch_transition", e.data));
+      es.addEventListener("blob_registered",  (e) => push("blob_registered",  e.data));
+      es.addEventListener("blob_pending",     (e) => push("blob_pending",     e.data));
+      es.addEventListener("blob_deleted",     (e) => push("blob_deleted",     e.data));
       es.addEventListener("heartbeat",        (e) => push("heartbeat",        JSON.stringify({ timestamp: e.data })));
     }
 

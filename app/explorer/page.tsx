@@ -1,6 +1,17 @@
 "use client";
 /**
- * app/explorer/page.tsx — v3.6
+ * app/explorer/page.tsx — v3.7
+ *
+ * Changes vs v3.6:
+ * - Merged the standalone Activity tab into Blobs Explorer: live SSE feed now
+ *   renders as a strip above the blob table (ActivityFeed with onEvent), and
+ *   "blob_registered"/"blob_pending"/"blob_deleted" events trigger a debounced
+ *   blobCtrl.refresh() instead of polling. Activity tab nav entry removed.
+ * - BlobTable row click now routes to BlobDetailPanel (?b=&bv=) instead of
+ *   inline expand/collapse — mirrors TxDetailPanel's click-through pattern.
+ * - NOTE: requires the new backend route api/src/routes/activity.ts (was
+ *   missing — activity-feed.tsx was previously calling a non-existent
+ *   endpoint) and blob-registry-sync.ts v3.5 (emits blob_registered).
  *
  * Changes vs v3.5:
  * - Fix: top search bar's blob-name routing now syncs into the Blobs Explorer
@@ -32,7 +43,9 @@ import {
   BlobStatusFilter,
   BlobTable,
   BlobPagination,
+  BlobDetailExpanded,
 } from "@/components/blob-explorer";
+import type { BlobRecord } from "@/hooks/use-blob-search";
 import { useBlobSearch } from "@/hooks/use-blob-search";
 import { useTheme }      from "@/components/theme-context";
 
@@ -647,6 +660,61 @@ function BlobSearchPanel({ blobName, network, onVersionClick }: {
   );
 }
 
+// ─── Flow 3: Blob detail panel (click-through from Blobs Explorer table) ─────
+
+function BlobDetailPanel({ blobName, txVersion, network, isDark, onClose }: {
+  blobName: string; txVersion: string; network: string; isDark: boolean;
+  onClose: () => void;
+}) {
+  const [blob,    setBlob]    = useState<BlobRecord | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error,   setError]   = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true); setError(null); setBlob(null);
+    const params = new URLSearchParams({ network, name: blobName, limit: "20" });
+    fetch(`/api/network/blobs-data?${params}`, { signal: AbortSignal.timeout(15_000) })
+      .then(r => r.json())
+      .then((j: { ok: boolean; blobs?: BlobRecord[]; blob?: BlobRecord; error?: string }) => {
+        if (cancelled) return;
+        if (!j.ok) { setError(j.error ?? "Not found"); return; }
+        const list = j.blobs ?? (j.blob ? [j.blob] : []);
+        const match = txVersion
+          ? list.find(b => String(b.tx_version) === txVersion) ?? list[0]
+          : list[0];
+        if (!match) { setError(`No blob matching "${blobName}" was found.`); return; }
+        setBlob(match);
+      })
+      .catch(e => { if (!cancelled) setError((e as Error).message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [blobName, txVersion, network]);
+
+  return (
+    <div>
+      <div style={{ ...MONO, padding: "11px 20px", fontSize: 12, fontWeight: 700,
+                    background: "rgba(255,119,201,0.06)",
+                    textTransform: "uppercase", letterSpacing: "0.1em",
+                    color: "#ff77c9", borderBottom: "1px solid var(--border)",
+                    display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span>Blob Detail</span>
+        <button onClick={onClose}
+          style={{ ...MONO, fontSize: 11, background: "none", border: "none",
+                   color: "var(--text-dim)", cursor: "pointer" }}>× back to list</button>
+      </div>
+
+      {loading && <Spinner label={`Loading "${blobName}"…`}/>}
+      {!loading && error && <EmptyState icon="⚠️" title="Lookup failed" sub={error} mono/>}
+      {!loading && !error && blob && (
+        <div style={{ padding: "20px" }}>
+          <BlobDetailExpanded blob={blob} isDark={isDark}/>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main page ────────────────────────────────────────────────────────────────
 
 function ExplorerContent() {
@@ -667,14 +735,31 @@ function ExplorerContent() {
   const [searchAddr, setSearchAddr] = useState("");
   const [selectedV,  setSelectedV]  = useState("");
   const [blobSearch, setBlobSearch] = useState("");
+  const [selectedBlob, setSelectedBlob] = useState<{ name: string; v: string } | null>(null);
+  const [liveBlobCount, setLiveBlobCount] = useState(0);
+  const liveRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // SSE → table refresh: debounce so a burst of registrations triggers one
+  // refetch, not one per event. Polling fallback is no longer needed once
+  // this is live, since blob-sync now emits "blob_registered" on insert.
+  const handleActivityEvent = useCallback((kind: string, payload: Record<string, unknown>) => {
+    if (kind !== "blob_registered" && kind !== "blob_pending" && kind !== "blob_deleted") return;
+    if (payload["network"] && payload["network"] !== network) return;
+    setLiveBlobCount(c => c + 1);
+    if (liveRefreshTimer.current) clearTimeout(liveRefreshTimer.current);
+    liveRefreshTimer.current = setTimeout(() => {
+      blobCtrl.refresh();
+    }, 1500);
+  }, [network, blobCtrl]);
 
   const networkLabel = network === "shelbynet" ? "Shelbynet" : "Testnet";
 
   // ── Restore state from URL on mount / URL change ───────────────────────────
   useEffect(() => {
-    const q = searchParams.get("q") ?? "";
-    const v = searchParams.get("v") ?? "";
-    const b = searchParams.get("b") ?? "";
+    const q  = searchParams.get("q") ?? "";
+    const v  = searchParams.get("v") ?? "";
+    const b  = searchParams.get("b") ?? "";
+    const bv = searchParams.get("bv") ?? "";
     if (q.startsWith("0x")) { setSearchAddr(q); setQuery(q); }
     else if (/^\d+$/.test(q)) { setSelectedV(q); setQuery(q); }
     if (v) setSelectedV(v);
@@ -682,6 +767,7 @@ function ExplorerContent() {
       setBlobSearch(b); setQuery(b);
       blobCtrl.setQuery(b);
       setActiveTab("blobs");
+      if (bv) setSelectedBlob({ name: b, v: bv });
     }
   }, [searchParams]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -729,6 +815,7 @@ function ExplorerContent() {
   const clearSearch = () => {
     setQuery(""); setSearchAddr(""); setSelectedV(""); setBlobSearch(""); setInputErr("");
     blobCtrl.setQuery("");
+    setSelectedBlob(null);
     router.push("/explorer");
   };
 
@@ -812,7 +899,6 @@ function ExplorerContent() {
             {[
               { id: "transactions", label: "⚡ Transactions" },
               { id: "blobs", label: "🗂 Blobs Explorer" },
-              { id: "activity", label: "📈 Activity" },
               { id: "export", label: "↓ Export" },
               { id: "leaderboard", label: "🏆 Leaderboard" }
             ].map(tab => (
@@ -874,60 +960,84 @@ function ExplorerContent() {
             </>
           )}
 
-          {/* TAB 2: BLOBS EXPLORER (Thay thế nội dung theo STEP 3) */}
+          {/* TAB 2: BLOBS EXPLORER (merged with live Activity feed) */}
           {activeTab === "blobs" && (
             <div style={{ padding: "24px 20px" }}>
-              {/* ── Blob search controls ─────────────────────────── */}
-              <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 16 }}>
-                <BlobSearchBar
-                  query={blobCtrl.query}
-                  onChange={blobCtrl.setQuery}
-                  loading={blobState.loading}
-                  isDark={isDark}
+              {selectedBlob ? (
+                <BlobDetailPanel
+                  blobName={selectedBlob.name} txVersion={selectedBlob.v}
+                  network={network} isDark={isDark}
+                  onClose={() => setSelectedBlob(null)}
                 />
-                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                  <BlobStatusFilter
-                    status={blobCtrl.status}
-                    onChange={blobCtrl.setStatus}
-                    isDark={isDark}
+              ) : (
+                <>
+                  {/* ── Live indicator + collapsible activity strip ──────── */}
+                  <div style={{ marginBottom: 16, borderRadius: 9,
+                                 border: "1px solid var(--border)", overflow: "hidden" }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+                                   padding: "8px 14px", background: "var(--bg-card2)" }}>
+                      <span style={{ ...MONO, fontSize: 11, color: "var(--text-muted)" }}>
+                        📡 Live network activity
+                        {liveBlobCount > 0 && (
+                          <span style={{ marginLeft: 8, color: "#ff77c9" }}>
+                            · {liveBlobCount} update{liveBlobCount > 1 ? "s" : ""} this session
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                    <ActivityFeed network={network} height={160} onEvent={handleActivityEvent}/>
+                  </div>
+
+                  {/* ── Blob search controls ─────────────────────────── */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 16 }}>
+                    <BlobSearchBar
+                      query={blobCtrl.query}
+                      onChange={blobCtrl.setQuery}
+                      loading={blobState.loading}
+                      isDark={isDark}
+                    />
+                    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                      <BlobStatusFilter
+                        status={blobCtrl.status}
+                        onChange={blobCtrl.setStatus}
+                        isDark={isDark}
+                      />
+                      {blobState.loading && (
+                        <span style={{ fontSize: 12, opacity: 0.4, ...MONO }}>Loading…</span>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* ── Results ────────────────────────────────────────── */}
+                  <BlobTable
+                    state={blobState} isDark={isDark}
+                    onSelect={(blob) => {
+                      const v = String(blob.tx_version);
+                      setSelectedBlob({ name: blob.blob_name, v });
+                      router.push(`/explorer?b=${encodeURIComponent(blob.blob_name)}&bv=${v}`);
+                    }}
                   />
-                  {blobState.loading && (
-                    <span style={{ fontSize: 12, opacity: 0.4, ...MONO }}>Loading…</span>
-                  )}
-                </div>
-              </div>
-
-              {/* ── Results ────────────────────────────────────────── */}
-              <BlobTable state={blobState} isDark={isDark} />
-              <div style={{ marginTop: 16 }}>
-                <BlobPagination
-                  state={blobState}
-                  onPage={blobCtrl.setPage}
-                  pageSize={20}
-                  isDark={isDark}
-                />
-              </div>
+                  <div style={{ marginTop: 16 }}>
+                    <BlobPagination
+                      state={blobState}
+                      onPage={blobCtrl.setPage}
+                      pageSize={20}
+                      isDark={isDark}
+                    />
+                  </div>
+                </>
+              )}
             </div>
           )}
 
-          {/* TAB 3: LIVE NETWORK ACTIVITY (STEP 4) */}
-          {activeTab === "activity" && (
-            <div style={{ padding: "24px 20px" }}>
-              <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: "var(--text-primary)", ...MONO }}>
-                Live Network Activity
-              </h3>
-              <ActivityFeed network={network} height={500} />
-            </div>
-          )}
-
-          {/* TAB 4: EXPORT PANEL (STEP 5) */}
+          {/* TAB 3: EXPORT PANEL */}
           {activeTab === "export" && (
             <div style={{ padding: "24px 20px" }}>
               <ExportPanel network={network} />
             </div>
           )}
 
-          {/* TAB 5: SP LEADERBOARD (Phase 3 Week 4 — B1) */}
+          {/* TAB 4: SP LEADERBOARD (Phase 3 Week 4 — B1) */}
           {activeTab === "leaderboard" && (
             <div style={{ padding: "24px 20px" }}>
               <LeaderboardTab initialNetwork={network as "shelbynet" | "testnet"} />

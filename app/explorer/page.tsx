@@ -1,6 +1,14 @@
 "use client";
 /**
- * app/explorer/page.tsx — v3.5
+ * app/explorer/page.tsx — v3.6
+ *
+ * Changes vs v3.5:
+ * - Fix: top search bar's blob-name routing now syncs into the Blobs Explorer
+ *   tab's own state (blobCtrl) and switches activeTab to "blobs" instead of
+ *   "transactions" — previously results were set on an orphaned BlobSearchPanel
+ *   that only rendered under the Transactions tab, so top-bar blob searches
+ *   silently produced nothing while on the Blobs Explorer tab.
+ * - clearSearch() and the ?b= URL-restore effect now also reset/sync blobCtrl.
  *
  * Changes vs v3.4:
  * - Tích hợp hệ thống quản lý Tab linh hoạt (Transactions, Blobs Explorer, Activity, Export).
@@ -670,8 +678,12 @@ function ExplorerContent() {
     if (q.startsWith("0x")) { setSearchAddr(q); setQuery(q); }
     else if (/^\d+$/.test(q)) { setSelectedV(q); setQuery(q); }
     if (v) setSelectedV(v);
-    if (b) { setBlobSearch(b); setQuery(b); }
-  }, [searchParams]);
+    if (b) {
+      setBlobSearch(b); setQuery(b);
+      blobCtrl.setQuery(b);
+      setActiveTab("blobs");
+    }
+  }, [searchParams]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Input parser (Fail Fast) ───────────────────────────────────────────────
   const handleSearch = () => {
@@ -706,7 +718,8 @@ function ExplorerContent() {
     // Plain blob name / filename
     if (q.includes(".") || q.includes("/") || q.length > 3) {
       setBlobSearch(q); setSearchAddr(""); setSelectedV("");
-      setActiveTab("transactions");
+      blobCtrl.setQuery(q);
+      setActiveTab("blobs");
       router.push(`/explorer?b=${encodeURIComponent(q)}`);
       return;
     }
@@ -715,6 +728,7 @@ function ExplorerContent() {
 
   const clearSearch = () => {
     setQuery(""); setSearchAddr(""); setSelectedV(""); setBlobSearch(""); setInputErr("");
+    blobCtrl.setQuery("");
     router.push("/explorer");
   };
 

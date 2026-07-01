@@ -1,6 +1,6 @@
 "use client";
 /**
- * app/explorer/page.tsx — v3.7
+ * app/explorer/page.tsx — v3.8
  *
  * Changes vs v3.6:
  * - Merged the standalone Activity tab into Blobs Explorer: live SSE feed now
@@ -35,7 +35,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useNetwork } from "@/components/network-context";
 
 // ─── Imports từ EXPLORER_PAGE_PATCH v3.5 ──────────────────────────────────────
-import { ActivityFeed }  from "@/components/activity-feed";
+import { useActivityStream, type ActivityStreamEvent } from "@/hooks/use-activity-stream";
 import { ExportPanel }   from "@/components/export-panel";
 import { LeaderboardTab } from "@/components/leaderboard-tab";
 import {
@@ -675,10 +675,10 @@ function BlobDetailPanel({ blobName, txVersion, network, isDark, onClose }: {
     setLoading(true); setError(null); setBlob(null);
     const params = new URLSearchParams({ network, name: blobName, limit: "20" });
     fetch(`/api/network/blobs-data?${params}`, { signal: AbortSignal.timeout(15_000) })
-      .then(r => r.json())
-      .then((j: { ok: boolean; blobs?: BlobRecord[]; blob?: BlobRecord; error?: string }) => {
+      .then(async (res) => {
+        const j: { blobs?: BlobRecord[]; blob?: BlobRecord; error?: string } = await res.json();
         if (cancelled) return;
-        if (!j.ok) { setError(j.error ?? "Not found"); return; }
+        if (!res.ok) { setError(j.error ?? `Server error (${res.status})`); return; }
         const list = j.blobs ?? (j.blob ? [j.blob] : []);
         const match = txVersion
           ? list.find(b => String(b.tx_version) === txVersion) ?? list[0]
@@ -736,21 +736,39 @@ function ExplorerContent() {
   const [selectedV,  setSelectedV]  = useState("");
   const [blobSearch, setBlobSearch] = useState("");
   const [selectedBlob, setSelectedBlob] = useState<{ name: string; v: string } | null>(null);
-  const [liveBlobCount, setLiveBlobCount] = useState(0);
-  const liveRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [liveRows, setLiveRows] = useState<BlobRecord[]>([]);
+  const liveReconcileTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // SSE → table refresh: debounce so a burst of registrations triggers one
-  // refetch, not one per event. Polling fallback is no longer needed once
-  // this is live, since blob-sync now emits "blob_registered" on insert.
-  const handleActivityEvent = useCallback((kind: string, payload: Record<string, unknown>) => {
+  // SSE → optimistic row insert. New blobs render at the top of the table
+  // immediately (pushing existing rows down), then a delayed background
+  // refresh reconciles against the real DB-backed list — at which point the
+  // optimistic row is naturally superseded (see dedupe in the render below).
+  const handleActivityEvent = useCallback(({ kind, payload }: ActivityStreamEvent) => {
     if (kind !== "blob_registered" && kind !== "blob_pending" && kind !== "blob_deleted") return;
     if (payload["network"] && payload["network"] !== network) return;
-    setLiveBlobCount(c => c + 1);
-    if (liveRefreshTimer.current) clearTimeout(liveRefreshTimer.current);
-    liveRefreshTimer.current = setTimeout(() => {
-      blobCtrl.refresh();
-    }, 1500);
+
+    if (kind === "blob_registered") {
+      const row: BlobRecord = {
+        blob_name:     String(payload["blobName"] ?? ""),
+        owner:         String(payload["owner"] ?? ""),
+        size_bytes:    payload["sizeBytes"] != null ? Number(payload["sizeBytes"]) : null,
+        status:        "active",
+        registered_at: new Date().toISOString(),
+        expires_at:    null,
+        tx_hash:       String(payload["txHash"] ?? ""),
+        tx_version:    Number(payload["txVersion"] ?? 0),
+        num_slices:    null,
+        content_hash:  "",
+        content_type:  "",
+      };
+      if (row.blob_name) setLiveRows((prev) => [row, ...prev].slice(0, 20));
+    }
+
+    if (liveReconcileTimer.current) clearTimeout(liveReconcileTimer.current);
+    liveReconcileTimer.current = setTimeout(() => { blobCtrl.refresh(); }, 4000);
   }, [network, blobCtrl]);
+
+  const { connected: liveConnected } = useActivityStream(network, handleActivityEvent);
 
   const networkLabel = network === "shelbynet" ? "Shelbynet" : "Testnet";
 
@@ -971,21 +989,22 @@ function ExplorerContent() {
                 />
               ) : (
                 <>
-                  {/* ── Live indicator + collapsible activity strip ──────── */}
-                  <div style={{ marginBottom: 16, borderRadius: 9,
-                                 border: "1px solid var(--border)", overflow: "hidden" }}>
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
-                                   padding: "8px 14px", background: "var(--bg-card2)" }}>
-                      <span style={{ ...MONO, fontSize: 11, color: "var(--text-muted)" }}>
-                        📡 Live network activity
-                        {liveBlobCount > 0 && (
-                          <span style={{ marginLeft: 8, color: "#ff77c9" }}>
-                            · {liveBlobCount} update{liveBlobCount > 1 ? "s" : ""} this session
-                          </span>
-                        )}
+                  {/* ── Inline live status dot (no separate panel) ──────── */}
+                  <div style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{
+                      width: 7, height: 7, borderRadius: "50%",
+                      background: liveConnected ? "#4ade80" : "#ef4444",
+                      display: "inline-block",
+                      boxShadow: liveConnected ? "0 0 6px #4ade80" : "none",
+                    }}/>
+                    <span style={{ ...MONO, fontSize: 11, color: "var(--text-muted)" }}>
+                      {liveConnected ? "Live updates active" : "Connecting to live feed…"}
+                    </span>
+                    {liveRows.length > 0 && (
+                      <span style={{ ...MONO, fontSize: 11, color: "#ff77c9", marginLeft: 6 }}>
+                        · {liveRows.length} new blob{liveRows.length > 1 ? "s" : ""} this session
                       </span>
-                    </div>
-                    <ActivityFeed network={network} height={160} onEvent={handleActivityEvent}/>
+                    )}
                   </div>
 
                   {/* ── Blob search controls ─────────────────────────── */}
@@ -1011,9 +1030,11 @@ function ExplorerContent() {
                   {/* ── Results ────────────────────────────────────────── */}
                   <BlobTable
                     state={blobState} isDark={isDark}
+                    liveBlobNames={new Set(liveRows.map(r => r.blob_name))}
                     onSelect={(blob) => {
                       const v = String(blob.tx_version);
                       setSelectedBlob({ name: blob.blob_name, v });
+                      setLiveRows([]);
                       router.push(`/explorer?b=${encodeURIComponent(blob.blob_name)}&bv=${v}`);
                     }}
                   />

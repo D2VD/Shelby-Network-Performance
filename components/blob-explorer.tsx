@@ -1,9 +1,8 @@
-// components/blob-explorer.tsx — v1.3
-// CHANGES vs v1.2:
-//   BlobTable: replaced inline expand/collapse with onSelect navigation —
-//   clicking a row now routes to a dedicated detail view (mirrors the
-//   Transactions tab's TxDetailPanel pattern) instead of collapsing on
-//   re-click. BlobDetailExpanded is now exported for reuse by that panel.
+// components/blob-explorer.tsx — v1.4
+// CHANGES vs v1.3:
+//   BlobTable: accepts optional liveBlobNames Set — rows matching it render
+//   with a highlight + "NEW" tag and a slide-in animation, for optimistic
+//   SSE-driven inserts from the merged live-activity flow in explorer/page.tsx.
 
 "use client";
 
@@ -228,12 +227,15 @@ function BlobSkeleton({ isDark }: { isDark: boolean }) {
 // ── BlobTable ─────────────────────────────────────────────────────────────────
 
 export function BlobTable({
-  state, isDark, onSelect,
+  state, isDark, onSelect, liveBlobNames,
 }: {
   state: BlobSearchState; isDark: boolean;
   /** Called when a row is clicked — parent navigates to the blob detail view
    *  (mirrors TxDetailPanel's click-through pattern instead of inline expand). */
   onSelect: (blob: BlobRecord) => void;
+  /** Blob names that just arrived via live SSE and haven't been confirmed by
+   *  a real DB refetch yet — rendered with a subtle highlight + "live" tag. */
+  liveBlobNames?: Set<string>;
 }) {
   const mounted = useMounted();
 
@@ -290,17 +292,31 @@ export function BlobTable({
       </div>
 
       {state.results.map((blob) => {
-        const key = `${str(blob.blob_name)}-${num(blob.tx_version)}`;
+        const key    = `${str(blob.blob_name)}-${num(blob.tx_version)}`;
+        const isLive = liveBlobNames?.has(blob.blob_name) ?? false;
 
         return (
           <div key={key}
             className={`border-b last:border-b-0 ${rowBdr} ${rowHover} cursor-pointer transition-colors`}
+            style={isLive ? {
+              background: isDark ? "rgba(255,119,201,0.08)" : "rgba(255,119,201,0.06)",
+              animation: "blobRowIn 600ms ease-out",
+            } : undefined}
             onClick={() => onSelect(blob)}
           >
             <div className="grid grid-cols-[1fr_auto_auto_auto] gap-4 px-4 py-3 items-center">
-              <div className="min-w-0">
-                <p className={`truncate text-xs ${nameCls}`}>{str(blob.blob_name, "—")}</p>
-                <p className={`text-xs mt-0.5 ${mutedCls}`}>{shortAddr(blob.owner)}</p>
+              <div className="min-w-0 flex items-center gap-2">
+                <div className="min-w-0">
+                  <p className={`truncate text-xs ${nameCls}`}>{str(blob.blob_name, "—")}</p>
+                  <p className={`text-xs mt-0.5 ${mutedCls}`}>{shortAddr(blob.owner)}</p>
+                </div>
+                {isLive && (
+                  <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.06em",
+                                 color: "#ff77c9", border: "1px solid #ff77c9",
+                                 borderRadius: 4, padding: "1px 5px", whiteSpace: "nowrap" }}>
+                    NEW
+                  </span>
+                )}
               </div>
               <span className={`text-xs tabular-nums whitespace-nowrap ${mutedCls}`}>
                 {formatBytes(blob.size_bytes)}
@@ -313,6 +329,12 @@ export function BlobTable({
           </div>
         );
       })}
+      <style jsx>{`
+        @keyframes blobRowIn {
+          from { transform: translateY(-6px); opacity: 0; }
+          to   { transform: translateY(0);     opacity: 1; }
+        }
+      `}</style>
     </div>
   );
 }

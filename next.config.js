@@ -59,7 +59,7 @@ const nextConfig = {
               // ====== NEW CSP PATCH LOGIC END ======
 
               // Workers: cobe uses a WebGL worker internally
-              "worker-src 'self' 'blob:",
+              "worker-src 'self' blob:",
             ].join("; "),
           },
         ],

@@ -17,6 +17,7 @@ export type ActivityEventKind =
   | "epoch_transition"
   | "blob_registered"
   | "blob_pending"
+  | "blob_activated"
   | "blob_deleted"
   | "heartbeat";
 

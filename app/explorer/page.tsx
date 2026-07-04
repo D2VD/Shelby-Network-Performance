@@ -48,6 +48,7 @@ import {
 import type { BlobRecord } from "@/hooks/use-blob-search";
 import { useBlobSearch } from "@/hooks/use-blob-search";
 import { useTheme }      from "@/components/theme-context";
+import { BlobPreviewPanel, type BlobPreviewTarget } from "@/components/blob-preview-panel";
 
 // ─── Env / constants ──────────────────────────────────────────────────────────
 
@@ -174,6 +175,61 @@ function Spinner({ label = "Loading…" }: { label?: string }) {
                     animation: "spin 0.8s linear infinite", margin: "0 auto 14px" }}/>
       <div style={{ fontSize: 14, color: "var(--text-muted)" }}>{label}</div>
     </div>
+  );
+}
+
+// ─── Nav tab icons ────────────────────────────────────────────────────────────
+// Custom line icons replacing the previous emoji. Uniform 18x18 grid, uniform
+// stroke weight/joins so the set reads as one deliberate family rather than a
+// mismatched emoji grab-bag. All use stroke="currentColor" so they pick up
+// the existing active(#ff77c9)/inactive(var(--text-muted)) tab coloring with
+// zero extra props — no new dependency, no bundle weight.
+
+function IconTransactions({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 18 18" fill="none" aria-hidden="true">
+      <path d="M9.8 1.6 3.2 10.4h4.7l-.9 6 6.8-8.9H9.1l.7-5.9Z"
+            stroke="currentColor" strokeWidth={1.5}
+            strokeLinejoin="round" strokeLinecap="round"/>
+    </svg>
+  );
+}
+
+function IconBlobs({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 18 18" fill="none" aria-hidden="true">
+      <path d="M2.4 5.3 9 2l6.6 3.3v7.4L9 16l-6.6-3.3V5.3Z"
+            stroke="currentColor" strokeWidth={1.4} strokeLinejoin="round"/>
+      <path d="M2.4 5.3 9 8.6l6.6-3.3M9 8.6V16"
+            stroke="currentColor" strokeWidth={1.4} strokeLinejoin="round"/>
+    </svg>
+  );
+}
+
+function IconExport({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 18 18" fill="none" aria-hidden="true">
+      <path d="M9 2v8.3M5.6 7.4 9 10.8l3.4-3.4"
+            stroke="currentColor" strokeWidth={1.5}
+            strokeLinecap="round" strokeLinejoin="round"/>
+      <path d="M2.6 12.4v2.1a1 1 0 0 0 1 1h10.8a1 1 0 0 0 1-1v-2.1"
+            stroke="currentColor" strokeWidth={1.5} strokeLinecap="round"/>
+    </svg>
+  );
+}
+
+function IconLeaderboard({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 18 18" fill="none" aria-hidden="true">
+      <path d="M5.6 3h6.8v3.8a3.4 3.4 0 0 1-6.8 0V3Z"
+            stroke="currentColor" strokeWidth={1.4} strokeLinejoin="round"/>
+      <path d="M5.6 4.1H3.8a.9.9 0 0 0-.9.9v.4A2.4 2.4 0 0 0 5.3 7.8"
+            stroke="currentColor" strokeWidth={1.3} strokeLinecap="round"/>
+      <path d="M12.4 4.1h1.8a.9.9 0 0 1 .9.9v.4a2.4 2.4 0 0 1-2.4 2.4"
+            stroke="currentColor" strokeWidth={1.3} strokeLinecap="round"/>
+      <path d="M9 10v2.2M7 15.4h4M7.5 12.6h3v2.1h-3v-2.1Z"
+            stroke="currentColor" strokeWidth={1.3} strokeLinejoin="round"/>
+    </svg>
   );
 }
 
@@ -669,6 +725,7 @@ function BlobDetailPanel({ blobName, txVersion, network, isDark, onClose }: {
   const [blob,    setBlob]    = useState<BlobRecord | null>(null);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState<string | null>(null);
+  const [previewTarget, setPreviewTarget] = useState<BlobPreviewTarget | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -691,6 +748,11 @@ function BlobDetailPanel({ blobName, txVersion, network, isDark, onClose }: {
     return () => { cancelled = true; };
   }, [blobName, txVersion, network]);
 
+  // Preview is currently shelbynet-only — matches the scope of
+  // /api/blobs/preview, which proxies a gateway host confirmed only for
+  // shelbynet. Don't offer the button where it can't work.
+  const previewSupported = network === "shelbynet";
+
   return (
     <div>
       <div style={{ ...MONO, padding: "11px 20px", fontSize: 12, fontWeight: 700,
@@ -699,9 +761,26 @@ function BlobDetailPanel({ blobName, txVersion, network, isDark, onClose }: {
                     color: "#ff77c9", borderBottom: "1px solid var(--border)",
                     display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <span>Blob Detail</span>
-        <button onClick={onClose}
-          style={{ ...MONO, fontSize: 11, background: "none", border: "none",
-                   color: "var(--text-dim)", cursor: "pointer" }}>× back to list</button>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          {!loading && !error && blob && previewSupported && (
+            <button
+              onClick={() => setPreviewTarget({
+                network: "shelbynet",
+                owner: blob.owner,
+                blobName: blob.blob_name,
+                sizeBytes: blob.size_bytes ?? undefined,
+              })}
+              style={{ ...MONO, fontSize: 11, fontWeight: 700, padding: "5px 12px",
+                       borderRadius: 6, border: "1px solid rgba(255,119,201,0.3)",
+                       background: "rgba(255,119,201,0.08)", color: "#ff77c9",
+                       cursor: "pointer", textTransform: "none", letterSpacing: 0 }}>
+              👁 Preview
+            </button>
+          )}
+          <button onClick={onClose}
+            style={{ ...MONO, fontSize: 11, background: "none", border: "none",
+                     color: "var(--text-dim)", cursor: "pointer" }}>× back to list</button>
+        </div>
       </div>
 
       {loading && <Spinner label={`Loading "${blobName}"…`}/>}
@@ -711,6 +790,8 @@ function BlobDetailPanel({ blobName, txVersion, network, isDark, onClose }: {
           <BlobDetailExpanded blob={blob} isDark={isDark}/>
         </div>
       )}
+
+      <BlobPreviewPanel target={previewTarget} onClose={() => setPreviewTarget(null)} />
     </div>
   );
 }
@@ -744,7 +825,18 @@ function ExplorerContent() {
   // refresh reconciles against the real DB-backed list — at which point the
   // optimistic row is naturally superseded (see dedupe in the render below).
   const handleActivityEvent = useCallback(({ kind, payload }: ActivityStreamEvent) => {
-    if (kind !== "blob_registered" && kind !== "blob_pending" && kind !== "blob_deleted") return;
+    // NOTE: "blob_activated" added here — without it, runPendingPromotion()
+    // flipping a row server-side (pending → active) never reached the UI;
+    // the event was silently dropped by this guard and required a manual
+    // reload to see the status change. No optimistic row mutation needed for
+    // it (unlike blob_registered below) — it just needs to trigger the same
+    // debounced refetch so BlobTable re-renders with the real DB state.
+    if (
+      kind !== "blob_registered" &&
+      kind !== "blob_pending" &&
+      kind !== "blob_activated" &&
+      kind !== "blob_deleted"
+    ) return;
     if (payload["network"] && payload["network"] !== network) return;
 
     if (kind === "blob_registered") {
@@ -915,10 +1007,10 @@ function ExplorerContent() {
           {/* ── Tích hợp Tab bar từ bản vá (STEP 4 & 5) ────────────────────── */}
           <div style={{ display: "flex", marginTop: 20, borderBottom: "1px solid var(--border)", gap: 8 }}>
             {[
-              { id: "transactions", label: "⚡ Transactions" },
-              { id: "blobs", label: "🗂 Blobs Explorer" },
-              { id: "export", label: "↓ Export" },
-              { id: "leaderboard", label: "🏆 Leaderboard" }
+              { id: "transactions", label: "Transactions", icon: <IconTransactions/> },
+              { id: "blobs",        label: "Blobs Explorer", icon: <IconBlobs/> },
+              { id: "export",       label: "Export", icon: <IconExport/> },
+              { id: "leaderboard",  label: "Leaderboard", icon: <IconLeaderboard/> },
             ].map(tab => (
               <button
                 key={tab.id}
@@ -930,7 +1022,9 @@ function ExplorerContent() {
                   background: "none", border: "none", cursor: "pointer", ...MONO
                 }}
               >
-                {tab.label}
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 7 }}>
+                  {tab.icon}{tab.label}
+                </span>
               </button>
             ))}
           </div>

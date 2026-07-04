@@ -769,6 +769,7 @@ function BlobDetailPanel({ blobName, txVersion, network, isDark, onClose }: {
                 owner: blob.owner,
                 blobName: blob.blob_name,
                 sizeBytes: blob.size_bytes ?? undefined,
+                contentHash: blob.content_hash ?? undefined,
               })}
               style={{ ...MONO, fontSize: 11, fontWeight: 700, padding: "5px 12px",
                        borderRadius: 6, border: "1px solid rgba(255,119,201,0.3)",

@@ -29,6 +29,15 @@ export interface BlobPreviewTarget {
   owner: string;
   blobName: string;
   sizeBytes?: number;
+  // Used purely as a cache-busting key (see previewUrl below) — ties the
+  // browser/CDN cache entry to the actual file content rather than the URL
+  // alone. CONFIRMED NEEDED this session: a Cloudflare edge cache entry
+  // created while an earlier buggy version of the proxy route was live kept
+  // serving corrupted bytes for up to an hour after the bug was fixed and
+  // redeployed, because the cache key (the URL) never changed. Since
+  // content_hash only changes when the file itself changes, appending it
+  // means any future fix to route.ts naturally busts old cached entries too.
+  contentHash?: string;
 }
 
 interface BlobPreviewPanelProps {
@@ -81,7 +90,8 @@ export function BlobPreviewPanel({ target, onClose }: BlobPreviewPanelProps): Re
   const previewUrl = target
     ? `/api/blobs/preview?network=${encodeURIComponent(target.network)}` +
       `&owner=${encodeURIComponent(target.owner)}` +
-      `&name=${encodeURIComponent(target.blobName)}`
+      `&name=${encodeURIComponent(target.blobName)}` +
+      (target.contentHash ? `&ch=${encodeURIComponent(target.contentHash)}` : "")
     : "";
 
   const downloadUrl = previewUrl ? `${previewUrl}&download=1` : "";

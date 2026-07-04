@@ -1,4 +1,21 @@
-// app/api/blobs/preview/route.ts — v1.1
+// app/api/blobs/preview/route.ts — v1.2
+//
+// CHANGES vs v1.1:
+// The corruption bug persisted after v1.1's arrayBuffer() fix was deployed
+// (confirmed via fresh incognito testing — ruled out browser cache as the
+// cause). Two changes to isolate this further:
+// 1. Removed the manually-set Content-Length header. Setting it explicitly
+//    from the buffered byte count is redundant (the runtime derives it
+//    correctly from an ArrayBuffer body on its own) and risky — if anything
+//    in the response path transforms the body after this function returns,
+//    a hand-set Content-Length can go stale and produce exactly this
+//    "looks complete, gets cut off" symptom. Letting the platform compute
+//    it removes an entire class of mismatch bugs.
+// 2. Added an X-Preview-Route-Version debug header. There is no equivalent
+//    of the VPS's "grep dist/ to confirm the new code is actually running"
+//    check for Cloudflare Pages deployments — this header exists solely so
+//    a redeploy can be confirmed unambiguously via response headers instead
+//    of assumed.
 //
 // CHANGES vs v1.0 (all three confirmed via live DevTools testing this
 // session, not guessed):
@@ -155,7 +172,6 @@ export async function GET(req: Request): Promise<Response> {
     status: 200,
     headers: {
       "Content-Type": contentType,
-      "Content-Length": String(bytes.byteLength),
       "Content-Disposition": `${disposition}; filename="${filename}"`,
       "Cache-Control": "public, max-age=3600",
       // Overrides the site-wide X-Frame-Options: deny (correct policy
@@ -165,6 +181,9 @@ export async function GET(req: Request): Promise<Response> {
       // refuses to frame our own preview URL and shows
       // "shelbyanalytics.site refused to connect / ERR_BLOCKED_BY_RESPONSE".
       "X-Frame-Options": "SAMEORIGIN",
+      // Debug marker only — confirms which version is actually live.
+      // Safe to remove once corruption bug is confirmed fixed.
+      "X-Preview-Route-Version": "1.2",
     },
   });
 }

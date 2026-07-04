@@ -42,7 +42,12 @@ function kindForBlobName(blobName: string): Kind {
   const ext = blobName.split(".").pop()?.toLowerCase() ?? "";
   if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext)) return "image";
   if (ext === "pdf") return "pdf";
-  if (["txt", "json", "md", "log", "csv"].includes(ext)) return "text";
+  // Matches route.ts's EXT_CONTENT_TYPE plain-text entries — keep these two
+  // lists in sync when adding a new extension to either.
+  if ([
+    "txt", "json", "md", "log", "csv", "xml", "cfg", "ini", "yaml", "yml",
+    "toml", "env", "conf", "sh", "html", "css", "js", "ts", "py",
+  ].includes(ext)) return "text";
   if (["mp4", "webm"].includes(ext)) return "video";
   if (["mp3", "wav"].includes(ext)) return "audio";
   return "unsupported";

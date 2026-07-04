@@ -1,5 +1,23 @@
-// app/api/blobs/preview/route.ts
+// app/api/blobs/preview/route.ts — v1.1
 //
+// CHANGES vs v1.0 (all three confirmed via live DevTools testing this
+// session, not guessed):
+// FIX: Corrupted/truncated image bodies. Streaming upstream.body straight
+//      through was returning 200 + correct Content-Type but an incomplete
+//      body (DevTools Preview tab showed a partial render + checkerboard
+//      gap). Now buffers the full response via arrayBuffer() before
+//      returning it. Ruled out first: Cloudflare Hotlink Protection
+//      (confirmed OFF in dashboard) and browser extensions (reproduced in a
+//      clean profile) — this was a code bug, not an infra/extension issue.
+// FIX: PDF <iframe> preview blocked by the site-wide X-Frame-Options: deny
+//      (correct policy elsewhere). Now explicitly overridden to SAMEORIGIN
+//      on this route's response only.
+// EXPANDED: content-type map now covers xml/cfg/ini/yaml/yml/toml/env/conf
+//      and common code/text extensions (deliberately served as text/plain,
+//      not their "native" MIME type, to avoid script-execution risk on our
+//      own origin for anything resembling html/js/css).
+//
+
 // Thin edge proxy for Shelby's own public content gateway, confirmed live via
 // DevTools capture of explorer.shelby.xyz's own "File Preview" action:
 //
@@ -49,6 +67,20 @@ const EXT_CONTENT_TYPE: Record<string, string> = {
   md: "text/markdown",
   log: "text/plain",
   csv: "text/csv",
+  xml: "application/xml",
+  cfg: "text/plain",
+  ini: "text/plain",
+  yaml: "text/plain",
+  yml: "text/plain",
+  toml: "text/plain",
+  env: "text/plain",
+  conf: "text/plain",
+  sh: "text/plain",
+  html: "text/plain", // deliberately plain, not text/html — avoid accidental script execution on preview
+  css: "text/plain",
+  js: "text/plain",
+  ts: "text/plain",
+  py: "text/plain",
   mp4: "video/mp4",
   webm: "video/webm",
   mp3: "audio/mpeg",
@@ -104,12 +136,35 @@ export async function GET(req: Request): Promise<Response> {
   const contentType = inferContentType(blobName);
   const disposition = download ? "attachment" : "inline";
 
-  return new Response(upstream.body, {
+  // Buffer fully rather than pipe upstream.body through as a live stream.
+  // CONFIRMED BUG (this session): streaming pass-through via
+  // `new Response(upstream.body, ...)` was returning a 200 with the correct
+  // Content-Type, but a truncated/corrupted body — DevTools' own Preview tab
+  // showed a partial image render followed by a transparent/checkerboard
+  // gap, consistent with the stream being cut short before fully flushing.
+  // Buffering trades a moment of memory for a guaranteed-complete response;
+  // fine for preview-sized files.
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await upstream.arrayBuffer();
+  } catch {
+    return Response.json({ error: "Failed to read upstream response body" }, { status: 502 });
+  }
+
+  return new Response(bytes, {
     status: 200,
     headers: {
       "Content-Type": contentType,
+      "Content-Length": String(bytes.byteLength),
       "Content-Disposition": `${disposition}; filename="${filename}"`,
       "Cache-Control": "public, max-age=3600",
+      // Overrides the site-wide X-Frame-Options: deny (correct policy
+      // elsewhere, per this project's security checklist) specifically for
+      // this route — needed so the PDF <iframe> preview (same-origin) isn't
+      // blocked. Confirmed this session: without this override, the browser
+      // refuses to frame our own preview URL and shows
+      // "shelbyanalytics.site refused to connect / ERR_BLOCKED_BY_RESPONSE".
+      "X-Frame-Options": "SAMEORIGIN",
     },
   });
 }

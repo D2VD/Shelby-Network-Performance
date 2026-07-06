@@ -33,7 +33,8 @@ const VPS_BASE =
 
 const KINDS: ActivityEventKind[] = [
   "connected", "sp_health_change", "sp_joined", "sp_left",
-  "epoch_transition", "blob_registered", "blob_pending", "blob_deleted", "heartbeat",
+  "epoch_transition", "blob_registered", "blob_pending", "blob_activated",
+  "blob_deleted", "heartbeat",
 ];
 
 export function useActivityStream(

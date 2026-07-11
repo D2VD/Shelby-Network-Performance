@@ -1,4 +1,18 @@
-// app/api/blobs/preview/route.ts — v1.2
+// app/api/blobs/preview/route.ts — v1.3
+//
+// CHANGES vs v1.2:
+// FIX: ownerHex was only prepending "0x" when missing — it never padded
+//      the hex body to 64 chars. Aptos addresses that come in one digit
+//      short (the same failure mode already fixed in blob-registry-sync.ts
+//      via normalizeAddress(), and confirmed to starve get_blob_metadata
+//      elsewhere in this project) were being passed straight through
+//      unpadded to the gateway URL, which would 404/mismatch against the
+//      real on-chain path. Added normalizeOwnerAddress() mirroring the
+//      backend's normalizeAddress() logic: strip any "0x", left-pad the
+//      hex body to 64 chars with "0", re-prefix "0x". Confirmed via code
+//      review this had never actually been applied to this route — v1.1's
+//      and v1.2's changelogs only ever addressed the truncation/CSP bugs,
+//      not this one.
 //
 // CHANGES vs v1.1:
 // The corruption bug persisted after v1.1's arrayBuffer() fix was deployed
@@ -68,6 +82,7 @@
 export const runtime = "edge";
 
 const SHELBYNET_GATEWAY = "https://shelby.shelbynet.shelby.xyz/shelby/v1/blobs";
+const APTOS_ADDRESS_HEX_LENGTH = 64;
 
 // TODO: if a shared byte-content-type map already exists in lib/, replace
 // this with that instead of maintaining a second copy.
@@ -109,6 +124,17 @@ function inferContentType(blobName: string): string {
   return EXT_CONTENT_TYPE[ext] ?? "application/octet-stream";
 }
 
+// Mirrors normalizeAddress() in blob-registry-sync.ts. Aptos Node REST
+// serializes addresses one hex digit short in some cases — without this,
+// an unpadded owner address silently 404s against the real on-chain path
+// instead of matching it. Left-pads the hex body to 64 chars, independent
+// of whether the caller included a "0x" prefix.
+function normalizeOwnerAddress(owner: string): string {
+  const hexBody = owner.startsWith("0x") ? owner.slice(2) : owner;
+  const padded = hexBody.padStart(APTOS_ADDRESS_HEX_LENGTH, "0");
+  return `0x${padded}`;
+}
+
 export async function GET(req: Request): Promise<Response> {
   const { searchParams } = new URL(req.url);
   const network  = searchParams.get("network");
@@ -129,7 +155,7 @@ export async function GET(req: Request): Promise<Response> {
     );
   }
 
-  const ownerHex = owner.startsWith("0x") ? owner : `0x${owner}`;
+  const ownerHex = normalizeOwnerAddress(owner);
   const upstreamUrl =
     `${SHELBYNET_GATEWAY}/${ownerHex}/${encodeURIComponent(blobName).replace(/%2F/g, "/")}`;
 
@@ -154,7 +180,7 @@ export async function GET(req: Request): Promise<Response> {
   const disposition = download ? "attachment" : "inline";
 
   // Buffer fully rather than pipe upstream.body through as a live stream.
-  // CONFIRMED BUG (this session): streaming pass-through via
+  // CONFIRMED BUG (v1.1 session): streaming pass-through via
   // `new Response(upstream.body, ...)` was returning a 200 with the correct
   // Content-Type, but a truncated/corrupted body — DevTools' own Preview tab
   // showed a partial image render followed by a transparent/checkerboard
@@ -183,7 +209,7 @@ export async function GET(req: Request): Promise<Response> {
       "X-Frame-Options": "SAMEORIGIN",
       // Debug marker only — confirms which version is actually live.
       // Safe to remove once corruption bug is confirmed fixed.
-      "X-Preview-Route-Version": "1.2",
+      "X-Preview-Route-Version": "1.3",
     },
   });
 }

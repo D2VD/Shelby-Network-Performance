@@ -1,4 +1,25 @@
-// app/api/blobs/preview/route.ts — v1.3
+// app/api/blobs/preview/route.ts — v1.4
+//
+// CHANGES vs v1.3:
+// FEATURE: testnet support. Previously hard-blocked to shelbynet only,
+// because no testnet content gateway host had been confirmed. Confirmed
+// this session via live DevTools capture of explorer.shelby.xyz with its
+// network switched to TESTNET:
+//
+//   GET https://api.testnet.shelby.xyz/shelby/v1/blobs/{owner_0x}/{blob_name}
+//   → 200 OK, same PRIVATE-OR-AUTHENTICATED-RESPONSE cache-status label as
+//     shelbynet (confirmed harmless/non-blocking on both networks — do not
+//     treat that label as an auth or permission signal on either network).
+//
+// IMPORTANT — the testnet gateway host is NOT a parallel rename of the
+// shelbynet pattern. It is NOT "shelby.testnet.shelby.xyz". It is
+// "api.testnet.shelby.xyz". Do not assume naming symmetry between networks
+// without checking — this project has already been burned once by an
+// assumed-symmetric hostname pattern.
+//
+// Path shape, no-auth-header rule, full-buffer-before-return fix, and the
+// X-Frame-Options override all carried over unchanged — nothing about
+// those was shelbynet-specific to begin with.
 //
 // CHANGES vs v1.2:
 // FIX: ownerHex was only prepending "0x" when missing — it never padded
@@ -70,9 +91,10 @@
 //   - get_blob_metadata /v1/view argument:  "@{owner_hex_NO_0x}/{blob_name}"
 //   - THIS gateway path:                    "{owner_hex_WITH_0x}/{blob_name}"
 //
-// SCOPE: shelbynet only. A testnet equivalent of this gateway host has not
-// been confirmed — do not assume the same hostname/path pattern applies
-// there without checking first.
+// SCOPE: shelbynet and testnet both supported as of v1.4. Their gateway
+// hosts were confirmed independently and are NOT the same pattern — see
+// GATEWAY_BY_NETWORK below. If a third network is ever added, its gateway
+// host must be independently confirmed too, not assumed from the other two.
 //
 // No Authorization header is sent — matches the public-read pattern already
 // established for api.shelbynet.shelby.xyz elsewhere in this project, though
@@ -81,7 +103,14 @@
 
 export const runtime = "edge";
 
-const SHELBYNET_GATEWAY = "https://shelby.shelbynet.shelby.xyz/shelby/v1/blobs";
+// Gateway hosts are NOT symmetric across networks — do not derive one from
+// the other by string substitution. Each was independently confirmed via
+// live DevTools capture of explorer.shelby.xyz's own File Preview action.
+const GATEWAY_BY_NETWORK: Record<string, string> = {
+  shelbynet: "https://shelby.shelbynet.shelby.xyz/shelby/v1/blobs",
+  testnet: "https://api.testnet.shelby.xyz/shelby/v1/blobs",
+};
+const SUPPORTED_NETWORKS = Object.keys(GATEWAY_BY_NETWORK);
 const APTOS_ADDRESS_HEX_LENGTH = 64;
 
 // TODO: if a shared byte-content-type map already exists in lib/, replace
@@ -142,9 +171,9 @@ export async function GET(req: Request): Promise<Response> {
   const blobName = searchParams.get("name");
   const download = searchParams.get("download") === "1";
 
-  if (network !== "shelbynet") {
+  if (!network || !SUPPORTED_NETWORKS.includes(network)) {
     return Response.json(
-      { error: "Blob preview is currently supported for shelbynet only" },
+      { error: `network must be one of: ${SUPPORTED_NETWORKS.join(", ")}` },
       { status: 400 },
     );
   }
@@ -156,8 +185,9 @@ export async function GET(req: Request): Promise<Response> {
   }
 
   const ownerHex = normalizeOwnerAddress(owner);
+  const gatewayBase = GATEWAY_BY_NETWORK[network];
   const upstreamUrl =
-    `${SHELBYNET_GATEWAY}/${ownerHex}/${encodeURIComponent(blobName).replace(/%2F/g, "/")}`;
+    `${gatewayBase}/${ownerHex}/${encodeURIComponent(blobName).replace(/%2F/g, "/")}`;
 
   let upstream: Response;
   try {
@@ -209,7 +239,7 @@ export async function GET(req: Request): Promise<Response> {
       "X-Frame-Options": "SAMEORIGIN",
       // Debug marker only — confirms which version is actually live.
       // Safe to remove once corruption bug is confirmed fixed.
-      "X-Preview-Route-Version": "1.3",
+      "X-Preview-Route-Version": "1.4",
     },
   });
 }

@@ -5,7 +5,9 @@
 // Content-Type/Content-Disposition are normalized — see that route for the
 // gateway discovery notes and key-format warning).
 //
-// SCOPE: shelbynet only, matching the proxy route's current scope.
+// SCOPE: shelbynet and testnet both supported as of v1.4 of the underlying
+// preview route. Their gateway hosts are NOT the same pattern — see
+// route.ts's GATEWAY_BY_NETWORK for the confirmed hosts per network.
 //
 // UI conventions followed (per project's UI ruleset, still authoritative):
 //   - 100% English UI text
@@ -25,7 +27,11 @@ import { useEffect, useState, type ReactElement } from "react";
 const str = (v: unknown): string => (v === null || v === undefined ? "" : String(v));
 
 export interface BlobPreviewTarget {
-  network: "shelbynet"; // widen to include "testnet" once that gateway is confirmed
+  // Widened from "shelbynet" only, now that /api/blobs/preview v1.4 added
+  // a confirmed testnet gateway host (api.testnet.shelby.xyz). This was
+  // the exact type this comment already flagged as pending — the gateway
+  // confirmation happened this session.
+  network: "shelbynet" | "testnet";
   owner: string;
   blobName: string;
   sizeBytes?: number;

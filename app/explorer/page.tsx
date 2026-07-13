@@ -748,10 +748,14 @@ function BlobDetailPanel({ blobName, txVersion, network, isDark, onClose }: {
     return () => { cancelled = true; };
   }, [blobName, txVersion, network]);
 
-  // Preview is currently shelbynet-only — matches the scope of
-  // /api/blobs/preview, which proxies a gateway host confirmed only for
-  // shelbynet. Don't offer the button where it can't work.
-  const previewSupported = network === "shelbynet";
+  // Preview supports both networks as of /api/blobs/preview v1.4, which
+  // added a confirmed testnet gateway host (api.testnet.shelby.xyz) —
+  // previously this was hard-gated to shelbynet only because no testnet
+  // gateway had been confirmed yet. Kept as an explicit allow-list (not a
+  // blanket `true`) so a new network added later fails closed instead of
+  // silently offering a preview that can't work until its gateway is
+  // confirmed too.
+  const previewSupported = network === "shelbynet" || network === "testnet";
 
   return (
     <div>
@@ -765,7 +769,7 @@ function BlobDetailPanel({ blobName, txVersion, network, isDark, onClose }: {
           {!loading && !error && blob && previewSupported && (
             <button
               onClick={() => setPreviewTarget({
-                network: "shelbynet",
+                network,
                 owner: blob.owner,
                 blobName: blob.blob_name,
                 sizeBytes: blob.size_bytes ?? undefined,
@@ -882,6 +886,20 @@ function ExplorerContent() {
     }
   }, [searchParams]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Preserves the current network across every client-side navigation in
+  // this page. Without this, NetworkParamsReader (network-context.tsx)
+  // sees no `network` param on the destination URL and unconditionally
+  // resets to shelbynet on every search, blob click, address click, or
+  // version click — confirmed root cause of testnet blobs showing
+  // "Lookup failed" after any in-page navigation. shelbynet is the
+  // implicit default (per setNetwork()'s own convention of omitting the
+  // param for it), so this only appends when the current network isn't it.
+  const withNetwork = useCallback((path: string): string => {
+    if (network !== "testnet") return path;
+    const sep = path.includes("?") ? "&" : "?";
+    return `${path}${sep}network=testnet`;
+  }, [network]);
+
   // ── Input parser (Fail Fast) ───────────────────────────────────────────────
   const handleSearch = () => {
     const q = query.trim();
@@ -892,7 +910,7 @@ function ExplorerContent() {
     if (q.startsWith("0x") && q.length >= 10) {
       setSearchAddr(q); setSelectedV(""); setBlobSearch("");
       setActiveTab("transactions");
-      router.push(`/explorer?q=${encodeURIComponent(q)}`);
+      router.push(withNetwork(`/explorer?q=${encodeURIComponent(q)}`));
       return;
     }
     // "@0x…/path" blob path
@@ -901,7 +919,7 @@ function ExplorerContent() {
       if (m) {
         setSearchAddr(m[1]); setSelectedV(""); setBlobSearch("");
         setActiveTab("transactions");
-        router.push(`/explorer?q=${encodeURIComponent(m[1])}`);
+        router.push(withNetwork(`/explorer?q=${encodeURIComponent(m[1])}`));
         return;
       }
     }
@@ -909,7 +927,7 @@ function ExplorerContent() {
     if (/^\d+$/.test(q)) {
       setSelectedV(q); setSearchAddr(""); setBlobSearch("");
       setActiveTab("transactions");
-      router.push(`/explorer?q=${encodeURIComponent(q)}`);
+      router.push(withNetwork(`/explorer?q=${encodeURIComponent(q)}`));
       return;
     }
     // Plain blob name / filename
@@ -917,7 +935,7 @@ function ExplorerContent() {
       setBlobSearch(q); setSearchAddr(""); setSelectedV("");
       blobCtrl.setQuery(q);
       setActiveTab("blobs");
-      router.push(`/explorer?b=${encodeURIComponent(q)}`);
+      router.push(withNetwork(`/explorer?b=${encodeURIComponent(q)}`));
       return;
     }
     setInputErr("Enter a wallet address (0x…), a version number, or a blob/file name.");
@@ -927,19 +945,19 @@ function ExplorerContent() {
     setQuery(""); setSearchAddr(""); setSelectedV(""); setBlobSearch(""); setInputErr("");
     blobCtrl.setQuery("");
     setSelectedBlob(null);
-    router.push("/explorer");
+    router.push(withNetwork("/explorer"));
   };
 
   const onVersionClick = (v: string) => {
     setSelectedV(v);
     const base = searchAddr ? `?q=${encodeURIComponent(searchAddr)}&v=${v}` : `?q=${v}`;
-    router.push(`/explorer${base}`);
+    router.push(withNetwork(`/explorer${base}`));
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const onAddressClick = (addr: string) => {
     setSearchAddr(addr); setQuery(addr); setSelectedV(""); setBlobSearch("");
-    router.push(`/explorer?q=${encodeURIComponent(addr)}`);
+    router.push(withNetwork(`/explorer?q=${encodeURIComponent(addr)}`));
   };
 
   const showContent = searchAddr || selectedV || blobSearch;
@@ -1045,7 +1063,7 @@ function ExplorerContent() {
                   onClose={() => {
                     setSelectedV("");
                     const back = searchAddr ? `/explorer?q=${encodeURIComponent(searchAddr)}` : "/explorer";
-                    router.push(back);
+                    router.push(withNetwork(back));
                   }}
                   onAddressClick={onAddressClick}
                 />
@@ -1130,7 +1148,7 @@ function ExplorerContent() {
                       const v = String(blob.tx_version);
                       setSelectedBlob({ name: blob.blob_name, v });
                       setLiveRows([]);
-                      router.push(`/explorer?b=${encodeURIComponent(blob.blob_name)}&bv=${v}`);
+                      router.push(withNetwork(`/explorer?b=${encodeURIComponent(blob.blob_name)}&bv=${v}`));
                     }}
                   />
                   <div style={{ marginTop: 16 }}>

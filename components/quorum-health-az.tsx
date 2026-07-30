@@ -30,6 +30,9 @@
  * Data source: GET /api/network/providers?network=... — confirmed live via
  * curl against api.shelbyanalytics.site to match the extraction below
  * ({ ok, data: { providers, count } }); fallbacks kept for defense only.
+ *
+ * v2.1: hover a card to see the individual SPs behind the aggregate counts
+ * (address, state, health per SP), sorted worst-health-first.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -39,10 +42,17 @@ type SpHealth = "Healthy" | "Faulty" | "Unhealthy" | "Unknown";
 
 interface RawSpInfo {
   address?: unknown;
+  addressShort?: unknown;
   availabilityZone?: unknown;
   locationName?: unknown;
   state?: unknown;
   health?: unknown;
+}
+
+interface SpEntry {
+  address: string;
+  state: SpState;
+  health: SpHealth;
 }
 
 interface AZGroup {
@@ -53,6 +63,7 @@ interface AZGroup {
   waitlistedCount: number;
   frozenCount: number;
   leavingCount: number;
+  providers: SpEntry[]; // full per-SP list for the hover breakdown
 }
 
 function str(v: unknown): string {
@@ -115,10 +126,22 @@ const BAND_META: Record<HealthBand, { color: string; icon: string; label: string
   empty:     { color: "#6b7280", icon: "⚪", label: "No Active SPs" },
 };
 
+const HEALTH_COLOR: Record<SpHealth, string> = {
+  Healthy:   "#22c55e",
+  Faulty:    "#ef4444",
+  Unhealthy: "#ef4444",
+  Unknown:   "#6b7280",
+};
+
+// Worst-first ordering for the per-SP hover list, so problem SPs surface immediately.
+const HEALTH_SEVERITY: Record<SpHealth, number> = { Faulty: 0, Unhealthy: 1, Unknown: 2, Healthy: 3 };
+const STATE_SEVERITY:  Record<SpState, number>  = { Frozen: 0, Leaving: 1, Waitlisted: 2, Active: 3 };
+
 export function SpDistributionByAZ({ network }: { network: string }) {
-  const [groups,  setGroups]  = useState<AZGroup[] | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error,   setError]   = useState<string | null>(null);
+  const [groups,    setGroups]    = useState<AZGroup[] | null>(null);
+  const [loading,   setLoading]   = useState(true);
+  const [error,     setError]     = useState<string | null>(null);
+  const [hoveredAz, setHoveredAz] = useState<string | null>(null);
   const alive = useRef(true);
 
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
@@ -147,9 +170,10 @@ export function SpDistributionByAZ({ network }: { network: string }) {
           const locationName = str(sp.locationName) === "—" ? az : String(sp.locationName);
           const state  = isSpState(sp.state)   ? sp.state   : "Active";  // fail-open to Active only if state truly absent
           const health = isSpHealth(sp.health) ? sp.health  : "Unknown"; // fail-open to Unknown, never assumed Healthy
+          const address = str(sp.addressShort) !== "—" ? String(sp.addressShort) : str(sp.address);
 
           if (!byAz.has(az)) {
-            byAz.set(az, { az, locationName, activeCount: 0, activeHealthyCount: 0, waitlistedCount: 0, frozenCount: 0, leavingCount: 0 });
+            byAz.set(az, { az, locationName, activeCount: 0, activeHealthyCount: 0, waitlistedCount: 0, frozenCount: 0, leavingCount: 0, providers: [] });
           }
           const g = byAz.get(az)!;
           if (state === "Active") {
@@ -159,6 +183,15 @@ export function SpDistributionByAZ({ network }: { network: string }) {
           if (state === "Waitlisted") g.waitlistedCount++;
           if (state === "Frozen")     g.frozenCount++;
           if (state === "Leaving")    g.leavingCount++;
+          g.providers.push({ address, state, health });
+        }
+
+        for (const g of byAz.values()) {
+          g.providers.sort((a, b) => {
+            const sd = STATE_SEVERITY[a.state] - STATE_SEVERITY[b.state];
+            if (sd !== 0) return sd;
+            return HEALTH_SEVERITY[a.health] - HEALTH_SEVERITY[b.health];
+          });
         }
 
         // Worst health-ratio first, so degraded AZs surface without implying a pass/fail line.
@@ -227,11 +260,15 @@ export function SpDistributionByAZ({ network }: { network: string }) {
           return (
             <div
               key={g.az}
+              onMouseEnter={() => setHoveredAz(g.az)}
+              onMouseLeave={() => setHoveredAz((cur) => (cur === g.az ? null : cur))}
               style={{
+                position: "relative",
                 background: `${meta.color}0d`,
                 border: `1px solid ${meta.color}44`,
                 borderRadius: 12,
                 padding: "12px 14px",
+                cursor: "default",
               }}
             >
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
@@ -270,6 +307,53 @@ export function SpDistributionByAZ({ network }: { network: string }) {
                 <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 4 }}>
                   {g.frozenCount > 0 && `${g.frozenCount} frozen `}
                   {g.leavingCount > 0 && `${g.leavingCount} leaving`}
+                </div>
+              )}
+
+              {hoveredAz === g.az && g.providers.length > 0 && (
+                <div
+                  style={{
+                    position: "absolute",
+                    top: "100%",
+                    left: 0,
+                    right: 0,
+                    marginTop: 6,
+                    zIndex: 20,
+                    background: "var(--bg-card)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 10,
+                    boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
+                    padding: "8px 10px",
+                    maxHeight: 220,
+                    overflowY: "auto",
+                  }}
+                >
+                  <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-muted)", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                    {g.providers.length} SP{g.providers.length === 1 ? "" : "s"} in {g.az}
+                  </div>
+                  {g.providers.map((sp, i) => (
+                    <div
+                      key={`${sp.address}-${i}`}
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "3px 0",
+                        borderTop: i === 0 ? "none" : "1px solid var(--border)",
+                        fontSize: 11,
+                      }}
+                    >
+                      <span style={{ fontFamily: "monospace", color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {sp.address}
+                      </span>
+                      <span style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 4 }}>
+                        <span style={{ color: "var(--text-dim)" }}>{sp.state}</span>
+                        <span style={{ width: 6, height: 6, borderRadius: "50%", background: HEALTH_COLOR[sp.health], display: "inline-block" }} />
+                        <span style={{ color: HEALTH_COLOR[sp.health] }}>{sp.health}</span>
+                      </span>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>

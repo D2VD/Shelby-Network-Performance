@@ -1,48 +1,38 @@
 "use client";
 /**
- * components/quorum-health-az.tsx — v1.0
+ * components/quorum-health-az.tsx — v2.0
  *
- * Per-AZ Quorum Health Indicator (UPGRADE_ROADMAP.md — A3)
+ * REWRITE (2026-07-30): v1.0 applied the on-chain constant
+ * `min_active_storage_providers_for_active_pg = 12` directly to raw per-AZ
+ * SP population counts. That constant is a PER-PLACEMENT-GROUP threshold
+ * (a PG needs 12 of its 16 assigned slots active) — it is not an AZ-level
+ * quorum rule. On a network with ~34 total SPs spread across 10 AZs, no
+ * single AZ can ever reach 12, so v1.0 showed every AZ as "Below Quorum"
+ * regardless of actual health. This was a spec error inherited from
+ * UPGRADE_ROADMAP.md's A3 section, not just an implementation bug — caught
+ * via live screenshot showing 10/10 AZs red including zones at 4/4 and 5/5
+ * healthy.
  *
- * Distinct from the existing NHI-derived QuorumHealthBar in app/network/page.tsx,
- * which shows a single aggregate 0-100 "Quorum" score. This component answers a
- * different question per AZ: "does this specific availability zone have enough
- * Active storage providers to keep placement groups healthy?"
+ * A true per-PG quorum verdict requires per-PG slot-fill data (the raw
+ * on-chain `designated_placement_groups` field), which the backend pipeline
+ * does not currently expose on SpInfo — see the deferred per-PG follow-up
+ * from the prior session. Until that data exists, this component makes NO
+ * quorum/pass-fail claim. It shows a plain, accurate distribution: how many
+ * SPs are Active per AZ, and what fraction of those are also health:Healthy.
+ * Coloring is informational (health ratio) — explicitly not labeled "OK" /
+ * "Quorum" / "Below Quorum" anywhere in this file, to avoid re-implying a
+ * verdict the data can't support.
  *
- * Threshold source: on-chain contract constant
- *   min_active_storage_providers_for_active_pg = 12
- * Status bands (per UPGRADE_ROADMAP.md A3 spec), computed from on-chain `state`:
- *   🔴 Below quorum  — activeCount < 12
- *   🟡 Warning       — 12 <= activeCount <= 14
- *   🟢 Quorum OK     — activeCount > 14
+ * `state` (on-chain) vs `health` (off-chain derived: condition + TCP/IP
+ * checks) remain tracked separately, per prior session — confirmed via live
+ * curl that an SP can be state:"Active" with health:"Faulty" simultaneously.
  *
- * `state` (on-chain) and `health` (off-chain derived: condition + TCP/IP checks)
- * are tracked separately and both surfaced — confirmed via live curl that an SP
- * can be state:"Active" with health:"Faulty" simultaneously. The big number/band
- * is state-based (matches the protocol's own quorum semantics exactly); the
- * subtext shows how many of those state-Active SPs are also health:"Healthy",
- * so a degraded-but-still-registered AZ is visible without silently discarding
- * either signal.
- *
- * Data source: GET /api/network/providers?network=... (existing route,
- * proxies to VPS /api/geo-sync/providers). Response envelope shape is NOT
- * fully confirmed from source in this session, so extraction is defensive —
- * it tries the known { ok, data: { providers, count } } shape first, then
- * falls back to a couple of plausible alternates, and surfaces a visible
- * error rather than silently rendering an empty/misleading state.
- *
- * NOT included: per-PG status (Active/At-risk/Inactive). SpInfo (shared-types.ts
- * v1.2) carries no placement-group/slot data — that only exists in the raw
- * on-chain `designated_placement_groups` field, which the backend geo-sync
- * pipeline currently drops before building SpInfo. Needs a backend change
- * (expose designated_placement_groups per SP, or a dedicated PG summary
- * endpoint) before per-PG status can be built without guessing.
+ * Data source: GET /api/network/providers?network=... — confirmed live via
+ * curl against api.shelbyanalytics.site to match the extraction below
+ * ({ ok, data: { providers, count } }); fallbacks kept for defense only.
  */
 
 import { useEffect, useRef, useState } from "react";
-
-const MIN_ACTIVE_SPS_FOR_QUORUM = 12; // on-chain: min_active_storage_providers_for_active_pg
-const WARNING_CEILING = 14;           // <=14 active SPs => Warning band
 
 type SpState  = "Active" | "Waitlisted" | "Frozen" | "Leaving";
 type SpHealth = "Healthy" | "Faulty" | "Unhealthy" | "Unknown";
@@ -65,13 +55,6 @@ interface AZGroup {
   leavingCount: number;
 }
 
-type QuorumBand = "ok" | "warning" | "below";
-
-function num(v: unknown, fb = 0): number {
-  const n = Number(v ?? fb);
-  return isFinite(n) ? n : fb;
-}
-
 function str(v: unknown): string {
   if (v == null) return "—";
   if (typeof v === "string") return v || "—";
@@ -92,7 +75,7 @@ function isRawSpInfo(v: unknown): v is RawSpInfo {
 }
 
 /**
- * Defensive extraction: tries the documented route.ts envelope first
+ * Defensive extraction: tries the confirmed-live envelope first
  * ({ ok, data: { providers, count } }), then falls back to a couple of
  * plausible alternates. Returns null (not []) if nothing matches, so the
  * caller can distinguish "zero providers" from "unexpected response shape".
@@ -114,19 +97,25 @@ function extractProviders(json: unknown): RawSpInfo[] | null {
   return null;
 }
 
-function bandFor(activeCount: number): QuorumBand {
-  if (activeCount < MIN_ACTIVE_SPS_FOR_QUORUM) return "below";
-  if (activeCount <= WARNING_CEILING) return "warning";
-  return "ok";
+/** Informational health-ratio banding — NOT a quorum verdict. */
+type HealthBand = "healthy" | "degraded" | "unhealthy" | "empty";
+
+function healthBandFor(activeCount: number, activeHealthyCount: number): HealthBand {
+  if (activeCount === 0) return "empty";
+  const ratio = activeHealthyCount / activeCount;
+  if (ratio >= 0.8) return "healthy";
+  if (ratio >= 0.5) return "degraded";
+  return "unhealthy";
 }
 
-const BAND_META: Record<QuorumBand, { color: string; icon: string; label: string }> = {
-  ok:      { color: "#22c55e", icon: "🟢", label: "Quorum OK" },
-  warning: { color: "#f59e0b", icon: "🟡", label: "Warning" },
-  below:   { color: "#ef4444", icon: "🔴", label: "Below Quorum" },
+const BAND_META: Record<HealthBand, { color: string; icon: string; label: string }> = {
+  healthy:   { color: "#22c55e", icon: "🟢", label: "Healthy" },
+  degraded:  { color: "#f59e0b", icon: "🟡", label: "Degraded" },
+  unhealthy: { color: "#ef4444", icon: "🔴", label: "Mostly Unhealthy" },
+  empty:     { color: "#6b7280", icon: "⚪", label: "No Active SPs" },
 };
 
-export function QuorumHealthByAZ({ network }: { network: string }) {
+export function SpDistributionByAZ({ network }: { network: string }) {
   const [groups,  setGroups]  = useState<AZGroup[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState<string | null>(null);
@@ -147,7 +136,7 @@ export function QuorumHealthByAZ({ network }: { network: string }) {
 
         const providers = extractProviders(json);
         if (providers === null) {
-          setError("Unexpected /api/network/providers response shape — cannot compute per-AZ quorum.");
+          setError("Unexpected /api/network/providers response shape — cannot compute AZ distribution.");
           setLoading(false);
           return;
         }
@@ -172,7 +161,12 @@ export function QuorumHealthByAZ({ network }: { network: string }) {
           if (state === "Leaving")    g.leavingCount++;
         }
 
-        const sorted = Array.from(byAz.values()).sort((a, b) => a.activeCount - b.activeCount);
+        // Worst health-ratio first, so degraded AZs surface without implying a pass/fail line.
+        const sorted = Array.from(byAz.values()).sort((a, b) => {
+          const ra = a.activeCount === 0 ? -1 : a.activeHealthyCount / a.activeCount;
+          const rb = b.activeCount === 0 ? -1 : b.activeHealthyCount / b.activeCount;
+          return ra - rb;
+        });
         if (alive.current) { setGroups(sorted); setLoading(false); }
       })
       .catch((e: unknown) => {
@@ -186,7 +180,7 @@ export function QuorumHealthByAZ({ network }: { network: string }) {
   if (loading) {
     return (
       <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 14, padding: "18px 22px", marginBottom: 18, textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>
-        Loading per-AZ quorum status…
+        Loading storage provider distribution…
       </div>
     );
   }
@@ -207,30 +201,29 @@ export function QuorumHealthByAZ({ network }: { network: string }) {
     );
   }
 
-  const belowCount   = groups.filter((g) => bandFor(g.activeCount) === "below").length;
-  const warningCount = groups.filter((g) => bandFor(g.activeCount) === "warning").length;
-  const okCount       = groups.length - belowCount - warningCount;
+  const totalActive  = groups.reduce((s, g) => s + g.activeCount, 0);
+  const totalHealthy = groups.reduce((s, g) => s + g.activeHealthyCount, 0);
+  const maxActive    = Math.max(...groups.map((g) => g.activeCount), 1);
 
   return (
     <div style={{ marginBottom: 18 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4, flexWrap: "wrap", gap: 8 }}>
         <div style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-muted)" }}>
-          Quorum Health by AZ
+          Storage Providers by AZ
         </div>
         <div style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "monospace" }}>
-          Threshold: {MIN_ACTIVE_SPS_FOR_QUORUM} active SPs/PG ·{" "}
-          <span style={{ color: "#22c55e" }}>{okCount} OK</span> ·{" "}
-          <span style={{ color: "#f59e0b" }}>{warningCount} Warning</span> ·{" "}
-          <span style={{ color: "#ef4444" }}>{belowCount} Below</span>
+          {groups.length} zones · {totalActive} active · {totalHealthy} healthy
         </div>
+      </div>
+      <div style={{ fontSize: 10.5, color: "var(--text-dim)", marginBottom: 10 }}>
+        Distribution only — per-PG quorum status (12-of-16 slots) requires placement-group data not yet exposed by the backend.
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 10 }}>
         {groups.map((g) => {
-          const band = bandFor(g.activeCount);
+          const band = healthBandFor(g.activeCount, g.activeHealthyCount);
           const meta = BAND_META[band];
-          // Visual fill relative to the warning ceiling, capped at 100%.
-          const fillPct = Math.min(100, (g.activeCount / WARNING_CEILING) * 100);
+          const fillPct = Math.min(100, (g.activeCount / maxActive) * 100);
           return (
             <div
               key={g.az}
@@ -260,17 +253,10 @@ export function QuorumHealthByAZ({ network }: { network: string }) {
                 </span>
               </div>
 
-              {/* Subtext: how many of the state-Active SPs are also health:Healthy.
-                  Distinct signal from `state` — see header comment. Only flagged
-                  when it diverges from activeCount, so a fully-healthy AZ stays clean. */}
-              {g.activeCount > 0 && g.activeHealthyCount < g.activeCount && (
-                <div style={{ fontSize: 10, color: "#f59e0b", marginBottom: 6 }}>
-                  ⚠ only {g.activeHealthyCount}/{g.activeCount} report Healthy
-                </div>
-              )}
-              {g.activeCount > 0 && g.activeHealthyCount === g.activeCount && (
-                <div style={{ fontSize: 10, color: "var(--text-dim)", marginBottom: 6 }}>
-                  {g.activeHealthyCount}/{g.activeCount} healthy
+              {g.activeCount > 0 && (
+                <div style={{ fontSize: 10, color: g.activeHealthyCount < g.activeCount ? "#f59e0b" : "var(--text-dim)", marginBottom: 6 }}>
+                  {g.activeHealthyCount < g.activeCount ? "⚠ only " : ""}{g.activeHealthyCount}/{g.activeCount}{" "}
+                  {g.activeHealthyCount < g.activeCount ? "report Healthy" : "healthy"}
                 </div>
               )}
 

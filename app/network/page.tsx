@@ -24,6 +24,11 @@ import { ActivityFeed } from "@/components/activity-feed";
 // per-AZ, so this no longer claims a quorum pass/fail verdict — see file header.
 import { SpDistributionByAZ } from "@/components/quorum-health-az";
 
+// Testnet retirement (Shelby announced shutdown Mon Aug 3, 2026, 12:00 PDT).
+// Replaces the static "Live data from Aptos Testnet RPC" badge below, which
+// becomes a false claim after shutdown — see component file header.
+import { TestnetRetirementBanner } from "@/components/testnet-retirement-banner";
+
 type TimeRange = "1h" | "24h" | "7d" | "30d";
 type TabId = "overview" | "timeseries" | "epoch" | "benchmark" | "explorer";
 
@@ -901,11 +906,7 @@ export default function NetworkPage() {
         </div>
       </div>
 
-      {isTestnet && (
-        <div style={{ background:"rgba(147,51,234,0.07)", border:"1px solid rgba(147,51,234,0.25)", borderRadius:10, padding:"10px 16px", marginBottom:16, fontSize:13, color:"#c084fc", display:"flex", alignItems:"center", gap:8 }}>
-          <span>⚗</span><span>Shelby Testnet · Live data from Aptos Testnet RPC + Indexer V3</span>
-        </div>
-      )}
+      <TestnetRetirementBanner isTestnet={isTestnet} />
 
       {/* Tab bar + content */}
       <div style={{ background:"var(--bg-card)", border:"1px solid var(--border)", borderRadius:14, overflow:"hidden" }}>

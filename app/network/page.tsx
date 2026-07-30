@@ -13,7 +13,17 @@
 
 import { useEffect, useState, useRef, useCallback, Suspense } from "react";
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
+import dynamic from "next/dynamic";
 import { useNetwork } from "@/components/network-context";
+import type { TsChartPoint } from "@/components/timeseries-chart";
+
+// TabTimeseries — eCharts, dynamically loaded (ssr:false) matching this
+// project's existing convention for other browser-only visual libs (map
+// component uses the same pattern for CF Pages compatibility).
+const TimeseriesChart = dynamic(
+  () => import("@/components/timeseries-chart").then((m) => m.TimeseriesChart),
+  { ssr: false, loading: () => <div style={{ height: 130 }} /> }
+);
 
 // STEP 1 — Add imports from NETWORK PAGE PATCH
 import { NHICard }      from "@/components/nhi-badge";
@@ -124,12 +134,6 @@ function fmtBytes(b: number | null | undefined): string {
 }
 function fmtMs(ms: number): string { return ms >= 1000 ? `${(ms/1000).toFixed(2)}s` : `${ms.toFixed(0)}ms`; }
 function fmtKbs(k: number): string { return k >= 1024 ? `${(k/1024).toFixed(2)} MB/s` : `${k.toFixed(1)} KB/s`; }
-function tLbl(ts: number, r: TimeRange): string {
-  const d = new Date(ts);
-  return (r === "1h" || r === "24h")
-    ? `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")}`
-    : `${d.getUTCMonth()+1}/${d.getUTCDate()}`;
-}
 function fmtDuration(ms: number): string {
   const h = Math.floor(ms / 3600000);
   const m = Math.floor((ms % 3600000) / 60000);
@@ -491,20 +495,22 @@ function TimeseriesTab({ network, isTestnet, accentColor }: { network:string; is
       }).catch(()=>{});
   }, [network, range]);
 
-  const labels = ts.map(p => tLbl(p.tsMs, range));
   const cd = ts;
   const last = cd[cd.length-1];
 
-  // Compute avg blob size for each point: (storageGB * 1e9) / activeBlobs in KB
-  const avgBlobSizeData = cd.map(p => {
-    if (p.activeBlobs > 0 && p.totalStorageGB > 0) return (p.totalStorageGB * 1e9) / p.activeBlobs / 1024;
-    return 0;
-  }).filter(v => v > 0);
-  const lastAvgKB = last && last.activeBlobs > 0 && last.totalStorageGB > 0
-    ? (last.totalStorageGB * 1e9) / last.activeBlobs / 1024 : 0;
+  // Maps a numeric field off each TsPoint into {tsMs, value} pairs for TimeseriesChart.
+  // Zero values are now plotted (not dropped) — see behavior-change note in
+  // components/timeseries-chart.tsx's header comment.
+  const toPoints = (pick: (p: TsPoint) => number): TsChartPoint[] =>
+    cd.map(p => ({ tsMs: p.tsMs, value: pick(p) }));
 
-  const ChartCard = ({ title, sub, latest, latestColor, data, color, h = 130 }: {
-    title:string; sub:string; latest:string; latestColor:string; data:number[]; color:string; h?:number;
+  // Compute avg blob size for each point: (storageGB * 1e9) / activeBlobs in KB
+  const avgKB = (p: TsPoint) => (p.activeBlobs > 0 && p.totalStorageGB > 0) ? (p.totalStorageGB * 1e9) / p.activeBlobs / 1024 : 0;
+  const avgBlobSizePoints = toPoints(avgKB);
+  const lastAvgKB = last ? avgKB(last) : 0;
+
+  const ChartCard = ({ title, sub, latest, latestColor, points, color, h = 130 }: {
+    title:string; sub:string; latest:string; latestColor:string; points:TsChartPoint[]; color:string; h?:number;
   }) => (
     <div style={{ background:"var(--bg-card)", border:"1px solid var(--border)", borderRadius:14, padding:"16px 20px" }}>
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
@@ -514,12 +520,7 @@ function TimeseriesTab({ network, isTestnet, accentColor }: { network:string; is
         </div>
         <div style={{ fontFamily:"monospace", fontSize:15, fontWeight:700, color:latestColor }}>{latest}</div>
       </div>
-      <SparkLine data={data} color={color} height={h} />
-      {labels.length > 1 && (
-        <div style={{ display:"flex", justifyContent:"space-between", fontSize:9, color:"var(--text-dim)", fontFamily:"monospace", marginTop:4 }}>
-          <span>{labels[0]}</span><span>{labels[labels.length-1]}</span>
-        </div>
-      )}
+      <TimeseriesChart points={points} color={color} height={h} />
     </div>
   );
 
@@ -534,8 +535,8 @@ function TimeseriesTab({ network, isTestnet, accentColor }: { network:string; is
       {/* Section: Blob Analytics */}
       <div style={{ fontSize:12, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.08em", color:"var(--text-muted)", marginBottom:12 }}>Blob Analytics</div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginBottom:14 }}>
-        <ChartCard title="Active Blobs" sub={`${range} window`} latest={fmt(last?.activeBlobs)} latestColor="#22c55e" data={cd.map(p=>p.activeBlobs).filter(v=>v>0)} color="#22c55e" />
-        <ChartCard title="Blob Events" sub="blob_activities count" latest={fmt(last?.totalBlobEvents)} latestColor="#f59e0b" data={cd.map(p=>p.totalBlobEvents).filter(v=>v>0)} color="#f59e0b" />
+        <ChartCard title="Active Blobs" sub={`${range} window`} latest={fmt(last?.activeBlobs)} latestColor="#22c55e" points={toPoints(p=>p.activeBlobs)} color="#22c55e" />
+        <ChartCard title="Blob Events" sub="blob_activities count" latest={fmt(last?.totalBlobEvents)} latestColor="#f59e0b" points={toPoints(p=>p.totalBlobEvents)} color="#f59e0b" />
       </div>
       {/* Pending + Deleted — full width */}
       <div style={{ background:"var(--bg-card)", border:"1px solid var(--border)", borderRadius:14, padding:"16px 20px", marginBottom:20 }}>
@@ -553,24 +554,19 @@ function TimeseriesTab({ network, isTestnet, accentColor }: { network:string; is
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
           <div>
             <div style={{ fontSize:10, color:"var(--text-dim)", marginBottom:4 }}>Pending</div>
-            <SparkLine data={cd.map(p=>p.pendingOrFailed).filter(v=>v>0)} color="#f59e0b" height={80} />
+            <TimeseriesChart points={toPoints(p=>p.pendingOrFailed)} color="#f59e0b" height={80} />
           </div>
           <div>
             <div style={{ fontSize:10, color:"var(--text-dim)", marginBottom:4 }}>Deleted</div>
-            <SparkLine data={cd.map(p=>p.deletedBlobs).filter(v=>v>0)} color="#ef4444" height={80} />
+            <TimeseriesChart points={toPoints(p=>p.deletedBlobs)} color="#ef4444" height={80} />
           </div>
         </div>
-        {labels.length > 1 && (
-          <div style={{ display:"flex", justifyContent:"space-between", fontSize:9, color:"var(--text-dim)", fontFamily:"monospace", marginTop:4 }}>
-            <span>{labels[0]}</span><span>{labels[labels.length-1]}</span>
-          </div>
-        )}
       </div>
 
       {/* Section: Storage Analytics */}
       <div style={{ fontSize:12, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.08em", color:"var(--text-muted)", marginBottom:12 }}>Storage Analytics</div>
       <div style={{ display:"grid", gridTemplateColumns:"2fr 1fr", gap:14, marginBottom:14 }}>
-        <ChartCard title="Storage Used (GB)" sub="Active blobs only" latest={`${(last?.totalStorageGB??0).toFixed(2)} GB`} latestColor="#9333ea" data={cd.map(p=>p.totalStorageGB).filter(v=>v>0)} color="#9333ea" />
+        <ChartCard title="Storage Used (GB)" sub="Active blobs only" latest={`${(last?.totalStorageGB??0).toFixed(2)} GB`} latestColor="#9333ea" points={toPoints(p=>p.totalStorageGB)} color="#9333ea" />
         <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
           {[
             { label:"Total Storage",  val:`${(last?.totalStorageGB??0).toFixed(2)} GB`, color:"#9333ea" },
@@ -595,12 +591,7 @@ function TimeseriesTab({ network, isTestnet, accentColor }: { network:string; is
             {lastAvgKB>0?(lastAvgKB>=1024?`${(lastAvgKB/1024).toFixed(1)} MB`:`${lastAvgKB.toFixed(0)} KB`):"—"}
           </div>
         </div>
-        <SparkLine data={avgBlobSizeData} color={accentColor} height={110} />
-        {labels.length > 1 && (
-          <div style={{ display:"flex", justifyContent:"space-between", fontSize:9, color:"var(--text-dim)", fontFamily:"monospace", marginTop:4 }}>
-            <span>{labels[0]}</span><span>{labels[labels.length-1]}</span>
-          </div>
-        )}
+        <TimeseriesChart points={avgBlobSizePoints} color={accentColor} height={110} />
       </div>
 
       {/* Block Height */}
@@ -609,7 +600,7 @@ function TimeseriesTab({ network, isTestnet, accentColor }: { network:string; is
         title="Block Height" sub="Chain progress"
         latest={last?.blockHeight ? `#${last.blockHeight.toLocaleString("en-US")}` : "—"}
         latestColor={accentColor}
-        data={cd.map(p=>p.blockHeight).filter(v=>v>0)} color={accentColor}
+        points={toPoints(p=>p.blockHeight)} color={accentColor}
       />
     </div>
   );

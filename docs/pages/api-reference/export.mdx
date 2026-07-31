@@ -1,0 +1,35 @@
+import { Callout } from 'nextra/components';
+
+# Export
+
+<Callout type="warning">
+  Rate limited: 1 export/hour on the free tier, 10/hour on Pro.
+</Callout>
+
+## `GET /v1/export/snapshots`
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+| `from` | ISO timestamp | Required |
+| `to` | ISO timestamp | Required |
+| `format` | `csv \| json` | Default `csv` |
+
+**Response**: file download (CSV or JSON).
+
+---
+
+## `GET /v1/export/sp-history`
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `address` | string | Required |
+| `network` | string | Required |
+| `from` | ISO timestamp | |
+| `to` | ISO timestamp | |
+
+**Response**: CSV file download.

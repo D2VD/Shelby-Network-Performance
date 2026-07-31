@@ -1,0 +1,52 @@
+import { Callout } from 'nextra/components';
+
+# Calculator
+
+## `GET /v1/calculator/storage-cost`
+
+Estimate ShelbyUSD storage cost, with comparisons to other storage networks.
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `sizeBytes` | number | Required |
+| `durationDays` | number | Required |
+| `network` | string | Required |
+
+**Response**
+
+```json
+{
+  "totalShelbyUSD": "0",
+  "perMonthShelbyUSD": "0",
+  "breakdown": {},
+  "comparison": { "s3": 0, "r2": 0, "arweave": 0, "filecoin": 0 }
+}
+```
+
+<Callout type="info">
+  Pricing is based on the on-chain PaymentTiers rate. Whether the currently observed
+  42 µShelbyUSD/chunk/epoch rate is a testnet placeholder or the intended mainnet rate
+  is not yet confirmed — do not present cost estimates as confirmed mainnet pricing.
+</Callout>
+
+---
+
+## `GET /v1/calculator/sp-rewards`
+
+Estimate SP operator rewards given a stake amount.
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `stake` | number | Required |
+| `az` | string | Availability zone |
+| `network` | string | Required |
+
+**Response**
+
+```json
+{ "estimatedPerEpoch": "0", "estimatedPerMonth": "0", "breakEvenDays": 0 }
+```

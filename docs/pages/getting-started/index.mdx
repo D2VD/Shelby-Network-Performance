@@ -1,0 +1,21 @@
+# Overview
+
+Shelby Analytics pulls data from two sources and merges it into one dashboard:
+
+1. **On-chain data** via the Aptos Labs Generic V3 GraphQL indexer and Node REST APIs,
+   for both shelbynet and testnet.
+2. **Historical timeseries** stored in TimescaleDB — network snapshots, storage provider
+   (SP) health snapshots, and epoch snapshots, sampled continuously and used to power the
+   charts on the Timeseries tab.
+
+No wallet connection or signing is required to view public network data. Blob preview
+works for **Public**-permission blobs on shelbynet only today — Allowlist / Time Lock /
+Purchasable blobs, and testnet blob preview, are not yet supported (see
+[Reading the Dashboard](/getting-started/reading-the-dashboard) for what each tab shows).
+
+## Where to go next
+
+- New to the dashboard? Start with [Reading the Dashboard](/getting-started/reading-the-dashboard).
+- Curious about the shelbynet/testnet split, or the testnet retirement? See
+  [Shelbynet vs Testnet](/getting-started/networks).
+- Want to pull data programmatically? Jump to the [API Reference](/api-reference).

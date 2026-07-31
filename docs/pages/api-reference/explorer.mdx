@@ -1,0 +1,88 @@
+# Explorer
+
+## `GET /v1/explorer/transactions`
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+| `type` | `register_blob \| all` | |
+| `address` | string | Filter by sender |
+| `limit` | number | Default 50 |
+| `cursor` | string | Cursor-based pagination |
+
+**Response**
+
+```json
+{ "txs": [], "nextCursor": null }
+```
+
+---
+
+## `GET /v1/explorer/tx/:hash`
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+
+**Response**
+
+```json
+{
+  "hash": "0x...",
+  "type": "register_blob",
+  "sender": "0x...",
+  "success": true,
+  "timestamp": "2026-07-30T00:00:00Z",
+  "blobIds": [],
+  "gasUsed": 0
+}
+```
+
+---
+
+## `GET /v1/explorer/blobs`
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+| `address` | string | Filter by owner |
+| `status` | `active \| deleted \| all` | |
+| `limit` | number | Default 50 |
+| `cursor` | string | |
+
+**Response**
+
+```json
+{ "blobs": [], "nextCursor": null }
+```
+
+---
+
+## `GET /v1/explorer/blobs/:blobId`
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+
+**Response**
+
+```json
+{
+  "blobId": "...",
+  "owner": "0x...",
+  "size": 0,
+  "status": "active",
+  "registeredAt": "2026-07-30T00:00:00Z",
+  "expiresAt": "2026-08-30T00:00:00Z",
+  "placementGroups": [],
+  "chunksVerified": 0
+}
+```

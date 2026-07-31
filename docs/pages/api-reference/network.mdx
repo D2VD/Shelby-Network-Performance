@@ -1,0 +1,75 @@
+# Network
+
+## `GET /v1/network/stats`
+
+Current network-wide stats.
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | `shelbynet \| testnet \| mainnet` | Required |
+
+**Response**
+
+```json
+{
+  "network": "shelbynet",
+  "totalBlobs": 0,
+  "activeBlobs": 0,
+  "storageBytes": 0,
+  "storageProviders": 0,
+  "placementGroups": 0,
+  "slices": 0,
+  "blockHeight": 0,
+  "nhi": 0,
+  "updatedAt": "2026-07-30T00:00:00Z"
+}
+```
+
+---
+
+## `GET /v1/network/stats/timeseries`
+
+Historical network stats, bucketed.
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+| `resolution` | `5m \| 1h \| 1d` | Bucket size |
+| `range` | `1h \| 24h \| 7d \| 30d \| 1y` | Lookback window |
+
+**Response**
+
+```json
+{
+  "series": [
+    { "time": "2026-07-30T00:00:00Z", "totalBlobs": 0, "storageBytes": 0 }
+  ]
+}
+```
+
+---
+
+## `GET /v1/network/health`
+
+Network Health Index (NHI) and quorum status.
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+
+**Response**
+
+```json
+{
+  "nhi": 87,
+  "quorumStatus": "OK",
+  "anomalies": [],
+  "updatedAt": "2026-07-30T00:00:00Z"
+}
+```

@@ -1,0 +1,87 @@
+# Providers
+
+## `GET /v1/providers`
+
+List storage providers.
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+| `status` | `active \| waitlisted \| all` | Default `all` |
+| `az` | string | Filter by availability zone |
+| `limit` | number | Default 50 |
+| `offset` | number | Default 0 |
+
+**Response**
+
+```json
+{ "providers": [], "count": 0, "total": 0 }
+```
+
+---
+
+## `GET /v1/providers/:address`
+
+Single provider detail, including reputation and PG assignment.
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+
+**Response**
+
+```json
+{
+  "address": "0x...",
+  "reputationScore": 0,
+  "uptimePct30d": 0,
+  "designatedPgs": [],
+  "stake": "0",
+  "epochHistory": []
+}
+```
+
+---
+
+## `GET /v1/providers/leaderboard`
+
+Ranked provider leaderboard.
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+| `sort` | `reputation \| uptime \| stake` | Default `reputation` |
+| `limit` | number | Default 20 |
+
+**Response**
+
+```json
+{ "leaderboard": [{ "rank": 1, "address": "0x...", "score": 0 }] }
+```
+
+---
+
+## `GET /v1/providers/:address/history`
+
+Health history for a single provider.
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+| `from` | ISO timestamp | |
+| `to` | ISO timestamp | |
+| `resolution` | string | Default `1h` |
+
+**Response**
+
+```json
+{ "history": [{ "time": "2026-07-30T00:00:00Z", "health": "Healthy", "condition": 0 }] }
+```

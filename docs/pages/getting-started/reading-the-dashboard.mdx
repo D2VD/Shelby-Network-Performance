@@ -1,0 +1,35 @@
+# Reading the Dashboard
+
+The `/network` page is organized into tabs:
+
+### Overview
+Top-line stats: total/active blobs, storage providers, placement groups, and a
+**Storage Providers by AZ** panel showing the live distribution of SPs across
+availability zones, colored by health ratio. Hover any AZ to see the individual SPs in
+it (address, on-chain state, health), sorted worst-first.
+
+> This panel deliberately does **not** claim per-availability-zone quorum pass/fail.
+> The protocol's `min_active_storage_providers_for_active_pg = 12` constant is a
+> **per-placement-group** threshold, not a per-AZ one — applying it directly to raw
+> AZ population counts produces a false "every AZ is unhealthy" reading on a network
+> this size. A true per-PG quorum verdict requires placement-group assignment data
+> not yet exposed by the API.
+
+### Timeseries
+Historical charts (active blobs, blob events, pending/deleted counts, storage used,
+average blob size, block height) rendered from TimescaleDB snapshots. Zero-value points
+render as real dips — they are not filtered out.
+
+### Epoch
+Live countdowns for the audit, payment, and staking epochs, plus history of past epoch
+transitions.
+
+### Explorer
+Search and inspect individual blobs and transactions.
+
+## Blob preview limitations
+
+Blob preview currently only works for blobs on **shelbynet** with **Public** permission.
+Allowlist, Time Lock, and Purchasable blobs cannot preview correctly yet, since no
+wallet-identity or signing flow exists in this dashboard — that's planned future work.
+Testnet blob preview is not supported.

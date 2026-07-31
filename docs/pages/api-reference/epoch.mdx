@@ -1,0 +1,29 @@
+# Epoch
+
+## `GET /v1/epoch`
+
+Current epoch state across all three epoch types (audit, payment, staking) plus history.
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+
+**Response**
+
+```json
+{
+  "currentAuditEpoch": 0,
+  "currentPaymentEpoch": 0,
+  "currentStakingEpoch": 0,
+  "auditCountdown": "00:00:00",
+  "paymentCountdown": "00:00:00",
+  "stakingCountdown": "00:00:00",
+  "auditHistory": [],
+  "paymentHistory": [],
+  "stakingHistory": []
+}
+```
+
+Epoch cycle lengths: audit ~1 hour, payment ~24 hours, staking ~7 days.

@@ -1,0 +1,22 @@
+import { Callout } from 'nextra/components';
+
+# Shelbynet vs Testnet
+
+<Callout type="warning">
+  **Testnet is retiring Monday, August 3, 2026, 12:00 PDT.** After that time, testnet
+  data on this dashboard is frozen at its last-known state — no new data will be
+  collected. Shelbynet is unaffected and remains the primary, live network.
+</Callout>
+
+| | Shelbynet | Testnet |
+|---|---|---|
+| Status | Primary, live | Retiring Aug 3, 2026 |
+| Node REST auth | No `Authorization` header (401s if sent) | Requires `Authorization: Bearer` |
+| Blob preview | Supported (Public blobs) | Not supported |
+| Content gateway | `*.shelbynet.shelby.xyz` pattern | `api.testnet.shelby.xyz/shelby/v1/blobs/{owner}/{blob_name}` (not a symmetric rename) |
+
+Both networks are tracked through the same pipeline shape — a `geo-sync` job per network
+feeding TimescaleDB — but the two implementations have some deliberate and some
+historical differences. If you notice numbers that look inconsistent between the two
+networks' pages, it's worth checking whether it's a known, disclosed difference (like the
+ones above) before assuming it's a bug.

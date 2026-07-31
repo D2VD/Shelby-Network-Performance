@@ -1,0 +1,48 @@
+import { Callout } from 'nextra/components';
+
+# API Reference
+
+<Callout type="warning">
+  This reference reflects the `/v1/*` API **design spec** drafted for the project's Phase
+  3 build-out. Before publishing this publicly, confirm each endpoint below is actually
+  deployed and matches this shape — some may still be pending or may have changed during
+  implementation. Treat this page as a draft until verified against the live API.
+</Callout>
+
+## Base URL
+
+```
+https://shelbyanalytics.site/v1
+```
+
+## Authentication
+
+| Tier | Auth | Rate limit |
+|---|---|---|
+| Free | None required | 100 requests/hour, limited by IP |
+| Pro | API key | 5,000 requests/hour |
+
+For authenticated (Pro) requests, pass the key as a bearer token:
+
+```
+GET /v1/network/stats
+Authorization: Bearer sa_live_xxxxxxxxxxxx
+```
+
+## Response format
+
+All endpoints return JSON. Error responses use a generic shape and do not leak internal
+details:
+
+```json
+{ "error": "message" }
+```
+
+## Sections
+
+- **[Network](/api-reference/network)** — network-wide stats, timeseries, and health
+- **[Providers](/api-reference/providers)** — storage provider listings, detail, and leaderboard
+- **[Epoch](/api-reference/epoch)** — current epoch state and countdowns
+- **[Explorer](/api-reference/explorer)** — transactions and blobs
+- **[Calculator](/api-reference/calculator)** — storage cost and SP reward estimates
+- **[Export](/api-reference/export)** — bulk CSV/JSON data export

@@ -19,7 +19,7 @@ export async function GET(_req: NextRequest): Promise<NextResponse> {
 
   let upstream: Response;
   try {
-    upstream = await fetch(`${VPS_URL}/api/v1/health`, { cache: "no-store" });
+    upstream = await fetch(`${VPS_URL}/api/v1/health`, { next: { revalidate: 0 } });
   } catch {
     return NextResponse.json(
       { status: "unreachable", error: "Could not reach API service" },

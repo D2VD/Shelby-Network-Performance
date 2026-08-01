@@ -17,7 +17,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   let upstream: Response;
   try {
     upstream = await fetch(`${VPS_URL}/api/v1/providers?${qs}`, {
-      cache: "no-store",
+      next: { revalidate: 0 },
     });
   } catch {
     return NextResponse.json({ error: "Could not reach API service" }, { status: 502 });

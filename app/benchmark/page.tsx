@@ -9,7 +9,10 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { useNetwork } from "@/components/network-context";
 import { TestnetBanner } from "@/components/testnet-banner";
 import { getDeviceId, useDeviceId } from "@/lib/use-device-id";
-import { useBenchHistory } from "@/lib/use-bench-history";
+import { useWalletSession } from "@/lib/use-wallet-session";
+import { useWalletHistory } from "@/lib/use-wallet-history";
+import { ConnectWalletButton } from "@/components/connect-wallet-button";
+import { BenchmarkWalletProvider } from "@/components/benchmark-wallet-provider";
 
 type Phase = "idle"|"checking"|"latency"|"upload"|"download"|"txtime"|"done"|"error";
 interface LatResult  { avg:number; min:number; max:number; samples?:number[] }
@@ -64,8 +67,12 @@ const callWithDevice = async <T,>(url:string, body?:object): Promise<T> => {
 const signalRunEnd = async () => {
   try { await fetch("/api/benchmark/upload/end",{method:"POST",headers:{"x-device-id":getDeviceId()}}); } catch {}
 };
-const saveResultToServer = async (res:BenchResult) => {
-  try { await fetch("/api/benchmark/results",{method:"POST",headers:{"Content-Type":"application/json","x-device-id":getDeviceId()},body:JSON.stringify(res)}); } catch(e){console.warn("[bench] server save failed:",e);}
+const saveResultToServer = async (res:BenchResult, sessionToken:string|null) => {
+  if (!sessionToken) { console.warn("[bench] no verified wallet session — result not saved to server"); return; }
+  try {
+    const r = await fetch("/api/benchmark/results",{method:"POST",headers:{"Content-Type":"application/json","x-device-id":getDeviceId(),"x-wallet-session":sessionToken},body:JSON.stringify(res)});
+    if (!r.ok) { const err:any=await r.json().catch(()=>({})); console.warn("[bench] server save rejected:",err.error??r.status); }
+  } catch(e){console.warn("[bench] server save failed:",e);}
 };
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -290,10 +297,11 @@ function HistoryTable({displayHistory,totalCount}:{displayHistory:any[];totalCou
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
-export default function BenchmarkPage() {
+function BenchmarkPageInner() {
   const { config, network } = useNetwork();
   const deviceId = useDeviceId();
-  const { history, saveRun, displayHistory } = useBenchHistory();
+  const wallet = useWalletSession();
+  const { history, displayHistory, refresh: refreshHistory } = useWalletHistory(wallet.sessionToken);
   const [phase,setPhase]=useState<Phase>("idle");
   const [log,setLog]=useState<string[]>([]);
   const [result,setResult]=useState<BenchResult|null>(null);
@@ -321,6 +329,7 @@ export default function BenchmarkPage() {
 
   const run=useCallback(async()=>{
     if(!diagnose?.ready){await runDiagnose();return;}
+    if(!wallet.isVerified){setPhase("error");addLog("✗ Connect and verify a wallet before running a benchmark");return;}
     const myRun=++runIdRef.current;
     setPhase("checking");setLog([]);setResult(null);
     try {
@@ -398,13 +407,13 @@ export default function BenchmarkPage() {
 
       const res:BenchResult={latency,uploads,downloads,tx,avgUploadKbs:avgUp,avgDownloadKbs:avgDown,score,tier,runAt:new Date().toLocaleString(),maxSuccessfulBytes,mode:benchMode};
       setResult(res); setPhase("done");
-      saveRun(res); await saveResultToServer(res); await signalRunEnd();
+      await saveResultToServer(res, wallet.sessionToken); await signalRunEnd(); await refreshHistory();
       addLog(`— Done · Score: ${score}/1000 (${tier}) · Max blob: ${fmtBytes(maxSuccessfulBytes)}`);
     } catch(e:any){
       if(myRun!==runIdRef.current)return;
       setPhase("error"); addLog(`✗ ${e.message}`); await signalRunEnd();
     }
-  },[diagnose,runDiagnose,addLog,saveRun,benchMode]);
+  },[diagnose,runDiagnose,addLog,benchMode,wallet.isVerified,wallet.sessionToken,refreshHistory]);
 
   const requestFaucet=useCallback(async()=>{
     addLog("— Requesting faucet…");
@@ -430,7 +439,8 @@ export default function BenchmarkPage() {
           <p style={{fontSize:13,margin:"4px 0 0",color:"var(--text-muted)"}}>Upload · download · latency · TX speed on <strong>{config.label}</strong></p>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-          {deviceId&&<div style={{fontSize:10,fontFamily:"var(--font-mono)",color:"var(--text-dim)",background:"var(--bg-card2)",border:"1px solid var(--border)",borderRadius:6,padding:"3px 8px"}}>Device: {`dev_${deviceId.replace(/-/g,"").slice(0,8)}`}</div>}
+          <ConnectWalletButton/>
+          {deviceId&&<div title="Legacy device identifier — no longer used for history, kept for debugging" style={{fontSize:10,fontFamily:"var(--font-mono)",color:"var(--text-dim)",background:"var(--bg-card2)",border:"1px solid var(--border)",borderRadius:6,padding:"3px 8px"}}>Device: {`dev_${deviceId.replace(/-/g,"").slice(0,8)}`}</div>}
           <div style={{display:"flex",background:"#f4f4f4",borderRadius:10,padding:3,gap:2}}>
             {(["run","history"] as const).map(tab=>(
               <button key={tab} onClick={()=>setActiveTab(tab)} style={{padding:"6px 14px",borderRadius:8,fontSize:13,fontWeight:activeTab===tab?600:400,color:activeTab===tab?"#0a0a0a":"#999",background:activeTab===tab?"#fff":"transparent",boxShadow:activeTab===tab?"0 1px 4px rgba(0,0,0,0.08)":"none",border:"none",cursor:"pointer"}}>
@@ -470,9 +480,10 @@ export default function BenchmarkPage() {
               ))}
               <span style={{fontSize:11,color:"var(--gray-400)"}}>{benchMode==="adaptive"?"1KB → 64KB → 512KB → 2MB → 5MB → 10MB":"1KB / 10KB / 100KB"}</span>
             </div>
-            <button onClick={run} disabled={running} className="btn btn-primary" style={{width:"100%",padding:"13px 0",fontSize:15,justifyContent:"center",borderRadius:12,marginBottom:running||phase!=="idle"?16:0,opacity:(!diagnose?.ready&&!running)?0.6:1}}>
-              {running?`Running — ${STEPS.find(s=>s.phase===phase)?.label??phase}…`:!diagnose?.ready?"⚠ Fix issues first":result?"⟳ Run again":"▶ Start benchmark"}
+            <button onClick={run} disabled={running||!wallet.isVerified} className="btn btn-primary" style={{width:"100%",padding:"13px 0",fontSize:15,justifyContent:"center",borderRadius:12,marginBottom:running||phase!=="idle"?16:0,opacity:(!wallet.isVerified||(!diagnose?.ready&&!running))?0.6:1}}>
+              {running?`Running — ${STEPS.find(s=>s.phase===phase)?.label??phase}…`:!wallet.isVerified?"◎ Connect wallet to run":!diagnose?.ready?"⚠ Fix issues first":result?"⟳ Run again":"▶ Start benchmark"}
             </button>
+            {!wallet.isVerified&&!running&&<p style={{fontSize:12,color:"var(--gray-400)",margin:"0 0 12px",textAlign:"center"}}>Connect and sign to verify a wallet — results are now saved by wallet address, not device.</p>}
             {(running||phase==="done"||phase==="error")&&<ProgressBar phase={phase} running={running}/>}
           </div>
 
@@ -542,7 +553,26 @@ export default function BenchmarkPage() {
           )}
         </>
       )}
-      {activeTab==="history"&&<HistoryTable displayHistory={displayHistory} totalCount={totalHistoryCount}/>}
+      {activeTab==="history"&&(
+        wallet.isVerified
+          ? <HistoryTable displayHistory={displayHistory} totalCount={totalHistoryCount}/>
+          : <div className="card"><div className="card-body" style={{textAlign:"center",padding:"32px 16px",color:"var(--gray-400)"}}>
+              <p style={{margin:"0 0 12px",fontSize:13}}>Connect and verify a wallet to see your benchmark history.</p>
+              <ConnectWalletButton/>
+            </div></div>
+      )}
     </div>
+  );
+}
+
+// Wraps the page in the Aptos Wallet Adapter provider — useWallet() must be
+// called from inside this tree, hence BenchmarkPageInner above rather than
+// putting the provider at the app-layout level (kept scoped to this page,
+// see benchmark-wallet-provider.tsx header comment).
+export default function BenchmarkPage() {
+  return (
+    <BenchmarkWalletProvider>
+      <BenchmarkPageInner/>
+    </BenchmarkWalletProvider>
   );
 }

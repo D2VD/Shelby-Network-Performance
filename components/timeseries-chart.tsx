@@ -111,6 +111,13 @@ export function TimeseriesChart({ points, color, height = 130, valueFormatter = 
     );
   }
 
+  // FIX: eCharts' default yAxis.splitNumber (~5) was crowding short charts —
+  // the Pending/Deleted mini charts render at height:80, so 5-6 gridlines
+  // (each with a label) left almost no vertical gap between them. Scale tick
+  // count to actual pixel height instead of using one fixed number for every
+  // chart size on the page.
+  const ySplitNumber = height < 100 ? 2 : height < 150 ? 3 : 4;
+
   const option: EChartsOption = {
     backgroundColor: "transparent",
     grid: { left: 4, right: 8, top: 8, bottom: 4, containLabel: true },
@@ -123,6 +130,7 @@ export function TimeseriesChart({ points, color, height = 130, valueFormatter = 
     },
     yAxis: {
       type: "value",
+      splitNumber: ySplitNumber,
       axisLine: { show: false },
       axisTick: { show: false },
       axisLabel: { color: theme.text, fontSize: 9, fontFamily: "monospace", formatter: (v: number) => axisLabelFormatter(v) },

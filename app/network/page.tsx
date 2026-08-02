@@ -614,21 +614,39 @@ function EpochTab({ network }: { network: string }) {
   const alive = useRef(true);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
-  useEffect(() => {
-    if (alive.current) { setEpoch(null); setError(null); setLoading(true); }
-    fetch(`/api/network/epoch?network=${network}`, { signal: AbortSignal.timeout(10_000) })
-      .then(r => r.json() as Promise<Record<string, unknown>>)
-      .then(j => {
-        if (!alive.current) return;
-        if (j.ok && j.data) {
-          setEpoch(j.data as EpochData);
-        } else {
-          setError(String(j.error ?? "Epoch data unavailable"));
-        }
-        setLoading(false);
-      })
-      .catch(e => { if (alive.current) { setError((e as Error).message); setLoading(false); } });
+  // FIX: was a single fetch-on-mount with no re-fetch — once an epoch actually
+  // rolled over on-chain, next_epoch_at_ms stayed stuck at its expired value
+  // forever (EpochCountdown's local Date.now() ticker just kept recomputing
+  // max(0, expired - now), which is permanently 0). Only a page reload (=
+  // remount = one fresh fetch) ever cleared it. Now polls every 20s so the
+  // countdown re-syncs to the new epoch automatically after rollover.
+  const fetchEpoch = useCallback(async (isInitial: boolean) => {
+    if (isInitial && alive.current) { setEpoch(null); setError(null); setLoading(true); }
+    try {
+      const r = await fetch(`/api/network/epoch?network=${network}`, { signal: AbortSignal.timeout(10_000) });
+      const j = await r.json() as Record<string, unknown>;
+      if (!alive.current) return;
+      if (j.ok && j.data) {
+        setEpoch(j.data as EpochData);
+        setError(null);
+      } else if (isInitial) {
+        setError(String(j.error ?? "Epoch data unavailable"));
+      }
+      // Non-initial (background poll) failures deliberately don't clear a
+      // previously-loaded epoch or show an error — the countdown keeps
+      // ticking fine off the last good data until the next successful poll.
+    } catch (e) {
+      if (alive.current && isInitial) setError((e as Error).message);
+    } finally {
+      if (alive.current) setLoading(false);
+    }
   }, [network]);
+
+  useEffect(() => {
+    fetchEpoch(true);
+    const id = setInterval(() => fetchEpoch(false), 20_000);
+    return () => clearInterval(id);
+  }, [fetchEpoch]);
 
   if (loading) return <div style={{ padding:32, textAlign:"center", color:"var(--text-muted)", fontSize:13 }}>Loading epoch data…</div>;
   if (error)   return <div style={{ padding:32, textAlign:"center", color:"#ef4444", fontSize:13 }}>⚠ {error}</div>;

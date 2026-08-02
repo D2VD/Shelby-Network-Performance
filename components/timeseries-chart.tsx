@@ -56,12 +56,28 @@ interface TimeseriesChartProps {
   points: TsChartPoint[];
   color: string;
   height?: number;
-  /** Formats values for the tooltip and y-axis labels. Defaults to en-US toLocaleString per project convention. */
+  /** Formats values for the tooltip (full precision). Defaults to en-US toLocaleString per project convention. */
   valueFormatter?: (v: number) => string;
+  /** Formats values for the Y-axis labels specifically (compact, since axis width scales with label length). Defaults to K/M/G abbreviation. */
+  axisLabelFormatter?: (v: number) => string;
 }
 
 function defaultFormatter(v: number): string {
   return v.toLocaleString("en-US");
+}
+
+// FIX: Y-axis was reusing valueFormatter (full "1,200,000"-style numbers),
+// and with grid.containLabel:true that forced eCharts to reserve a wide
+// left margin to fit the longest label — the "thick Y-axis" look. Axis
+// labels now use a compact K/M/G formatter (matching the old SparkLine's
+// fmtV), while the tooltip keeps full-precision valueFormatter — you still
+// see the exact number on hover, just not crammed into the axis gutter.
+function defaultAxisFormatter(v: number): string {
+  const abs = Math.abs(v);
+  if (abs >= 1e9) return `${(v / 1e9).toFixed(1)}G`;
+  if (abs >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (abs >= 1e3) return `${(v / 1e3).toFixed(0)}K`;
+  return String(Math.round(v));
 }
 
 /** Reads theme CSS vars once at mount — see "Known limitation" in file header. */
@@ -75,7 +91,7 @@ function readThemeColors() {
   return { text, border };
 }
 
-export function TimeseriesChart({ points, color, height = 130, valueFormatter = defaultFormatter }: TimeseriesChartProps) {
+export function TimeseriesChart({ points, color, height = 130, valueFormatter = defaultFormatter, axisLabelFormatter = defaultAxisFormatter }: TimeseriesChartProps) {
   const [theme] = useState(readThemeColors); // resolved once on mount, see known limitation above
   const chartRef = useRef<ReactECharts | null>(null);
 
@@ -109,7 +125,7 @@ export function TimeseriesChart({ points, color, height = 130, valueFormatter = 
       type: "value",
       axisLine: { show: false },
       axisTick: { show: false },
-      axisLabel: { color: theme.text, fontSize: 9, fontFamily: "monospace", formatter: (v: number) => valueFormatter(v) },
+      axisLabel: { color: theme.text, fontSize: 9, fontFamily: "monospace", formatter: (v: number) => axisLabelFormatter(v) },
       splitLine: { lineStyle: { color: theme.border, type: "dashed" } },
     },
     tooltip: {

@@ -334,7 +334,15 @@ function BenchmarkPageInner() {
   },[]);
 
   const refreshBalance=useCallback(()=>{callWithDevice<Balance>("/api/benchmark/balance").then(setBalance).catch(()=>{});},[]);
-  useEffect(()=>{runDiagnose();refreshBalance();},[runDiagnose,refreshBalance]);
+  // FIX (bug #4a, wallet-verify handoff): previously fired unconditionally
+  // on mount, fetching operational/server-wallet internals (private key
+  // validity, server-funded balance) before the user had connected their
+  // own wallet. Gated on wallet.walletConnected — re-fires automatically if
+  // the user connects mid-session, since walletConnected is a dep.
+  useEffect(()=>{
+    if(!wallet.walletConnected)return;
+    runDiagnose();refreshBalance();
+  },[wallet.walletConnected,runDiagnose,refreshBalance]);
 
   const run=useCallback(async()=>{
     if(!diagnose?.ready){await runDiagnose();return;}
@@ -460,22 +468,38 @@ function BenchmarkPageInner() {
         </div>
       </div>
 
-      <DiagnosePanel result={diagnose} loading={diagLoad} onRecheck={runDiagnose}/>
+      {/* FIX (bug #4a): pre-flight checks + balance card show
+          operational/server-wallet internals, not the user's own wallet —
+          gated behind connection so pre-connection state reads as "connect
+          first" rather than misleadingly showing server internals as if
+          they were the user's wallet state. */}
+      {wallet.walletConnected ? (
+        <>
+          <DiagnosePanel result={diagnose} loading={diagLoad} onRecheck={runDiagnose}/>
 
-      {/* Wallet */}
-      <div className="card" style={{marginBottom:16}}>
-        <div className="card-body" style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:14}}>
-          <div style={{display:"flex",gap:20,flexWrap:"wrap"}}>
-            {[{label:"APT",value:balance?balance.apt.toFixed(4):"—",ok:(balance?.apt??0)>=0.1},{label:"ShelbyUSD",value:balance?balance.shelbyusd.toFixed(6):"—",ok:(balance?.shelbyusd??0)>=0.001},...(balance?.address?[{label:"Wallet",value:`${balance.address.slice(0,10)}…${balance.address.slice(-5)}`,ok:true}]:[])].map(({label,value,ok})=>(
-              <div key={label}><div style={{fontSize:10,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:"var(--gray-400)",marginBottom:3}}>{label}</div><div style={{fontFamily:"var(--font-mono)",fontSize:15,fontWeight:600,color:ok?"var(--gray-900)":"#dc2626"}}>{value}</div></div>
-            ))}
+          {/* Wallet */}
+          <div className="card" style={{marginBottom:16}}>
+            <div className="card-body" style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:14}}>
+              <div style={{display:"flex",gap:20,flexWrap:"wrap"}}>
+                {[{label:"APT",value:balance?balance.apt.toFixed(4):"—",ok:(balance?.apt??0)>=0.1},{label:"ShelbyUSD",value:balance?balance.shelbyusd.toFixed(6):"—",ok:(balance?.shelbyusd??0)>=0.001},...(balance?.address?[{label:"Wallet",value:`${balance.address.slice(0,10)}…${balance.address.slice(-5)}`,ok:true}]:[])].map(({label,value,ok})=>(
+                  <div key={label}><div style={{fontSize:10,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",color:"var(--gray-400)",marginBottom:3}}>{label}</div><div style={{fontFamily:"var(--font-mono)",fontSize:15,fontWeight:600,color:ok?"var(--gray-900)":"#dc2626"}}>{value}</div></div>
+                ))}
+              </div>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                <button onClick={requestFaucet} disabled={running} className="btn btn-secondary">↯ Faucet</button>
+                <a href="https://docs.shelby.xyz/sdks/typescript/fund-your-account" target="_blank" rel="noreferrer" className="btn btn-secondary" style={{background:"white"}}>Docs ↗</a>
+              </div>
+            </div>
           </div>
-          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-            <button onClick={requestFaucet} disabled={running} className="btn btn-secondary">↯ Faucet</button>
-            <a href="https://docs.shelby.xyz/sdks/typescript/fund-your-account" target="_blank" rel="noreferrer" className="btn btn-secondary" style={{background:"white"}}>Docs ↗</a>
+        </>
+      ) : (
+        <div className="card" style={{marginBottom:16}}>
+          <div className="card-body" style={{textAlign:"center",padding:"32px 16px",color:"var(--gray-400)"}}>
+            <p style={{margin:"0 0 12px",fontSize:13}}>Connect a wallet to run pre-flight checks and view balance.</p>
+            <ConnectWalletButton/>
           </div>
         </div>
-      </div>
+      )}
 
       {activeTab==="run"&&(
         <>

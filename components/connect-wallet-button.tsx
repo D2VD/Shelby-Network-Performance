@@ -8,6 +8,24 @@ export function ConnectWalletButton() {
   const { walletConnected, walletAddress, isVerified, verifying, error, connect, verify, disconnect, wallets } = useWalletSession();
   const [showPicker, setShowPicker] = useState(false);
 
+  // FIX (bug #3, wallet-verify handoff): AptosConnect auto-registers
+  // social-login "wallets" (e.g. name === "Continue with Google") alongside
+  // real self-custody wallets — confirmed naming convention per Petra's own
+  // docs (signIn({ walletName: "Continue with Google" })) and the Aptos
+  // Connect docs. These are excluded here because the backend's
+  // POST /wallet/verify assumes a standard Ed25519 self-custody account
+  // (pubKeyObj.authKey().derivedAddress()), which does not necessarily hold
+  // for a social-login/MPC-custodial account. Filtering by name rather than
+  // an internal type/standard field since that field's presence on this
+  // hook's wallet objects hasn't been confirmed — name is the one signal
+  // documented and guaranteed stable across the SDK.
+  // NOTE: a more robust upstream fix is passing optInWallets to
+  // AptosWalletAdapterProvider (wherever it's configured) so these never
+  // register in the first place — this filter is a defensive backstop here,
+  // not a replacement for that.
+  const isSocialLoginWallet = (name: string) => name.toLowerCase().startsWith("continue with");
+  const selfCustodyWallets = wallets?.filter((w: any) => !isSocialLoginWallet(w.name));
+
   if (walletConnected && isVerified) {
     return (
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -38,7 +56,7 @@ export function ConnectWalletButton() {
       </button>
       {showPicker && (
         <div style={{ position: "absolute", top: "110%", right: 0, background: "#fff", border: "1px solid var(--gray-200)", borderRadius: 8, padding: 6, zIndex: 20, minWidth: 170, boxShadow: "0 4px 16px rgba(0,0,0,0.08)" }}>
-          {wallets?.map((w: any) => (
+          {selfCustodyWallets?.map((w: any) => (
             <button
               key={w.name}
               onClick={() => { connect(w.name); setShowPicker(false); }}
@@ -50,7 +68,7 @@ export function ConnectWalletButton() {
               {w.name}
             </button>
           ))}
-          {(!wallets || wallets.length === 0) && (
+          {(!selfCustodyWallets || selfCustodyWallets.length === 0) && (
             <div style={{ padding: "8px 10px", fontSize: 12, color: "var(--gray-400)" }}>No wallets detected — install Petra or another Aptos wallet extension</div>
           )}
         </div>

@@ -21,8 +21,14 @@ const ALL_VPS_URLS = [
 export const VPS_API_URL = ALL_VPS_URLS[0] ?? "http://localhost:3000";
 
 // ── Generic VPS proxy helper ──────────────────────────────────────────────────
+// FIX 2026-08-03: _req was accepted but never read — every header off the
+// incoming request, including x-wallet-session, was silently dropped. That
+// meant any route relying on getVerifiedWallet(c) downstream on the VPS
+// (POST /results, GET /results/mine) would always 401 even with a valid
+// session token from POST /wallet/verify, because the token had nowhere to
+// go. Now forwarded explicitly.
 export async function proxyToVPS(
-  _req: NextRequest,
+  req: NextRequest,
   vpsPath: string,
   method: "GET" | "POST" = "GET",
   body?: object,
@@ -39,6 +45,11 @@ export async function proxyToVPS(
     );
   }
 
+  const headers: Record<string, string> = {};
+  if (method === "POST") headers["Content-Type"] = "application/json";
+  const walletSession = req.headers.get("x-wallet-session");
+  if (walletSession) headers["x-wallet-session"] = walletSession;
+
   let lastError = "";
 
   for (const vpsUrl of ALL_VPS_URLS) {
@@ -49,9 +60,9 @@ export async function proxyToVPS(
 
       const res = await fetch(url, {
         method,
-        headers: method === "POST" ? { "Content-Type": "application/json" } : undefined,
-        body:    method === "POST" ? JSON.stringify(body ?? {}) : undefined,
-        signal:  controller.signal,
+        headers,
+        body:   method === "POST" ? JSON.stringify(body ?? {}) : undefined,
+        signal: controller.signal,
       });
 
       clearTimeout(timer);

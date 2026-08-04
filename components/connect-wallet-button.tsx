@@ -55,16 +55,16 @@ export function ConnectWalletButton() {
         ◎ Connect wallet
       </button>
       {showPicker && (
-        <div style={{ position: "absolute", top: "110%", right: 0, background: "#fff", border: "1px solid var(--gray-200)", borderRadius: 8, padding: 6, zIndex: 20, minWidth: 170, boxShadow: "0 4px 16px rgba(0,0,0,0.08)" }}>
+        <div style={{ position: "absolute", top: "110%", right: 0, background: "#fff", border: "1px solid var(--gray-200)", borderRadius: 8, padding: 6, zIndex: 20, minWidth: 190, boxShadow: "0 4px 16px rgba(0,0,0,0.08)" }}>
           {selfCustodyWallets?.map((w: any) => (
             <button
               key={w.name}
               onClick={() => { connect(w.name); setShowPicker(false); }}
-              style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "8px 10px", border: "none", background: "transparent", cursor: "pointer", borderRadius: 6, fontSize: 13, textAlign: "left" }}
+              style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "10px 12px", border: "none", background: "transparent", cursor: "pointer", borderRadius: 6, fontSize: 14, fontWeight: 500, textAlign: "left" }}
               onMouseEnter={e => (e.currentTarget.style.background = "#f9fafb")}
               onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
             >
-              {w.icon && <img src={w.icon} alt="" width={18} height={18} />}
+              {w.icon && <img src={w.icon} alt="" width={22} height={22} />}
               {w.name}
             </button>
           ))}

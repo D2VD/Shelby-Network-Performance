@@ -50,7 +50,7 @@ export function ConnectWalletButton() {
   }
 
   return (
-    <div style={{ position: "relative" }}>
+    <div style={{ position: "relative", display: "inline-block" }}>
       <button onClick={() => setShowPicker(v => !v)} className="btn btn-primary" style={{ fontSize: 12 }}>
         ◎ Connect wallet
       </button>

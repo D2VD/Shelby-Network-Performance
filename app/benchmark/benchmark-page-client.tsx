@@ -156,7 +156,6 @@ function TxHashCell({hash,network}:{hash:string|null;network:string}) {
 
 function DiagnosePanel({result,loading,onRecheck}:{result:DiagnoseResult|null;loading:boolean;onRecheck:()=>void}) {
   const [expanded,setExpanded]=useState(false);
-  const allPassed=result?.ready&&!loading;
   const icon:Record<string,string>={pass:"✓",fail:"✗",warn:"⚠"};
   const color:Record<string,string>={pass:"#16a34a",fail:"#ef4444",warn:"#f59e0b"};
   const bg:Record<string,string>={pass:"#f0fdf4",fail:"#fef2f2",warn:"#fffbeb"};
@@ -178,7 +177,15 @@ function DiagnosePanel({result,loading,onRecheck}:{result:DiagnoseResult|null;lo
         </div>
       </div>
       {loading&&!result&&<div className="card-body" style={{paddingTop:0}}><div className="skeleton" style={{height:100,borderRadius:6}}/></div>}
-      {result?.checks&&(expanded||!allPassed)&&(
+      {/* FIX 2026-08-06: was `expanded||!allPassed` — since !allPassed is
+          true whenever ANY check fails (which is currently always true due
+          to the unresolved blobs_aggregate/bug #2 SDK error), the panel body
+          rendered regardless of `expanded`, making the Hide/Details button
+          visually toggle its own label but have no effect on what's shown.
+          The useEffect above already auto-expands on a failing result, so
+          the render condition only needs `expanded` — the user's manual
+          Hide click will now actually stick. */}
+      {result?.checks&&expanded&&(
         <div className="card-body" style={{padding:"4px 20px 16px"}}>
           <div style={{display:"flex",flexDirection:"column",gap:5}}>
             {result.checks.map((c,i)=>(

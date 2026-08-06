@@ -495,8 +495,7 @@ function BenchmarkPageInner() {
       ) : (
         <div className="card" style={{marginBottom:16}}>
           <div className="card-body" style={{textAlign:"center",padding:"32px 16px",color:"var(--gray-400)"}}>
-            <p style={{margin:"0 0 12px",fontSize:13}}>Connect a wallet to run pre-flight checks and view balance.</p>
-            <ConnectWalletButton/>
+            <p style={{margin:0,fontSize:13}}>Connect a wallet (top right) to run pre-flight checks and view balance.</p>
           </div>
         </div>
       )}
@@ -590,8 +589,7 @@ function BenchmarkPageInner() {
         wallet.isVerified
           ? <HistoryTable displayHistory={displayHistory} totalCount={totalHistoryCount}/>
           : <div className="card"><div className="card-body" style={{textAlign:"center",padding:"32px 16px",color:"var(--gray-400)"}}>
-              <p style={{margin:"0 0 12px",fontSize:13}}>Connect and verify a wallet to see your benchmark history.</p>
-              <ConnectWalletButton/>
+              <p style={{margin:0,fontSize:13}}>Connect and verify a wallet (top right) to see your benchmark history.</p>
             </div></div>
       )}
     </div>

@@ -509,20 +509,20 @@ function TimeseriesTab({ network, isTestnet, accentColor }: { network:string; is
   const avgBlobSizePoints = toPoints(avgKB);
   const lastAvgKB = last ? avgKB(last) : 0;
 
-  const ChartCard = ({ title, sub, latest, latestColor, points, color, h = 130 }: {
-    title:string; sub:string; latest:string; latestColor:string; points:TsChartPoint[]; color:string; h?:number;
-  }) => (
-    <div style={{ background:"var(--bg-card)", border:"1px solid var(--border)", borderRadius:14, padding:"16px 20px" }}>
-      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
-        <div>
-          <div style={{ fontSize:13, fontWeight:700, color:"var(--text-primary)" }}>{title}</div>
-          <div style={{ fontSize:11, color:"var(--text-muted)" }}>{sub}</div>
-        </div>
-        <div style={{ fontFamily:"monospace", fontSize:15, fontWeight:700, color:latestColor }}>{latest}</div>
+  const ChartCard = ({ title, sub, latest, latestColor, points, color, h = 130, range }: {
+  title: string; sub: string; latest: string; latestColor: string; points: TsChartPoint[]; color: string; h?: number; range?: TimeRange;
+}) => (
+  <div style={{ background:"var(--bg-card)", border:"1px solid var(--border)", borderRadius:14, padding:"16px 20px" }}>
+    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
+      <div>
+        <div style={{ fontSize:13, fontWeight:700, color:"var(--text-primary)" }}>{title}</div>
+        <div style={{ fontSize:11, color:"var(--text-muted)" }}>{sub}</div>
       </div>
-      <TimeseriesChart points={points} color={color} height={h} />
+      <div style={{ fontFamily:"monospace", fontSize:15, fontWeight:700, color:latestColor }}>{latest}</div>
     </div>
-  );
+    <TimeseriesChart points={points} color={color} height={h} range={range} />
+  </div>
+);
 
   return (
     <div>
@@ -535,8 +535,8 @@ function TimeseriesTab({ network, isTestnet, accentColor }: { network:string; is
       {/* Section: Blob Analytics */}
       <div style={{ fontSize:12, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.08em", color:"var(--text-muted)", marginBottom:12 }}>Blob Analytics</div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginBottom:14 }}>
-        <ChartCard title="Active Blobs" sub={`${range} window`} latest={fmt(last?.activeBlobs)} latestColor="#22c55e" points={toPoints(p=>p.activeBlobs)} color="#22c55e" />
-        <ChartCard title="Blob Events" sub="blob_activities count" latest={fmt(last?.totalBlobEvents)} latestColor="#f59e0b" points={toPoints(p=>p.totalBlobEvents)} color="#f59e0b" />
+        <ChartCard title="Active Blobs" sub={`${range} window`} latest={fmt(last?.activeBlobs)} latestColor="#22c55e" points={toPoints(p=>p.activeBlobs)} color="#22c55e" range={range} />
+        <ChartCard title="Blob Events" sub="blob_activities count" latest={fmt(last?.totalBlobEvents)} latestColor="#f59e0b" points={toPoints(p=>p.totalBlobEvents)} color="#f59e0b" range={range} />
       </div>
       {/* Pending + Deleted — full width */}
       <div style={{ background:"var(--bg-card)", border:"1px solid var(--border)", borderRadius:14, padding:"16px 20px", marginBottom:20 }}>
@@ -554,11 +554,11 @@ function TimeseriesTab({ network, isTestnet, accentColor }: { network:string; is
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
           <div>
             <div style={{ fontSize:10, color:"var(--text-dim)", marginBottom:4 }}>Pending</div>
-            <TimeseriesChart points={toPoints(p=>p.pendingOrFailed)} color="#f59e0b" height={80} />
+            <TimeseriesChart points={toPoints(p=>p.pendingOrFailed)} color="#f59e0b" height={80} range={range} />
           </div>
           <div>
             <div style={{ fontSize:10, color:"var(--text-dim)", marginBottom:4 }}>Deleted</div>
-            <TimeseriesChart points={toPoints(p=>p.deletedBlobs)} color="#ef4444" height={80} />
+            <TimeseriesChart points={toPoints(p=>p.deletedBlobs)} color="#ef4444" height={80} range={range} />
           </div>
         </div>
       </div>
@@ -566,7 +566,7 @@ function TimeseriesTab({ network, isTestnet, accentColor }: { network:string; is
       {/* Section: Storage Analytics */}
       <div style={{ fontSize:12, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.08em", color:"var(--text-muted)", marginBottom:12 }}>Storage Analytics</div>
       <div style={{ display:"grid", gridTemplateColumns:"2fr 1fr", gap:14, marginBottom:14 }}>
-        <ChartCard title="Storage Used (GB)" sub="Active blobs only" latest={`${(last?.totalStorageGB??0).toFixed(2)} GB`} latestColor="#9333ea" points={toPoints(p=>p.totalStorageGB)} color="#9333ea" />
+        <ChartCard title="Storage Used (GB)" sub="Active blobs only" latest={`${(last?.totalStorageGB??0).toFixed(2)} GB`} latestColor="#9333ea" points={toPoints(p=>p.totalStorageGB)} color="#9333ea" range={range} />
         <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
           {[
             { label:"Total Storage",  val:`${(last?.totalStorageGB??0).toFixed(2)} GB`, color:"#9333ea" },
@@ -591,7 +591,7 @@ function TimeseriesTab({ network, isTestnet, accentColor }: { network:string; is
             {lastAvgKB>0?(lastAvgKB>=1024?`${(lastAvgKB/1024).toFixed(1)} MB`:`${lastAvgKB.toFixed(0)} KB`):"—"}
           </div>
         </div>
-        <TimeseriesChart points={avgBlobSizePoints} color={accentColor} height={110} />
+        <TimeseriesChart points={avgBlobSizePoints} color={accentColor} height={110} range={range} />
       </div>
 
       {/* Block Height */}
@@ -601,11 +601,11 @@ function TimeseriesTab({ network, isTestnet, accentColor }: { network:string; is
         latest={last?.blockHeight ? `#${last.blockHeight.toLocaleString("en-US")}` : "—"}
         latestColor={accentColor}
         points={toPoints(p=>p.blockHeight)} color={accentColor}
+        range={range}
       />
     </div>
   );
 }
-
 // ─── Epoch Tab — FIXED: uses new EpochData shape ─────────────────────────────
 function EpochTab({ network }: { network: string }) {
   const [epoch, setEpoch] = useState<EpochData | null>(null);

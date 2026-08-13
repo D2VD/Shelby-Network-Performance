@@ -1,7 +1,43 @@
-// app/api/network/epoch/route.ts — v1.0
+// app/api/network/epoch/route.ts — v1.1
 // Fetches epoch data directly from Aptos Node REST API (no VPS hop).
 // Supports both Shelbynet and Testnet.
 // Security: input validated, internal errors never exposed to client.
+//
+// CHANGES v1.1 (post shelbynet wipe schema change, confirmed live 2026-08):
+//   - Resource `config::ShelbyConfig` renamed on-chain to
+//     `config::ShelbyProtocolConfig`. Field names inside it (audit/payment/
+//     staking_epoch_duration) are UNCHANGED — only the resource type name
+//     moved. Confirmed via direct fetch: durations still read
+//     3_600_000_000 / 86_400_000_000 / 604_800_000_000 microseconds
+//     (1h/24h/7d), matching DEFAULT_DURATIONS exactly.
+//   - epoch::Epoch resource no longer exposes *_epoch_start_times as
+//     SortedVectorMap `{entries: [...]}` history structures. Replaced with
+//     flat scalar fields:
+//       current_audit_epoch_start_time    (direct, like before but singular)
+//       current_staking_epoch_start_time  (direct, same)
+//       payment_epoch_genesis_start       (NEW — epoch 0's start only;
+//         there is no current_payment_epoch_start_time field at all)
+//     Payment epoch's current start is therefore now COMPUTED:
+//       genesis + (current_payment_epoch * payment_epoch_duration)
+//     Verified independently: for live data (genesis=1785369688863243,
+//     current_payment_epoch=14, duration=86400000000), this computation
+//     produces 1786579288863243 — which exactly matches the live
+//     current_staking_epoch_start_time (14 payment days == 2 staking
+//     weeks, so the two boundaries coincide). That match is a strong
+//     correctness signal for the formula, not a coincidence to be
+//     suspicious of.
+//   - buildHistory() is REMOVED. The on-chain source data it depended on
+//     (per-epoch history entries) no longer exists in this resource at
+//     all — not renamed, genuinely gone. `history` is now always returned
+//     as an empty array. The frontend's existing `data.history.length > 0`
+//     guard (EpochPanel-style components) already handles an empty array
+//     gracefully — no frontend change required for this specifically, the
+//     "History" section will just not render, which is honest given we
+//     have no real history data anymore. If historical epoch timelines are
+//     wanted again later, they'd need to come from a different source
+//     (e.g. reconstructing from TimescaleDB epoch_snapshots, which this
+//     project already has a schema for) — not from this Node REST
+//     resource, since the data isn't there anymore.
 
 import { type NextRequest, NextResponse } from "next/server";
 
@@ -14,7 +50,10 @@ const NODE_URLS: Record<string, string> = {
   testnet:   "https://api.testnet.aptoslabs.com/v1",
 };
 
-// Epoch durations in microseconds — on-chain defaults from ShelbyConfig
+// Epoch durations in microseconds — on-chain defaults from ShelbyProtocolConfig.
+// Confirmed live 2026-08: values unchanged from pre-wipe (1h/24h/7d), only
+// the resource type name changed. Kept as fallback in case the config
+// resource is ever briefly unavailable (e.g. node syncing).
 const DEFAULT_DURATIONS = {
   audit:   3_600_000_000n,    // 1 hour
   payment: 86_400_000_000n,   // 24 hours
@@ -26,12 +65,6 @@ function validateNetwork(raw: string | null): string | null {
   if (!raw) return "shelbynet";
   const clean = raw.toLowerCase().trim();
   return ["shelbynet", "testnet"].includes(clean) ? clean : null;
-}
-
-// Extract the latest (highest-key) entry from a SortedVectorMap entries array
-function latestEntry(entries: Array<{ key: string; value: string }>): bigint {
-  if (!Array.isArray(entries) || entries.length === 0) return 0n;
-  return BigInt(entries[entries.length - 1].value ?? "0");
 }
 
 function computeCountdown(startMicros: bigint, durationMicros: bigint, nowMs: number) {
@@ -53,21 +86,6 @@ function computeCountdown(startMicros: bigint, durationMicros: bigint, nowMs: nu
   };
 }
 
-function buildHistory(
-  entries: Array<{ key: string; value: string }>,
-  durationMicros: bigint,
-  limit = 10
-) {
-  return [...entries]
-    .slice(-limit)
-    .reverse()
-    .map(e => {
-      const startMs = Number(BigInt(e.value) / 1000n);
-      const endMs   = Number((BigInt(e.value) + durationMicros) / 1000n);
-      return { epoch: Number(e.key), started_at: startMs, ended_at: endMs };
-    });
-}
-
 export async function GET(req: NextRequest): Promise<NextResponse> {
   const network = validateNetwork(req.nextUrl.searchParams.get("network"));
   if (!network) {
@@ -87,44 +105,45 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
 
-    // Fetch Epoch resource and ShelbyConfig in parallel
+    // Fetch Epoch resource and ShelbyProtocolConfig (renamed from
+    // ShelbyConfig, see header comment) in parallel.
     const [epochRes, configRes] = await Promise.allSettled([
       fetch(`${nodeUrl}/accounts/${CORE}/resource/${CORE}::epoch::Epoch`,
         { headers, signal: controller.signal }),
-      fetch(`${nodeUrl}/accounts/${CORE}/resource/${CORE}::config::ShelbyConfig`,
+      fetch(`${nodeUrl}/accounts/${CORE}/resource/${CORE}::config::ShelbyProtocolConfig`,
         { headers, signal: controller.signal }),
     ]);
 
     clearTimeout(timer);
 
-    // Parse Epoch data
-    type EpochEntries = Array<{ key: string; value: string }>;
+    // Parse Epoch data — flat scalar fields, confirmed live 2026-08.
+    // NOTE: no *_epoch_start_times history maps anymore, and no direct
+    // current_payment_epoch_start_time field — see header comment.
     interface EpochResource {
-      current_audit_epoch:   string;
-      current_payment_epoch: string;
-      current_staking_epoch: string;
-      audit_epoch_start_times:   { entries: EpochEntries };
-      payment_epoch_start_times: { entries: EpochEntries };
-      staking_epoch_start_times: { entries: EpochEntries };
+      current_audit_epoch:            string;
+      current_audit_epoch_start_time: string;
+      current_payment_epoch:          string;
+      current_staking_epoch:          string;
+      current_staking_epoch_start_time: string;
+      payment_epoch_genesis_start:    string;
     }
-    interface ShelbyConfig {
+    interface ShelbyProtocolConfig {
       audit_epoch_duration:   string;
       payment_epoch_duration: string;
       staking_epoch_duration: string;
-      min_active_storage_providers_for_active_pg: string;
-      max_placement_groups: string;
-      num_slots_per_pg:     string;
+      // staking: { max_stake: string; min_stake: string } — present on-chain,
+      // not needed by this route, intentionally not typed/used here.
     }
 
     let epochData: EpochResource | null = null;
-    let configData: ShelbyConfig | null = null;
+    let configData: ShelbyProtocolConfig | null = null;
 
     if (epochRes.status === "fulfilled" && epochRes.value.ok) {
       const j = await epochRes.value.json() as { data?: EpochResource };
       epochData = j.data ?? null;
     }
     if (configRes.status === "fulfilled" && configRes.value.ok) {
-      const j = await configRes.value.json() as { data?: ShelbyConfig };
+      const j = await configRes.value.json() as { data?: ShelbyProtocolConfig };
       configData = j.data ?? null;
     }
 
@@ -141,10 +160,20 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       staking: BigInt(configData?.staking_epoch_duration ?? String(DEFAULT_DURATIONS.staking)),
     };
 
-    const auditStart   = latestEntry(epochData.audit_epoch_start_times?.entries   ?? []);
-    const paymentStart = latestEntry(epochData.payment_epoch_start_times?.entries ?? []);
-    const stakingStart = latestEntry(epochData.staking_epoch_start_times?.entries ?? []);
-    const nowMs        = Date.now();
+    const nowMs = Date.now();
+
+    // Audit and staking still expose their current epoch's start directly.
+    const auditStart   = BigInt(epochData.current_audit_epoch_start_time   ?? "0");
+    const stakingStart = BigInt(epochData.current_staking_epoch_start_time ?? "0");
+
+    // Payment no longer has a direct current-start field — compute it from
+    // genesis + (current epoch number * duration). See header comment for
+    // the verified sanity check on this formula against live data.
+    const paymentGenesis    = BigInt(epochData.payment_epoch_genesis_start ?? "0");
+    const currentPaymentNum = BigInt(epochData.current_payment_epoch ?? "0");
+    const paymentStart      = paymentGenesis > 0n
+      ? paymentGenesis + currentPaymentNum * durations.payment
+      : 0n; // no genesis available — computeCountdown's zero-guard handles this safely
 
     return NextResponse.json(
       {
@@ -158,22 +187,35 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
           audit: {
             duration_ms: Number(durations.audit   / 1000n),
             countdown:   computeCountdown(auditStart,   durations.audit,   nowMs),
-            history:     buildHistory(epochData.audit_epoch_start_times?.entries   ?? [], durations.audit),
+            // History timeline data no longer exists in this on-chain
+            // resource — see header comment. Always empty until/unless a
+            // different data source (e.g. TimescaleDB epoch_snapshots) is
+            // wired in to replace this.
+            history:     [] as Array<{ epoch: number; started_at: number; ended_at: number }>,
           },
           payment: {
             duration_ms: Number(durations.payment / 1000n),
             countdown:   computeCountdown(paymentStart, durations.payment, nowMs),
-            history:     buildHistory(epochData.payment_epoch_start_times?.entries ?? [], durations.payment),
+            history:     [] as Array<{ epoch: number; started_at: number; ended_at: number }>,
           },
           staking: {
             duration_ms: Number(durations.staking / 1000n),
             countdown:   computeCountdown(stakingStart, durations.staking, nowMs),
-            history:     buildHistory(epochData.staking_epoch_start_times?.entries ?? [], durations.staking, 5),
+            history:     [] as Array<{ epoch: number; started_at: number; ended_at: number }>,
           },
           config: configData ? {
-            min_sps_for_active_pg: Number(configData.min_active_storage_providers_for_active_pg),
-            max_placement_groups:  Number(configData.max_placement_groups),
-            num_slots_per_pg:      Number(configData.num_slots_per_pg),
+            // min_active_storage_providers_for_active_pg / max_placement_groups /
+            // num_slots_per_pg were on the OLD ShelbyConfig resource and were
+            // not observed on the new ShelbyProtocolConfig resource in the
+            // live fetch this session (only audit/payment/staking durations
+            // and a nested `staking: {max_stake, min_stake}` were present).
+            // Returning null here rather than guessing these moved somewhere
+            // else — if the frontend actually renders these values anywhere,
+            // that display will need its own follow-up investigation to find
+            // where these three fields now live (if they still exist at all).
+            min_sps_for_active_pg: null,
+            max_placement_groups:  null,
+            num_slots_per_pg:      null,
           } : null,
         },
       },

@@ -659,13 +659,21 @@ function EpochTab({ network }: { network: string }) {
       {epoch.config && (
         <div style={{ marginTop:14, display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10 }}>
           {[
-            { label:"Min SPs for Active PG", value:String(epoch.config.min_sps_for_active_pg) },
-            { label:"Max Placement Groups",  value:String(epoch.config.max_placement_groups) },
-            { label:"Slots per PG",          value:String(epoch.config.num_slots_per_pg) },
+            { label:"Min SPs for Active PG", value: epoch.config.min_sps_for_active_pg },
+            { label:"Max Placement Groups",  value: epoch.config.max_placement_groups },
+            { label:"Slots per PG",          value: epoch.config.num_slots_per_pg },
           ].map(({ label, value }) => (
             <div key={label} style={{ background:"var(--bg-card2)", border:"1px solid var(--border)", borderRadius:10, padding:"10px 14px", textAlign:"center" }}>
               <div style={{ fontSize:10, color:"var(--text-dim)", textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:3 }}>{label}</div>
-              <div style={{ fontSize:18, fontWeight:700, fontFamily:"monospace", color:"var(--text-primary)" }}>{value}</div>
+              <div style={{
+                fontSize: value == null ? 12 : 18,
+                fontWeight: value == null ? 500 : 700,
+                fontFamily: value == null ? "inherit" : "monospace",
+                fontStyle: value == null ? "italic" : "normal",
+                color: value == null ? "var(--text-dim)" : "var(--text-primary)",
+              }}>
+                {value == null ? "Not publicly available" : String(value)}
+              </div>
             </div>
           ))}
         </div>

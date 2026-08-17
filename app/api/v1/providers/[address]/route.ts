@@ -1,5 +1,5 @@
-// app/api/v1/providers/route.ts
-// Proxies to backend GET /api/v1/providers?network=&status=&az=&limit=&offset=
+// app/api/v1/providers/[address]/route.ts
+// Proxies to backend GET /api/v1/providers/:address?network=
 
 import { NextRequest, NextResponse } from "next/server";
 
@@ -7,7 +7,10 @@ export const runtime = "edge";
 
 const VPS_URL = process.env.SHELBY_API_URL;
 
-export async function GET(req: NextRequest): Promise<NextResponse> {
+export async function GET(
+  req: NextRequest,
+  { params }: { params: { address: string } }
+): Promise<NextResponse> {
   if (!VPS_URL) {
     return NextResponse.json({ error: "VPS not configured" }, { status: 503 });
   }
@@ -16,7 +19,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
   let upstream: Response;
   try {
-    upstream = await fetch(`${VPS_URL}/api/v1/providers?${qs}`, {
+    upstream = await fetch(`${VPS_URL}/api/v1/providers/${params.address}?${qs}`, {
       next: { revalidate: 0 },
     });
   } catch {

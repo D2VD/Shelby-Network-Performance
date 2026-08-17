@@ -9,17 +9,18 @@ const VPS_URL = process.env.SHELBY_API_URL;
 
 export async function GET(
   req: NextRequest,
-  { params }: { params: { address: string } }
+  { params }: { params: Promise<{ address: string }> }
 ): Promise<NextResponse> {
   if (!VPS_URL) {
     return NextResponse.json({ error: "VPS not configured" }, { status: 503 });
   }
 
+  const { address } = await params;
   const qs = req.nextUrl.searchParams.toString();
 
   let upstream: Response;
   try {
-    upstream = await fetch(`${VPS_URL}/api/v1/providers/${params.address}/history?${qs}`, {
+    upstream = await fetch(`${VPS_URL}/api/v1/providers/${address}/history?${qs}`, {
       next: { revalidate: 0 },
     });
   } catch {

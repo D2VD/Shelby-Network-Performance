@@ -32,4 +32,33 @@ import { Callout } from 'nextra/components';
 | `from` | ISO timestamp | |
 | `to` | ISO timestamp | |
 
+{/* ── /v1/export/sp-history ───────────────────────────────────────────── */}
+{/* `address` is a required QUERY param here, not a path segment — confirmed
+   via live test: omitting it returns {"error":"address query param is required"}. */}
+ 
+<ApiPlayground
+  method="GET"
+  path="/v1/export/sp-history"
+  description="Export a single provider's history. `address` is required."
+  params={[
+    { name: "address", type: "text", required: true, placeholder: "0x1e17b3abf249e2f5d0a4b89efb5a7ad7bb9727f226668440d8fcafbb3ee8d0d4" },
+    { name: "network", type: "select", default: "shelbynet", options: ["shelbynet", "testnet", "mainnet"] },
+    { name: "from", type: "text", placeholder: "ISO timestamp, optional" },
+    { name: "to", type: "text", placeholder: "ISO timestamp, optional" },
+  ]}
+/>
+ 
+{/* ── /v1/activity/stream ─────────────────────────────────────────────── */}
+{/* SSE endpoint — uses the separate stream-specific component, not ApiPlayground. */}
+ 
+import { ApiStreamPlayground } from "../../components/ApiStreamPlayground";
+ 
+<ApiStreamPlayground
+  path="/v1/activity/stream"
+  description="Live event feed: new blobs registered, SP join/leave, epoch transitions, PG status changes."
+  params={[
+    { name: "network", type: "select", required: true, default: "shelbynet", options: ["shelbynet", "testnet", "mainnet"] },
+  ]}
+/>
+
 **Response**: CSV file download.

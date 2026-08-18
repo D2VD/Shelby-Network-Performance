@@ -85,3 +85,64 @@ Health history for a single provider.
 ```json
 { "history": [{ "time": "2026-07-30T00:00:00Z", "health": "Healthy", "condition": 0 }] }
 ```
+{/* ── /v1/providers ────────────────────────────────────────────────────── */}
+ 
+<ApiPlayground
+  method="GET"
+  path="/v1/providers"
+  description="List storage providers."
+  params={[
+    { name: "network", type: "select", required: true, default: "shelbynet", options: ["shelbynet", "testnet", "mainnet"] },
+    { name: "status", type: "select", default: "active", options: ["active", "waitlisted", "all"] },
+    { name: "az", type: "text", placeholder: "e.g. dc_australia" },
+    { name: "limit", type: "number", default: "50" },
+    { name: "offset", type: "number", default: "0" },
+  ]}
+/>
+ 
+{/* ── /v1/providers/leaderboard ────────────────────────────────────────── */}
+{/* NOTE: verify the exact accepted `sort` values against the live route —
+   observed default is "score"; roadmap doc separately lists
+   reputation|uptime|stake, which may or may not match current source. */}
+ 
+<ApiPlayground
+  method="GET"
+  path="/v1/providers/leaderboard"
+  description="Ranked SP leaderboard."
+  params={[
+    { name: "network", type: "select", required: true, default: "shelbynet", options: ["shelbynet", "testnet", "mainnet"] },
+    { name: "sort", type: "select", default: "score", options: ["score", "reputation", "uptime", "stake"] },
+    { name: "limit", type: "number", default: "20" },
+  ]}
+/>
+ 
+{/* ── /v1/providers/{address} ─────────────────────────────────────────── */}
+ 
+<ApiPlayground
+  method="GET"
+  path="/v1/providers/{address}"
+  description="Single provider detail. Use a real address from the leaderboard response above — post-wipe shelbynet addresses differ from any older testnet examples."
+  pathParams={[
+    { name: "address", placeholder: "0x1e17b3abf249e2f5d0a4b89efb5a7ad7bb9727f226668440d8fcafbb3ee8d0d4" },
+  ]}
+  params={[
+    { name: "network", type: "select", required: true, default: "shelbynet", options: ["shelbynet", "testnet", "mainnet"] },
+  ]}
+/>
+ 
+{/* ── /v1/providers/{address}/history ─────────────────────────────────── */}
+ 
+<ApiPlayground
+  method="GET"
+  path="/v1/providers/{address}/history"
+  description="Health/condition history for a single provider over time."
+  pathParams={[
+    { name: "address", placeholder: "0x1e17b3abf249e2f5d0a4b89efb5a7ad7bb9727f226668440d8fcafbb3ee8d0d4" },
+  ]}
+  params={[
+    { name: "network", type: "select", required: true, default: "shelbynet", options: ["shelbynet", "testnet", "mainnet"] },
+    { name: "from", type: "text", placeholder: "ISO timestamp, optional" },
+    { name: "to", type: "text", placeholder: "ISO timestamp, optional" },
+    { name: "resolution", type: "select", default: "1h", options: ["5m", "1h"] },
+  ]}
+/>

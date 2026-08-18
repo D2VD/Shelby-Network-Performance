@@ -25,5 +25,32 @@ Current epoch state across all three epoch types (audit, payment, staking) plus 
   "stakingHistory": []
 }
 ```
+{/* ── /v1/epoch ────────────────────────────────────────────────────────── */}
+ 
+<ApiPlayground
+  method="GET"
+  path="/v1/epoch"
+  description="Current audit/payment/staking epoch numbers, start times, and countdowns."
+  params={[
+    { name: "network", type: "select", required: true, default: "shelbynet", options: ["shelbynet", "testnet", "mainnet"] },
+  ]}
+/>
+ 
+{/* ── /v1/export/snapshots ─────────────────────────────────────────────── */}
+{/* Rate limited server-side (1/hour on free tier) — the playground will
+   surface a 429 body directly if the visitor (or others sharing the IP)
+   has already used their hourly export today. */}
+ 
+<ApiPlayground
+  method="GET"
+  path="/v1/export/snapshots"
+  description="Bulk export of network snapshots. Rate limited: 1 export/hour on the free tier."
+  params={[
+    { name: "network", type: "select", default: "shelbynet", options: ["shelbynet", "testnet", "mainnet"] },
+    { name: "from", type: "text", placeholder: "ISO timestamp, optional" },
+    { name: "to", type: "text", placeholder: "ISO timestamp, optional" },
+    { name: "format", type: "select", default: "json", options: ["json", "csv"] },
+  ]}
+/>
 
 Epoch cycle lengths: audit ~1 hour, payment ~24 hours, staking ~7 days.

@@ -41,6 +41,20 @@ Historical network stats, bucketed.
 | `resolution` | `5m \| 1h \| 1d` | Bucket size |
 | `range` | `1h \| 24h \| 7d \| 30d \| 1y` | Lookback window |
 
+
+{/* ── /v1/network/stats/timeseries ────────────────────────────────────── */}
+ 
+<ApiPlayground
+  method="GET"
+  path="/v1/network/stats/timeseries"
+  description="Historical network stats. Resolution/range combos are capped server-side (e.g. 5m resolution maxes out at a 7d range)."
+  params={[
+    { name: "network", type: "select", required: true, default: "shelbynet", options: ["shelbynet", "testnet", "mainnet"] },
+    { name: "resolution", type: "select", default: "5m", options: ["5m", "1h"] },
+    { name: "range", type: "select", default: "1h", options: ["1h", "24h", "7d", "30d"] },
+  ]}
+/>
+
 **Response**
 
 ```json

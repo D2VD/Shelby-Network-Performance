@@ -65,6 +65,15 @@ const nextConfig = {
         ],
       },
       { source: "/_next/static/(.*)", headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }] },
+        {
+        source: "/api/v1/:path*",
+        headers: [
+          { key: "Access-Control-Allow-Origin", value: "*" },
+          { key: "Access-Control-Allow-Methods", value: "GET, OPTIONS" },
+          { key: "Access-Control-Allow-Headers", value: "Content-Type" },
+        ],
+      },
+    { source: "/_next/static/(.*)", headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }] },
       { source: "/geo/(.*)",          headers: [{ key: "Cache-Control", value: "public, max-age=604800" }] },
       { source: "/api/network/stats", headers: [{ key: "Cache-Control", value: "public, max-age=15, stale-while-revalidate=60" }] },
       { source: "/api/network/providers", headers: [{ key: "Cache-Control", value: "public, max-age=60, stale-while-revalidate=300" }] },

@@ -24,9 +24,10 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     upstream = await fetch(`${VPS_URL}/api/v1/export/sp-history?${qs}`, {
       cache: "no-store",
     });
-  } catch {
-    return NextResponse.json({ error: "Could not reach export service" }, { status: 502 });
-  }
+  } catch (err) {
+  console.error(`[export proxy] fetch to Server failed:`, err instanceof Error ? err.message : String(err));
+  return NextResponse.json({ error: "Could not reach API service" }, { status: 502 });
+}
 
   if (upstream.status === 429) {
     return NextResponse.json(

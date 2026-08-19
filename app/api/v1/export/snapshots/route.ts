@@ -18,8 +18,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   let upstream: Response;
   try {
     upstream = await fetch(`${VPS_URL}/api/v1/export/snapshots?${qs}`, {
-      cache: "no-store",
-    });
+    next: { revalidate: 0 },
+});
   } catch (err) {
   console.error(`[export proxy] fetch to Server failed:`, err instanceof Error ? err.message : String(err));
   return NextResponse.json({ error: "Could not reach API service" }, { status: 502 });

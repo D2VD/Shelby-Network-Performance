@@ -58,7 +58,7 @@ Ranked provider leaderboard.
 | Param | Type | Notes |
 |---|---|---|
 | `network` | string | Required |
-| `sort` | `reputation \| uptime \| stake` | Default `reputation` |
+| `sort` | `score \| uptime \| stake` | Default `score` |
 | `limit` | number | Default 20 |
 
 **Response**
@@ -103,9 +103,9 @@ Health history for a single provider.
 />
  
 {/* ── /v1/providers/leaderboard ────────────────────────────────────────── */}
-{/* NOTE: verify the exact accepted `sort` values against the live route —
-   observed default is "score"; roadmap doc separately lists
-   reputation|uptime|stake, which may or may not match current source. */}
+{/* sort options verified against api/src/routes/leaderboard.ts VALID_SORTS
+   (2026-08-22): score | uptime | stake. "reputation" is not a real value —
+   removed from both this block and the prose table above. */}
  
 <ApiPlayground
   method="GET"
@@ -113,7 +113,7 @@ Health history for a single provider.
   description="Ranked SP leaderboard."
   params={[
     { name: "network", type: "select", required: true, default: "shelbynet", options: ["shelbynet", "testnet", "mainnet"] },
-    { name: "sort", type: "select", default: "score", options: ["score", "reputation", "uptime", "stake"] },
+    { name: "sort", type: "select", default: "score", options: ["score", "uptime", "stake"] },
     { name: "limit", type: "number", default: "20" },
   ]}
 />

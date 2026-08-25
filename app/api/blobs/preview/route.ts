@@ -1,4 +1,49 @@
-// app/api/blobs/preview/route.ts — v1.4
+// app/api/blobs/preview/route.ts — v1.5
+//
+// CHANGES vs v1.4:
+// FIX: 502s on every preview request. Root cause confirmed 2026-08-25:
+//   `shelby.shelbynet.shelby.xyz` (the host this route used, copied from a
+//   DevTools capture of explorer.shelby.xyz's own preview flow) REQUIRES an
+//   Authorization: Bearer header — confirmed via direct curl, which returned
+//   an explicit "Unauthorized. Rejected because anonymous requests are not
+//   allowed" error, not a generic failure. This route was never sending one
+//   (the v1.4 comment claiming a "public-read pattern" for this host was
+//   incorrect — that assumption was carried over from a *different* host,
+//   api.shelbynet.shelby.xyz's Node REST API, and never independently
+//   verified for this gateway host specifically).
+//
+//   Cross-checked against a live DevTools capture of the Explorer's own
+//   OPTIONS preflight to this exact host: it shows
+//   `Access-Control-Request-Headers: authorization` /
+//   `Access-Control-Allow-Headers: authorization` — a browser only sends
+//   that preflight because the real follow-up GET carries a custom
+//   Authorization header. The Explorer's real flow authenticates here; ours
+//   silently didn't.
+//
+//   FIX APPLIED: switched the shelbynet gateway host to
+//   `api.shelbynet.shelby.xyz` instead — confirmed via direct curl to
+//   return a clean 200 with the identical 62,115-byte body (matches the
+//   Explorer's own displayed "60.66 KB" for the same blob, byte-exact), with
+//   NO Authorization header required. Same content, publicly served, zero
+//   key management needed on this edge route.
+//
+//   ⚠️ OPEN RISK, not fully resolved: `api.shelbynet.shelby.xyz`'s content-
+//   gateway path is not the host Shelby's own Explorer actually uses for
+//   this purpose — it may be an unofficial mirror, a different CDN tier, or
+//   simply undocumented, and there's no guarantee it stays public or stays
+//   in sync with the authenticated host long-term. If previews start 404ing
+//   or returning stale content again, re-check this host choice first
+//   before assuming a regression elsewhere. The more durable long-term fix,
+//   if this host ever stops working, is wiring this route to send a
+//   Bearer key against `shelby.shelbynet.shelby.xyz` — either via a
+//   dedicated Cloudflare Pages env var, or by proxying this call through
+//   the backend's existing shelbynetKeyRotator instead of duplicating key
+//   management on the edge. Deferred for now since the simpler fix works
+//   and is confirmed correct.
+//
+//   testnet gateway host (api.testnet.shelby.xyz) was NOT re-tested for the
+//   same auth requirement this session — it may or may not have the same
+//   issue. Low priority since testnet sync is otherwise retired project-wide.
 //
 // CHANGES vs v1.3:
 // FEATURE: testnet support. Previously hard-blocked to shelbynet only,
@@ -17,9 +62,9 @@
 // without checking — this project has already been burned once by an
 // assumed-symmetric hostname pattern.
 //
-// Path shape, no-auth-header rule, full-buffer-before-return fix, and the
-// X-Frame-Options override all carried over unchanged — nothing about
-// those was shelbynet-specific to begin with.
+// Path shape, full-buffer-before-return fix, and the X-Frame-Options
+// override all carried over unchanged — nothing about those was
+// shelbynet-specific to begin with.
 //
 // CHANGES vs v1.2:
 // FIX: ownerHex was only prepending "0x" when missing — it never padded
@@ -30,84 +75,38 @@
 //      unpadded to the gateway URL, which would 404/mismatch against the
 //      real on-chain path. Added normalizeOwnerAddress() mirroring the
 //      backend's normalizeAddress() logic: strip any "0x", left-pad the
-//      hex body to 64 chars with "0", re-prefix "0x". Confirmed via code
-//      review this had never actually been applied to this route — v1.1's
-//      and v1.2's changelogs only ever addressed the truncation/CSP bugs,
-//      not this one.
+//      hex body to 64 chars with "0", re-prefix "0x".
 //
 // CHANGES vs v1.1:
 // The corruption bug persisted after v1.1's arrayBuffer() fix was deployed
 // (confirmed via fresh incognito testing — ruled out browser cache as the
 // cause). Two changes to isolate this further:
-// 1. Removed the manually-set Content-Length header. Setting it explicitly
-//    from the buffered byte count is redundant (the runtime derives it
-//    correctly from an ArrayBuffer body on its own) and risky — if anything
-//    in the response path transforms the body after this function returns,
-//    a hand-set Content-Length can go stale and produce exactly this
-//    "looks complete, gets cut off" symptom. Letting the platform compute
-//    it removes an entire class of mismatch bugs.
-// 2. Added an X-Preview-Route-Version debug header. There is no equivalent
-//    of the VPS's "grep dist/ to confirm the new code is actually running"
-//    check for Cloudflare Pages deployments — this header exists solely so
-//    a redeploy can be confirmed unambiguously via response headers instead
-//    of assumed.
+// 1. Removed the manually-set Content-Length header — the runtime derives
+//    it correctly from an ArrayBuffer body on its own; a hand-set value can
+//    go stale and produce a "looks complete, gets cut off" symptom.
+// 2. Added an X-Preview-Route-Version debug header so a redeploy can be
+//    confirmed unambiguously via response headers instead of assumed.
 //
-// CHANGES vs v1.0 (all three confirmed via live DevTools testing this
-// session, not guessed):
-// FIX: Corrupted/truncated image bodies. Streaming upstream.body straight
-//      through was returning 200 + correct Content-Type but an incomplete
-//      body (DevTools Preview tab showed a partial render + checkerboard
-//      gap). Now buffers the full response via arrayBuffer() before
-//      returning it. Ruled out first: Cloudflare Hotlink Protection
-//      (confirmed OFF in dashboard) and browser extensions (reproduced in a
-//      clean profile) — this was a code bug, not an infra/extension issue.
-// FIX: PDF <iframe> preview blocked by the site-wide X-Frame-Options: deny
-//      (correct policy elsewhere). Now explicitly overridden to SAMEORIGIN
-//      on this route's response only.
+// CHANGES vs v1.0:
+// FIX: Corrupted/truncated image bodies — streaming upstream.body straight
+//      through returned 200 + correct Content-Type but an incomplete body.
+//      Now buffers the full response via arrayBuffer() before returning it.
+// FIX: PDF <iframe> preview blocked by the site-wide X-Frame-Options: deny.
+//      Now explicitly overridden to SAMEORIGIN on this route's response only.
 // EXPANDED: content-type map now covers xml/cfg/ini/yaml/yml/toml/env/conf
-//      and common code/text extensions (deliberately served as text/plain,
-//      not their "native" MIME type, to avoid script-execution risk on our
-//      own origin for anything resembling html/js/css).
+//      and common code/text extensions (served as text/plain, not their
+//      "native" MIME type, to avoid script-execution risk on our own origin).
 //
-
-// Thin edge proxy for Shelby's own public content gateway, confirmed live via
-// DevTools capture of explorer.shelby.xyz's own "File Preview" action:
-//
-//   GET https://shelby.shelbynet.shelby.xyz/shelby/v1/blobs/{owner_0x}/{blob_name}
-//   → 200 OK, Access-Control-Allow-Origin: *, Content-Type: application/octet-stream
-//
-// CORS is wide open on that endpoint, so this proxy exists NOT because direct
-// client access is blocked, but to:
-//   1. Normalize Content-Type — upstream always returns generic
-//      application/octet-stream, which some browsers won't render inline for
-//      PDFs/text/etc (images tend to work via MIME-sniffing, but it's not
-//      guaranteed across browsers, so we set it explicitly for every type).
-//   2. Set a clean Content-Disposition filename for the Download button.
-//   3. Give one seam to add auth/rate-limiting later without a frontend change.
-//
-// KEY FORMAT — do not confuse with the other two blob-key formats already in
-// use elsewhere in this codebase:
-//   - register_blob argument:              plain "{blob_name}"            (no owner)
-//   - get_blob_metadata /v1/view argument:  "@{owner_hex_NO_0x}/{blob_name}"
-//   - THIS gateway path:                    "{owner_hex_WITH_0x}/{blob_name}"
-//
-// SCOPE: shelbynet and testnet both supported as of v1.4. Their gateway
-// hosts were confirmed independently and are NOT the same pattern — see
-// GATEWAY_BY_NETWORK below. If a third network is ever added, its gateway
-// host must be independently confirmed too, not assumed from the other two.
-//
-// No Authorization header is sent — matches the public-read pattern already
-// established for api.shelbynet.shelby.xyz elsewhere in this project, though
-// note this is a *different* host, so that assumption is carried over rather
-// than independently re-confirmed for every path on shelby.shelbynet.shelby.xyz.
 
 export const runtime = "edge";
 
 // Gateway hosts are NOT symmetric across networks — do not derive one from
-// the other by string substitution. Each was independently confirmed via
-// live DevTools capture of explorer.shelby.xyz's own File Preview action.
+// the other by string substitution. shelbynet's host below is the CONFIRMED
+// PUBLIC, NO-AUTH-REQUIRED mirror (api.shelbynet.shelby.xyz), not the
+// authenticated host Shelby's own Explorer uses (shelby.shelbynet.shelby.xyz)
+// — see the v1.5 changelog above for why, and the open risk of relying on it.
 const GATEWAY_BY_NETWORK: Record<string, string> = {
-  shelbynet: "https://shelby.shelbynet.shelby.xyz/shelby/v1/blobs",
+  shelbynet: "https://api.shelbynet.shelby.xyz/shelby/v1/blobs",
   testnet: "https://api.testnet.shelby.xyz/shelby/v1/blobs",
 };
 const SUPPORTED_NETWORKS = Object.keys(GATEWAY_BY_NETWORK);
@@ -212,11 +211,8 @@ export async function GET(req: Request): Promise<Response> {
   // Buffer fully rather than pipe upstream.body through as a live stream.
   // CONFIRMED BUG (v1.1 session): streaming pass-through via
   // `new Response(upstream.body, ...)` was returning a 200 with the correct
-  // Content-Type, but a truncated/corrupted body — DevTools' own Preview tab
-  // showed a partial image render followed by a transparent/checkerboard
-  // gap, consistent with the stream being cut short before fully flushing.
-  // Buffering trades a moment of memory for a guaranteed-complete response;
-  // fine for preview-sized files.
+  // Content-Type, but a truncated/corrupted body. Buffering trades a moment
+  // of memory for a guaranteed-complete response; fine for preview-sized files.
   let bytes: ArrayBuffer;
   try {
     bytes = await upstream.arrayBuffer();
@@ -231,15 +227,11 @@ export async function GET(req: Request): Promise<Response> {
       "Content-Disposition": `${disposition}; filename="${filename}"`,
       "Cache-Control": "public, max-age=3600",
       // Overrides the site-wide X-Frame-Options: deny (correct policy
-      // elsewhere, per this project's security checklist) specifically for
-      // this route — needed so the PDF <iframe> preview (same-origin) isn't
-      // blocked. Confirmed this session: without this override, the browser
-      // refuses to frame our own preview URL and shows
-      // "shelbyanalytics.site refused to connect / ERR_BLOCKED_BY_RESPONSE".
+      // elsewhere) specifically for this route — needed so the PDF
+      // <iframe> preview (same-origin) isn't blocked.
       "X-Frame-Options": "SAMEORIGIN",
       // Debug marker only — confirms which version is actually live.
-      // Safe to remove once corruption bug is confirmed fixed.
-      "X-Preview-Route-Version": "1.4",
+      "X-Preview-Route-Version": "1.5",
     },
   });
 }

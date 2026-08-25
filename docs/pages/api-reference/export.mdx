@@ -1,5 +1,6 @@
 import { Callout } from 'nextra/components';
 import { ApiPlayground } from "../../components/ApiPlayground";
+import { ApiStreamPlayground } from "../../components/ApiStreamPlayground";
 
 # Export
 
@@ -48,18 +49,32 @@ import { ApiPlayground } from "../../components/ApiPlayground";
     { name: "to", type: "text", placeholder: "ISO timestamp, optional" },
   ]}
 />
- 
+
+**Response**: CSV file download.
+
+---
+
+## `GET /v1/activity/stream`
+
+Server-sent events (SSE), not a request/response call — the connection stays open and pushes named events as they happen: `blob_registered`, `blob_activated`, `blob_deleted`, `sp_joined`, `sp_left`, `sp_health_change`, `epoch_transition`, plus `connected` on open and periodic `heartbeat` keep-alives.
+
+<Callout type="info">
+  Events arrive in bursts on the backend's sync cadence (every few minutes), not instantly on registration — a quiet stream for a few minutes is expected, not a sign of a broken connection.
+</Callout>
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `network` | string | Required |
+
 {/* ── /v1/activity/stream ─────────────────────────────────────────────── */}
 {/* SSE endpoint — uses the separate stream-specific component, not ApiPlayground. */}
  
-import { ApiStreamPlayground } from "../../components/ApiStreamPlayground";
- 
 <ApiStreamPlayground
   path="/v1/activity/stream"
-  description="Live event feed: new blobs registered, SP join/leave, epoch transitions, PG status changes."
+  description="Live event feed: new blobs registered/activated/deleted, SP join/leave/health changes, epoch transitions."
   params={[
     { name: "network", type: "select", required: true, default: "shelbynet", options: ["shelbynet", "testnet", "mainnet"] },
   ]}
 />
-
-**Response**: CSV file download.

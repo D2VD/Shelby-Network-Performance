@@ -75,12 +75,42 @@ export function ApiStreamPlayground({
 
     es.onopen = () => setConnected(true);
 
-    es.onmessage = (e) => {
+    // EventSource's default onmessage ONLY fires for events with no `event:`
+    // field in the SSE frame. Every event this backend sends is named
+    // (connected, heartbeat, blob_registered, blob_activated, blob_deleted,
+    // sp_joined, sp_left, sp_health_change, epoch_transition) — so without
+    // explicit addEventListener calls per name, onmessage alone silently
+    // receives nothing at all, even on a fully healthy connection. Confirmed
+    // 2026-08-25: the connection showed live/green with real events arriving
+    // over the wire (verified via curl -N), but nothing ever rendered here.
+    const KNOWN_EVENT_TYPES = [
+      "connected",
+      "heartbeat",
+      "blob_registered",
+      "blob_activated",
+      "blob_deleted",
+      "sp_joined",
+      "sp_left",
+      "sp_health_change",
+      "epoch_transition",
+    ];
+
+    const logEvent = (type: string, data: string) => {
       setEvents((prev) => {
-        const next = [`${new Date().toLocaleTimeString()}  ${e.data}`, ...prev];
+        const next = [`${new Date().toLocaleTimeString()}  [${type}]  ${data}`, ...prev];
         return next.slice(0, maxEvents);
       });
     };
+
+    for (const type of KNOWN_EVENT_TYPES) {
+      es.addEventListener(type, (e: MessageEvent) => logEvent(type, e.data));
+    }
+
+    // Kept as a fallback for any future unnamed/default-message event —
+    // harmless no-op today since the backend never sends one, but avoids
+    // silently dropping a future addition again if someone forgets to
+    // update KNOWN_EVENT_TYPES above.
+    es.onmessage = (e) => logEvent("message", e.data);
 
     es.onerror = () => {
       setError("Connection error or stream closed");

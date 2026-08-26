@@ -230,7 +230,7 @@ function useNetworkConfig(network: NetworkKey) {
 
 // ── Shared sub-components ──────────────────────────────────────────────────────
 function StatCard({ label, value, sub, badge, accent }: {
-  label: string; value: string; sub?: string; badge?: React.ReactNode; accent?: boolean;
+  label: React.ReactNode; value: string; sub?: string; badge?: React.ReactNode; accent?: boolean;
 }) {
   return (
     <div className={`rounded-lg border p-4 space-y-1 ${accent ? "border-emerald-200 bg-emerald-50 dark:bg-emerald-950/20 dark:border-emerald-800" : "bg-muted/30"}`}>
@@ -299,8 +299,16 @@ function CostBarChart({ rows }: { rows: { name: string; cost: number; note: stri
           </span>
           <div className="h-6 bg-muted rounded-sm overflow-hidden">
             <div
-              className={`h-full rounded-sm transition-all duration-700 ease-out ${r.isShelby ? "bg-emerald-500" : "bg-muted-foreground/30"}`}
-              style={{ width: `${Math.max((r.cost / max) * 100, 2)}%` }}
+              className={`h-full rounded-sm transition-all duration-700 ease-out ${r.isShelby ? "bg-emerald-500" : ""}`}
+              style={{
+                width: `${Math.max((r.cost / max) * 100, 2)}%`,
+                // Explicit fallback color for competitor bars — doesn't rely on
+                // bg-muted-foreground/30 resolving correctly, which depends on
+                // --muted-foreground being wired as rgb/hsl channels for Tailwind's
+                // opacity-modifier syntax. Shelby's bar is a literal color and
+                // isn't affected either way.
+                backgroundColor: r.isShelby ? undefined : "rgba(113, 113, 122, 0.45)",
+              }}
             />
           </div>
           <span className={`text-xs font-mono tabular-nums w-36 text-right ${r.isShelby ? "text-emerald-700 font-semibold" : "text-muted-foreground"}`}>
@@ -374,11 +382,17 @@ function StorageCostContent({
   const [sizeUnit, setSizeUnit]   = useState<"MB" | "GB" | "TB">("GB");
   const [days, setDays]           = useState(30);
 
-  // Usage inputs — optional, monthly rates. Default 0 so the comparison
-  // reduces to storage-only until the person opts into modeling ops/egress.
-  const [monthlyWrites, setMonthlyWrites]   = useState(0);
-  const [monthlyReads, setMonthlyReads]     = useState(0);
-  const [monthlyEgressGB, setMonthlyEgress] = useState(0);
+  // Usage inputs — optional, monthly rates. Kept as raw strings so the <input>
+  // fully owns what's displayed (avoids the classic React controlled-number-input
+  // bug where typing over an unselected "0" leaves a stray leading zero in the
+  // DOM even though the parsed numeric value was already correct).
+  const [monthlyWritesInput, setMonthlyWritesInput] = useState("0");
+  const [monthlyReadsInput, setMonthlyReadsInput]   = useState("0");
+  const [monthlyEgressInput, setMonthlyEgressInput] = useState("0");
+
+  const monthlyWrites    = Math.max(0, Number(monthlyWritesInput) || 0);
+  const monthlyReads     = Math.max(0, Number(monthlyReadsInput)  || 0);
+  const monthlyEgressGB  = Math.max(0, Number(monthlyEgressInput) || 0);
 
   const { pricing, lastUpdated } = usePricing();
   const { chunkSizeBytes, chunkSizeMiB, isOnChain, isLoading: configLoading } = useNetworkConfig(network);
@@ -402,13 +416,16 @@ function StorageCostContent({
 
   const chartRows = [
     { name: "Shelby", cost: result.totalSUSD, note: "sUSD*", isShelby: true },
-    ...competitors.map((c) => ({
-      name: c.name,
-      cost: calcCompetitorCost(c, result.gbDecimal, days, monthlyWrites, monthlyReads, monthlyEgressGB),
-      note: "USD",
-      isShelby: false,
-    })),
-  ].filter((r) => r.cost > 0);
+    ...competitors
+      .map((c) => ({
+        name: c.name,
+        cost: calcCompetitorCost(c, result.gbDecimal, days, monthlyWrites, monthlyReads, monthlyEgressGB),
+        note: "USD",
+        isShelby: false,
+      }))
+      .filter((r) => r.cost > 0)
+      .sort((a, b) => a.cost - b.cost),
+  ];
 
   const hasUsageInputs = monthlyWrites > 0 || monthlyReads > 0 || monthlyEgressGB > 0;
 
@@ -476,33 +493,33 @@ function StorageCostContent({
             <div className="space-y-1">
               <span className="text-xs text-muted-foreground">Writes / mo</span>
               <Input
-                type="number"
-                min={0}
-                step={1000}
-                value={monthlyWrites}
-                onChange={(e) => setMonthlyWrites(Math.max(0, Number(e.target.value)))}
+                type="text"
+                inputMode="numeric"
+                value={monthlyWritesInput}
+                onChange={(e) => setMonthlyWritesInput(e.target.value.replace(/[^\d]/g, "").replace(/^0+(?=\d)/, ""))}
+                onBlur={() => setMonthlyWritesInput((v) => (v === "" ? "0" : v))}
                 className="w-32 h-8 text-sm"
               />
             </div>
             <div className="space-y-1">
               <span className="text-xs text-muted-foreground">Reads / mo</span>
               <Input
-                type="number"
-                min={0}
-                step={1000}
-                value={monthlyReads}
-                onChange={(e) => setMonthlyReads(Math.max(0, Number(e.target.value)))}
+                type="text"
+                inputMode="numeric"
+                value={monthlyReadsInput}
+                onChange={(e) => setMonthlyReadsInput(e.target.value.replace(/[^\d]/g, "").replace(/^0+(?=\d)/, ""))}
+                onBlur={() => setMonthlyReadsInput((v) => (v === "" ? "0" : v))}
                 className="w-32 h-8 text-sm"
               />
             </div>
             <div className="space-y-1">
               <span className="text-xs text-muted-foreground">Egress GB / mo</span>
               <Input
-                type="number"
-                min={0}
-                step={10}
-                value={monthlyEgressGB}
-                onChange={(e) => setMonthlyEgress(Math.max(0, Number(e.target.value)))}
+                type="text"
+                inputMode="numeric"
+                value={monthlyEgressInput}
+                onChange={(e) => setMonthlyEgressInput(e.target.value.replace(/[^\d]/g, "").replace(/^0+(?=\d)/, ""))}
+                onBlur={() => setMonthlyEgressInput((v) => (v === "" ? "0" : v))}
                 className="w-32 h-8 text-sm"
               />
             </div>
@@ -575,7 +592,7 @@ function StorageCostContent({
           <StatCard label="Chunks"           value={result.chunks.toLocaleString("en-US")} />
           <StatCard label="Epochs"           value={result.epochs.toLocaleString("en-US")} sub={`${nc.paymentEpochDays}d each`} />
           <StatCard label="Rate"             value={`${nc.microSUSDTotal} µsUSD`} sub="per chunk / epoch" />
-          <StatCard label="Total µShelbyUSD" value={result.totalMicroSUSD.toLocaleString("en-US")} accent />
+          <StatCard label={<>Total <span className="normal-case">µ</span>ShelbyUSD</>} value={result.totalMicroSUSD.toLocaleString("en-US")} accent />
         </div>
       </div>
 
@@ -625,7 +642,12 @@ function StorageCostContent({
                   Decentralised, cryptographic guarantees
                 </TableCell>
               </TableRow>
-              {competitors.map((c) => {
+              {[...competitors]
+                .sort((a, b) =>
+                  calcCompetitorCost(a, result.gbDecimal, days, monthlyWrites, monthlyReads, monthlyEgressGB) -
+                  calcCompetitorCost(b, result.gbDecimal, days, monthlyWrites, monthlyReads, monthlyEgressGB)
+                )
+                .map((c) => {
                 const cost = calcCompetitorCost(c, result.gbDecimal, days, monthlyWrites, monthlyReads, monthlyEgressGB);
                 return (
                   <TableRow key={c.name} className="hover:bg-muted/20">

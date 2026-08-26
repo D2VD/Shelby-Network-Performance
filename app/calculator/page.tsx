@@ -64,16 +64,20 @@ const DURATION_PRESETS = [
 ];
 
 // ── Competitor table & types ───────────────────────────────────────────────────
+// egressPerGB/putPer1000/getPer1000 mirror api/src/services/pricing-adapters.ts —
+// keep these two lists in sync if either changes.
 interface Competitor {
-  name: string; usdPerGBmo: number | null; model: string; note: string;
+  name: string; usdPerGBmo: number | null;
+  egressPerGB: number; putPer1000: number; getPer1000: number;
+  model: string; note: string;
 }
 const COMPETITORS: Competitor[] = [
-  { name: "AWS S3",        usdPerGBmo: 0.023,  model: "Monthly",  note: "Standard, us-east-1" },
-  { name: "Cloudflare R2", usdPerGBmo: 0.015,  model: "Monthly",  note: "No egress fees" },
-  { name: "Backblaze B2",  usdPerGBmo: 0.006,  model: "Monthly",  note: "Cheapest S3-compatible" },
-  { name: "Arweave",       usdPerGBmo: null,   model: "One-time", note: "~$4.00/GB upfront (permanent)" },
-  { name: "Filecoin",      usdPerGBmo: 0.0002, model: "Monthly",  note: "Variable, deal-based" },
-  { name: "IPFS (pinned)", usdPerGBmo: 0.10,   model: "Monthly",  note: "Via Pinata / NFT.Storage" },
+  { name: "AWS S3",        usdPerGBmo: 0.023,  egressPerGB: 0.09, putPer1000: 0.005,  getPer1000: 0.0004,  model: "Monthly",  note: "Standard, us-east-1" },
+  { name: "Cloudflare R2", usdPerGBmo: 0.015,  egressPerGB: 0,    putPer1000: 0.0045, getPer1000: 0.00036, model: "Monthly",  note: "No egress fees" },
+  { name: "Backblaze B2",  usdPerGBmo: 0.006,  egressPerGB: 0.01, putPer1000: 0,      getPer1000: 0.004,   model: "Monthly",  note: "Cheapest S3-compatible" },
+  { name: "Arweave",       usdPerGBmo: null,   egressPerGB: 0,    putPer1000: 0,      getPer1000: 0,       model: "One-time", note: "~$4.00/GB upfront (permanent)" },
+  { name: "Filecoin",      usdPerGBmo: 0.0002, egressPerGB: 0,    putPer1000: 0,      getPer1000: 0,       model: "Monthly",  note: "Variable, deal-based" },
+  { name: "IPFS (pinned)", usdPerGBmo: 0.10,   egressPerGB: 0,    putPer1000: 0,      getPer1000: 0,       model: "Monthly",  note: "Via Pinata / NFT.Storage" },
 ];
 
 interface LivePricingProvider {
@@ -111,6 +115,37 @@ function bytesToDisplay(b: number): string {
   if (b >= 1e9)  return `${num(b / 1e9,  2)} GB`;
   if (b >= 1e6)  return `${num(b / 1e6,  2)} MB`;
   return `${num(b / 1e3, 2)} KB`;
+}
+
+/**
+ * Full competitor TCO: storage + egress + write ops + read ops, all scaled to
+ * the selected duration. Previously this only priced storage, silently
+ * dropping egress/put/get even though live pricing data already carried them.
+ *
+ * writes/reads/egressGB are treated as MONTHLY rates (same convention as
+ * usdPerGBmo) and scaled by days/30, consistent with how storage cost scales.
+ *
+ * Arweave (usdPerGBmo === null) is a flat one-time-per-GB model with no
+ * metered egress on its public gateways — ops/egress intentionally not
+ * modeled for that case.
+ */
+function calcCompetitorCost(
+  c: Competitor,
+  gbDecimal: number,
+  days: number,
+  monthlyWrites: number,
+  monthlyReads: number,
+  monthlyEgressGB: number,
+): number {
+  if (c.usdPerGBmo === null) return 4 * gbDecimal;
+
+  const monthsFactor = days / 30;
+  const storageCost  = c.usdPerGBmo * gbDecimal * monthsFactor;
+  const egressCost   = c.egressPerGB * monthlyEgressGB * monthsFactor;
+  const putCost      = (monthlyWrites / 1000) * c.putPer1000 * monthsFactor;
+  const getCost      = (monthlyReads  / 1000) * c.getPer1000 * monthsFactor;
+
+  return storageCost + egressCost + putCost + getCost;
 }
 
 // ── Calculation engines ────────────────────────────────────────────────────────
@@ -339,6 +374,12 @@ function StorageCostContent({
   const [sizeUnit, setSizeUnit]   = useState<"MB" | "GB" | "TB">("GB");
   const [days, setDays]           = useState(30);
 
+  // Usage inputs — optional, monthly rates. Default 0 so the comparison
+  // reduces to storage-only until the person opts into modeling ops/egress.
+  const [monthlyWrites, setMonthlyWrites]   = useState(0);
+  const [monthlyReads, setMonthlyReads]     = useState(0);
+  const [monthlyEgressGB, setMonthlyEgress] = useState(0);
+
   const { pricing, lastUpdated } = usePricing();
   const { chunkSizeBytes, chunkSizeMiB, isOnChain, isLoading: configLoading } = useNetworkConfig(network);
 
@@ -351,6 +392,9 @@ function StorageCostContent({
     ? pricing.providers.map((p) => ({
         name: p.name,
         usdPerGBmo: p.storagePerGBMonth,
+        egressPerGB: p.egressPerGB,
+        putPer1000: p.putPer1000,
+        getPer1000: p.getPer1000,
         model: p.model.charAt(0).toUpperCase() + p.model.slice(1),
         note: p.note,
       }))
@@ -360,13 +404,13 @@ function StorageCostContent({
     { name: "Shelby", cost: result.totalSUSD, note: "sUSD*", isShelby: true },
     ...competitors.map((c) => ({
       name: c.name,
-      cost: c.usdPerGBmo !== null
-        ? c.usdPerGBmo * result.gbDecimal * (days / 30)
-        : 4 * result.gbDecimal,
+      cost: calcCompetitorCost(c, result.gbDecimal, days, monthlyWrites, monthlyReads, monthlyEgressGB),
       note: "USD",
       isShelby: false,
     })),
   ].filter((r) => r.cost > 0);
+
+  const hasUsageInputs = monthlyWrites > 0 || monthlyReads > 0 || monthlyEgressGB > 0;
 
   return (
     <div className="space-y-6">
@@ -419,6 +463,55 @@ function StorageCostContent({
             <DurationPills days={days} onChange={setDays} />
           </div>
 
+        </div>
+
+        <div className="h-px w-full bg-border my-4" />
+
+        {/* Usage — optional, drives competitor egress/ops cost */}
+        <div className="space-y-1.5">
+          <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Usage <span className="font-normal normal-case text-muted-foreground/70">— optional, monthly rate</span>
+          </Label>
+          <div className="flex flex-wrap gap-4 items-end">
+            <div className="space-y-1">
+              <span className="text-xs text-muted-foreground">Writes / mo</span>
+              <Input
+                type="number"
+                min={0}
+                step={1000}
+                value={monthlyWrites}
+                onChange={(e) => setMonthlyWrites(Math.max(0, Number(e.target.value)))}
+                className="w-32 h-8 text-sm"
+              />
+            </div>
+            <div className="space-y-1">
+              <span className="text-xs text-muted-foreground">Reads / mo</span>
+              <Input
+                type="number"
+                min={0}
+                step={1000}
+                value={monthlyReads}
+                onChange={(e) => setMonthlyReads(Math.max(0, Number(e.target.value)))}
+                className="w-32 h-8 text-sm"
+              />
+            </div>
+            <div className="space-y-1">
+              <span className="text-xs text-muted-foreground">Egress GB / mo</span>
+              <Input
+                type="number"
+                min={0}
+                step={10}
+                value={monthlyEgressGB}
+                onChange={(e) => setMonthlyEgress(Math.max(0, Number(e.target.value)))}
+                className="w-32 h-8 text-sm"
+              />
+            </div>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {hasUsageInputs
+              ? "Competitor costs below include egress and per-operation charges."
+              : "Left at 0, competitor costs below reflect storage only — most providers also charge for egress and operations."}
+          </p>
         </div>
       </div>
 
@@ -495,6 +588,7 @@ function StorageCostContent({
           <CostBarChart rows={chartRows} />
           <p className="text-xs text-muted-foreground mt-4">
             * ShelbyUSD ≠ USD — exchange rate not established on {nc.label}. Comparison is directional only.
+            {" "}Competitor bars include storage{hasUsageInputs ? " + egress + operations" : " only — add Usage above for full TCO"}.
           </p>
         </div>
       </div>
@@ -510,8 +604,8 @@ function StorageCostContent({
               <TableRow className="bg-muted/30">
                 <TableHead className="min-w-[130px]">Provider</TableHead>
                 <TableHead className="min-w-[90px]">Model</TableHead>
-                <TableHead className="text-right min-w-[160px]">Est. Cost</TableHead>
-                <TableHead className="text-right min-w-[130px]">Per GB/mo</TableHead>
+                <TableHead className="text-right min-w-[160px]">Est. Cost (TCO)</TableHead>
+                <TableHead className="text-right min-w-[130px]">Storage/GB/mo</TableHead>
                 <TableHead className="min-w-[200px]">Note</TableHead>
               </TableRow>
             </TableHeader>
@@ -532,14 +626,13 @@ function StorageCostContent({
                 </TableCell>
               </TableRow>
               {competitors.map((c) => {
-                const cost = c.usdPerGBmo !== null
-                  ? c.usdPerGBmo * result.gbDecimal * (days / 30) : null;
+                const cost = calcCompetitorCost(c, result.gbDecimal, days, monthlyWrites, monthlyReads, monthlyEgressGB);
                 return (
                   <TableRow key={c.name} className="hover:bg-muted/20">
                     <TableCell className="font-medium text-sm">{c.name}</TableCell>
                     <TableCell className="text-sm text-muted-foreground">{c.model}</TableCell>
                     <TableCell className="text-right font-mono text-sm">
-                      {cost !== null ? `$${num(cost, 4)}` : "Variable"}
+                      {c.usdPerGBmo !== null ? `$${num(cost, 4)}` : "Variable"}
                     </TableCell>
                     <TableCell className="text-right font-mono text-sm text-muted-foreground">
                       {c.usdPerGBmo !== null ? `$${c.usdPerGBmo}` : "—"}

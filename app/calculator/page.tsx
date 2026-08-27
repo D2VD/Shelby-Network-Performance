@@ -104,6 +104,25 @@ interface NetworkConfig {
   resourceType:   string | null;
   fieldName:      string | null;
   fetchedAt:      string;
+
+  // Payment tier + epoch durations — independent source flag from chunk size,
+  // since these come from different on-chain resources and can fail
+  // independently (see api/src/services/network-config.ts v1.2).
+  microSUSDSP:      number | null;
+  microSUSDAdmin:   number | null;
+  microSUSDTotal:   number | null;
+  paymentEpochDays: number | null;
+  stakingEpochDays: number | null;
+  auditEpochHours:  number | null;
+  ratesSource:      "on-chain" | "fallback";
+}
+
+interface NetworkRates {
+  microSUSDTotal:   number;
+  microSUSDSP:      number;
+  microSUSDAdmin:   number;
+  paymentEpochDays: number;
+  stakingEpochDays: number;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -154,11 +173,10 @@ interface StorageResult {
   totalMicroSUSD: number; totalSUSD: number;
   perMonthSUSD: number; perGBMonthSUSD: number; gbDecimal: number;
 }
-function calcStorage(sizeBytes: number, days: number, net: NetworkKey, chunkSizeBytes: number): StorageResult {
-  const c = NETWORK_CONSTANTS[net];
+function calcStorage(sizeBytes: number, days: number, chunkSizeBytes: number, rates: NetworkRates): StorageResult {
   const chunks         = Math.ceil(sizeBytes / chunkSizeBytes);
-  const epochs         = Math.ceil(days / c.paymentEpochDays);
-  const totalMicroSUSD = chunks * epochs * c.microSUSDTotal;
+  const epochs         = Math.ceil(days / rates.paymentEpochDays);
+  const totalMicroSUSD = chunks * epochs * rates.microSUSDTotal;
   const totalSUSD      = totalMicroSUSD / 1_000_000;
   const perMonthSUSD   = days > 0 ? (totalSUSD / days) * 30 : 0;
   const gbDecimal      = sizeBytes / 1e9;
@@ -171,10 +189,9 @@ interface SPResult {
   rewardPerMonthSUSD: number; rewardPerYearSUSD: number;
   breakEvenDays: number | null;
 }
-function calcSP(stakeApt: number, chunks: number, net: NetworkKey): SPResult {
-  const c                  = NETWORK_CONSTANTS[net];
-  const rewardPerEpochSUSD = (chunks * c.microSUSDSP) / 1_000_000;
-  const rewardPerDaySUSD   = rewardPerEpochSUSD / c.paymentEpochDays;
+function calcSP(stakeApt: number, chunks: number, rates: NetworkRates): SPResult {
+  const rewardPerEpochSUSD = (chunks * rates.microSUSDSP) / 1_000_000;
+  const rewardPerDaySUSD   = rewardPerEpochSUSD / rates.paymentEpochDays;
   const rewardPerMonthSUSD = rewardPerDaySUSD * 30;
   const rewardPerYearSUSD  = rewardPerDaySUSD * 365;
   const stakeValueSUSD     = stakeApt * 10;
@@ -217,18 +234,69 @@ function useNetworkConfig(network: NetworkKey) {
       .then((d: NetworkConfig | null) => {
         if (d?.chunkSizeBytes) setConfig(d);
       })
-      .catch(() => {/* fall back to DEFAULT_CHUNK_SIZE_BYTES below */})
+      .catch(() => {/* fall back to DEFAULT_CHUNK_SIZE_BYTES / NETWORK_CONSTANTS below */})
       .finally(() => setIsLoading(false));
   }, [network]);
+
+  const fallback = NETWORK_CONSTANTS[network];
 
   const chunkSizeBytes = config?.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES;
   const chunkSizeMiB   = chunkSizeBytes / 1_048_576;
   const isOnChain      = config?.source === "on-chain";
 
-  return { chunkSizeBytes, chunkSizeMiB, isOnChain, isLoading, config };
+  // Rates have their own on-chain flag — separate resource, separate failure
+  // mode from chunk size. Falls back to NETWORK_CONSTANTS when unavailable.
+  const isRatesOnChain = config?.ratesSource === "on-chain";
+  const rates: NetworkRates = isRatesOnChain
+    ? {
+        microSUSDSP:      config!.microSUSDSP!,
+        microSUSDAdmin:   config!.microSUSDAdmin!,
+        microSUSDTotal:   config!.microSUSDTotal!,
+        paymentEpochDays: config!.paymentEpochDays!,
+        stakingEpochDays: config!.stakingEpochDays!,
+      }
+    : {
+        microSUSDSP:      fallback.microSUSDSP,
+        microSUSDAdmin:   fallback.microSUSDAdmin,
+        microSUSDTotal:   fallback.microSUSDTotal,
+        paymentEpochDays: fallback.paymentEpochDays,
+        stakingEpochDays: fallback.stakingEpochDays,
+      };
+
+  return { chunkSizeBytes, chunkSizeMiB, isOnChain, rates, isRatesOnChain, isLoading, config };
 }
 
 // ── Shared sub-components ──────────────────────────────────────────────────────
+// Dependency-free tooltip — works via hover on desktop and tap on mobile
+// (no Radix/shadcn Tooltip provider required, so it doesn't depend on
+// whichever tooltip setup may or may not already be wired app-wide).
+function InfoTooltip({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <span className="relative inline-flex group align-middle">
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); setOpen((o) => !o); }}
+        onBlur={() => setOpen(false)}
+        aria-label={text}
+        className="text-muted-foreground/70 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-full"
+      >
+        <Info className="h-3 w-3" />
+      </button>
+      <span
+        role="tooltip"
+        className={`pointer-events-none absolute z-50 left-1/2 -translate-x-1/2 bottom-full mb-1.5
+          w-52 rounded-md border bg-popover px-2.5 py-1.5 text-[11px] normal-case font-normal
+          leading-snug text-popover-foreground shadow-md transition-opacity duration-150
+          ${open ? "opacity-100" : "opacity-0"} group-hover:opacity-100`}
+      >
+        {text}
+      </span>
+    </span>
+  );
+}
+
 function StatCard({ label, value, sub, badge, accent }: {
   label: React.ReactNode; value: string; sub?: string; badge?: React.ReactNode; accent?: boolean;
 }) {
@@ -259,7 +327,7 @@ function DurationPills({ days, onChange }: { days: number; onChange: (d: number)
           className={`px-3 py-1.5 rounded-md text-sm font-medium border transition-all
             focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring
             ${days === p.days && !custom
-              ? "bg-primary text-primary-foreground border-primary shadow-sm"
+              ? "bg-emerald-600 text-white border-emerald-600 shadow-sm"
               : "bg-background border-border text-muted-foreground hover:bg-muted hover:text-foreground"
             }`}
         >
@@ -279,7 +347,7 @@ function DurationPills({ days, onChange }: { days: number; onChange: (d: number)
             const n = parseInt(e.target.value, 10);
             if (!isNaN(n) && n > 0) onChange(n);
           }}
-          className={`w-24 h-8 text-sm ${custom && !isPreset ? "border-primary ring-1 ring-primary" : ""}`}
+          className={`w-24 h-8 text-sm ${custom && !isPreset ? "border-emerald-600 ring-1 ring-emerald-600" : ""}`}
         />
         <span className="text-xs text-muted-foreground">days</span>
       </div>
@@ -349,16 +417,16 @@ function ModeSwitcher({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => v
             rounded-xl border p-4 text-left transition-all duration-150
             focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring
             ${mode === o.key
-              ? "border-primary bg-primary/5 shadow-sm"
+              ? "border-emerald-600 bg-emerald-50 dark:bg-emerald-950/20 shadow-sm"
               : "border-border bg-card hover:border-foreground/20 hover:bg-muted/40"
             }
           `}
         >
-          <div className={`flex items-center gap-2 mb-1 font-semibold text-sm ${mode === o.key ? "text-primary" : "text-foreground"}`}>
+          <div className={`flex items-center gap-2 mb-1 font-semibold text-sm ${mode === o.key ? "text-emerald-700 dark:text-emerald-400" : "text-foreground"}`}>
             {o.icon}
             {o.title}
             {mode === o.key && (
-              <span className="ml-auto text-[10px] font-medium uppercase tracking-wider text-primary bg-primary/10 px-1.5 py-0.5 rounded">
+              <span className="ml-auto text-[10px] font-medium uppercase tracking-wider text-emerald-700 dark:text-emerald-400 bg-emerald-100 dark:bg-emerald-900/40 px-1.5 py-0.5 rounded">
                 Active
               </span>
             )}
@@ -395,11 +463,11 @@ function StorageCostContent({
   const monthlyEgressGB  = Math.max(0, Number(monthlyEgressInput) || 0);
 
   const { pricing, lastUpdated } = usePricing();
-  const { chunkSizeBytes, chunkSizeMiB, isOnChain, isLoading: configLoading } = useNetworkConfig(network);
+  const { chunkSizeBytes, chunkSizeMiB, isOnChain, rates, isRatesOnChain, isLoading: configLoading } = useNetworkConfig(network);
 
   const unitBytes: Record<"MB" | "GB" | "TB", number> = { MB: 1e6, GB: 1e9, TB: 1e12 };
   const sizeBytes = sizeValue * unitBytes[sizeUnit];
-  const result    = calcStorage(sizeBytes, days, network, chunkSizeBytes);
+  const result    = calcStorage(sizeBytes, days, chunkSizeBytes, rates);
   const nc        = NETWORK_CONSTANTS[network];
 
   const competitors: Competitor[] = pricing?.providers
@@ -565,7 +633,7 @@ function StorageCostContent({
 
         </div>
         <p className="text-xs text-muted-foreground mt-4">
-          {nc.microSUSDTotal} µShelbyUSD · chunk⁻¹ · epoch⁻¹ · 1 epoch = {nc.paymentEpochDays} day
+          {rates.microSUSDTotal} µShelbyUSD · chunk⁻¹ · epoch⁻¹ · 1 epoch = {rates.paymentEpochDays} day
         </p>
       </div>
 
@@ -575,10 +643,13 @@ function StorageCostContent({
           <BarChart2 className="h-3.5 w-3.5" /> Calculation Breakdown
         </p>
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-          <StatCard label="Storage Size" value={bytesToDisplay(sizeBytes)} />
-          <StatCard 
-            label="Chunk Size" 
-            value={`${num(chunkSizeMiB)} MiB`} 
+          <StatCard
+            label={<>Storage Size <InfoTooltip text="The total amount of data you're storing, converted to bytes for the calculation." /></>}
+            value={bytesToDisplay(sizeBytes)}
+          />
+          <StatCard
+            label={<>Chunk Size <InfoTooltip text="Chunks are fixed-size (~1 MiB) portions of a Chunkset, formed by erasure-coding. 'On-chain' means this value was fetched live; 'assumed' means the live fetch failed or returned no value." /></>}
+            value={`${num(chunkSizeMiB)} MiB`}
             badge={
               configLoading ? (
                 <div className="text-muted-foreground text-xs">fetching...</div>
@@ -589,10 +660,34 @@ function StorageCostContent({
               )
             }
           />
-          <StatCard label="Chunks"           value={result.chunks.toLocaleString("en-US")} />
-          <StatCard label="Epochs"           value={result.epochs.toLocaleString("en-US")} sub={`${nc.paymentEpochDays}d each`} />
-          <StatCard label="Rate"             value={`${nc.microSUSDTotal} µsUSD`} sub="per chunk / epoch" />
-          <StatCard label={<>Total <span className="normal-case">µ</span>ShelbyUSD</>} value={result.totalMicroSUSD.toLocaleString("en-US")} accent />
+          <StatCard
+            label={<>Chunks <InfoTooltip text="Storage size divided by chunk size, rounded up: how many chunks your data is split into." /></>}
+            value={result.chunks.toLocaleString("en-US")}
+          />
+          <StatCard
+            label={<>Epochs <InfoTooltip text="Your selected duration divided by the payment epoch length — how many billing cycles you're paying for." /></>}
+            value={result.epochs.toLocaleString("en-US")}
+            sub={`${rates.paymentEpochDays}d each`}
+          />
+          <StatCard
+            label={<>Rate <InfoTooltip text="Combined payment (storage-provider share + admin share) charged per chunk, per epoch. 'On-chain' means this was fetched live from PaymentTiers; 'assumed' means the live fetch failed and a last-known default is shown." /></>}
+            value={`${rates.microSUSDTotal} µsUSD`}
+            sub="per chunk / epoch"
+            badge={
+              configLoading ? (
+                <div className="text-muted-foreground text-xs">fetching...</div>
+              ) : isRatesOnChain ? (
+                <div className="text-green-600 dark:text-green-400 text-xs font-medium">on-chain ✓</div>
+              ) : (
+                <div className="text-orange-500 text-xs font-medium">assumed</div>
+              )
+            }
+          />
+          <StatCard
+            label={<>Total <span className="normal-case">µ</span>ShelbyUSD <InfoTooltip text="Chunks × Epochs × Rate. 1 ShelbyUSD = 1,000,000 µShelbyUSD." /></>}
+            value={result.totalMicroSUSD.toLocaleString("en-US")}
+            accent
+          />
         </div>
       </div>
 
@@ -707,8 +802,8 @@ function SPEconomicsContent({ network }: { network: NetworkKey }) {
   const [stakeApt, setStakeApt] = useState(1000);
   const [chunks, setChunks]     = useState(10000);
 
-  const { chunkSizeBytes } = useNetworkConfig(network);
-  const result = calcSP(stakeApt, chunks, network);
+  const { chunkSizeBytes, rates, isRatesOnChain, isLoading: ratesLoading } = useNetworkConfig(network);
+  const result = calcSP(stakeApt, chunks, rates);
   const nc     = NETWORK_CONSTANTS[network];
 
   const projections = [
@@ -807,7 +902,7 @@ function SPEconomicsContent({ network }: { network: NetworkKey }) {
 
         </div>
         <p className="text-xs text-muted-foreground mt-4">
-          {nc.microSUSDSP} µsUSD / chunk / epoch (SP share, excl. {nc.microSUSDAdmin} µ admin)
+          {rates.microSUSDSP} µsUSD / chunk / epoch (SP share, excl. {rates.microSUSDAdmin} µ admin)
           · break-even assumes 1 APT = 10 sUSD (placeholder)
         </p>
       </div>
@@ -818,12 +913,25 @@ function SPEconomicsContent({ network }: { network: NetworkKey }) {
           <BarChart2 className="h-3.5 w-3.5" /> Economics Breakdown
         </p>
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-          <StatCard label="Stake"        value={`${stakeApt.toLocaleString("en-US")} APT`} />
-          <StatCard label="Chunks/epoch" value={chunks.toLocaleString("en-US")} />
-          <StatCard label="SP rate"      value={`${nc.microSUSDSP} µsUSD`} sub="per chunk / epoch" />
-          <StatCard label="Daily"        value={`${num(result.rewardPerDaySUSD, 4)}`} sub="sUSD / day" />
-          <StatCard label="Monthly"      value={`${num(result.rewardPerMonthSUSD, 2)}`} sub="sUSD / mo" />
-          <StatCard label="Yearly"       value={`${num(result.rewardPerYearSUSD, 2)}`} sub="sUSD / yr" accent />
+          <StatCard label={<>Stake <InfoTooltip text="The amount of APT this storage provider has staked to participate." /></>} value={`${stakeApt.toLocaleString("en-US")} APT`} />
+          <StatCard label={<>Chunks/epoch <InfoTooltip text="How many chunks of data this SP is expected to hold and serve per epoch, based on network demand." /></>} value={chunks.toLocaleString("en-US")} />
+          <StatCard
+            label={<>SP rate <InfoTooltip text="The storage-provider's share of the per-chunk, per-epoch payment (excludes the admin share). 'On-chain' means fetched live from PaymentTiers; 'assumed' means a last-known default is shown." /></>}
+            value={`${rates.microSUSDSP} µsUSD`}
+            sub="per chunk / epoch"
+            badge={
+              ratesLoading ? (
+                <div className="text-muted-foreground text-xs">fetching...</div>
+              ) : isRatesOnChain ? (
+                <div className="text-green-600 dark:text-green-400 text-xs font-medium">on-chain ✓</div>
+              ) : (
+                <div className="text-orange-500 text-xs font-medium">assumed</div>
+              )
+            }
+          />
+          <StatCard label={<>Daily <InfoTooltip text="Estimated reward for one payment epoch (currently 1 day)." /></>} value={`${num(result.rewardPerDaySUSD, 4)}`} sub="sUSD / day" />
+          <StatCard label={<>Monthly <InfoTooltip text="Daily reward × ~30 days." /></>} value={`${num(result.rewardPerMonthSUSD, 2)}`} sub="sUSD / mo" />
+          <StatCard label={<>Yearly <InfoTooltip text="Daily reward × 365 days." /></>} value={`${num(result.rewardPerYearSUSD, 2)}`} sub="sUSD / yr" accent />
         </div>
       </div>
 
@@ -894,6 +1002,7 @@ export default function CalculatorPage() {
   const [mode, setMode]       = useState<Mode>("storage");
   const [network, setNetwork] = useState<NetworkKey>("shelbynet");
   const nc                    = NETWORK_CONSTANTS[network];
+  const { rates, isRatesOnChain } = useNetworkConfig(network);
 
   return (
     <div className="min-h-screen bg-background">
@@ -931,10 +1040,10 @@ export default function CalculatorPage() {
         {/* ── Network info chips ── */}
         <div className="flex flex-wrap gap-2 text-xs">
           {[
-            { label: "Rate",          value: `${nc.microSUSDTotal} µsUSD / chunk / epoch` },
-            { label: "SP share",      value: `${nc.microSUSDSP} µ · Admin ${nc.microSUSDAdmin} µ` },
-            { label: "Payment epoch", value: `${nc.paymentEpochDays} day` },
-            { label: "Staking epoch", value: `${nc.stakingEpochDays} days` },
+            { label: "Rate",          value: `${rates.microSUSDTotal} µsUSD / chunk / epoch` },
+            { label: "SP share",      value: `${rates.microSUSDSP} µ · Admin ${rates.microSUSDAdmin} µ` },
+            { label: "Payment epoch", value: `${rates.paymentEpochDays} day` },
+            { label: "Staking epoch", value: `${rates.stakingEpochDays} days` },
             { label: "Contract",      value: nc.contractShort },
           ].map((chip) => (
             <div key={chip.label}
@@ -943,6 +1052,12 @@ export default function CalculatorPage() {
               <span className="font-medium font-mono">{chip.value}</span>
             </div>
           ))}
+          {!isRatesOnChain && (
+            <div className="flex items-center gap-1.5 rounded-full border border-orange-200 bg-orange-50 dark:bg-orange-950/20 px-3 py-1 text-orange-600 dark:text-orange-400">
+              <Info className="h-3 w-3" />
+              Rate/epoch values assumed — live on-chain fetch unavailable
+            </div>
+          )}
         </div>
 
         {/* ── Mode switcher — card-based ── */}

@@ -74,6 +74,66 @@
   --font-mono:     'Roboto Mono', 'SF Mono', 'Fira Code', monospace;
 }
 
+:root {
+  --background-hsl:         0 0% 100%;      /* from --bg-primary #fff */
+  --foreground-hsl:         24 24% 4%;      /* from --text-primary #0d0a08 */
+
+  --card-hsl:                0 0% 100%;     /* from --bg-card #fff */
+  --card-foreground-hsl:    24 24% 4%;      /* from --text-primary */
+
+  --popover-hsl:             0 0% 100%;     /* from --bg-card */
+  --popover-foreground-hsl: 24 24% 4%;      /* from --text-primary */
+
+  --primary-hsl:            324 100% 73%;   /* from --shelby-pink #ff77c9 */
+  --primary-foreground-hsl: 0 0% 100%;      /* white text on pink */
+
+  --secondary-hsl:           0 0% 96%;      /* from --bg-card2 #f5f5f5 */
+  --secondary-foreground-hsl: 24 24% 4%;    /* from --text-primary */
+
+  --muted-hsl:                0 0% 96%;     /* from --bg-card2 */
+  --muted-foreground-hsl:   22 5% 40%;      /* from --text-muted #6b6460 */
+
+  --accent-hsl:              0 0% 96%;      /* from --bg-card2, subtle hover tint */
+  --accent-foreground-hsl:  24 24% 4%;      /* from --text-primary */
+
+  --destructive-hsl:          0 84% 60%;    /* standard red — no existing token */
+  --destructive-foreground-hsl: 0 0% 100%;
+
+  --border-hsl:              0 0% 91%;      /* from --border #e8e8e8 */
+  --input-hsl:                0 0% 96%;     /* from --bg-input, approx */
+  --ring-hsl:               324 100% 73%;   /* from --shelby-pink, matches primary */
+}
+
+[data-theme="dark"] {
+  --background-hsl:         24 24% 4%;      /* from --bg-primary #0d0a08 */
+  --foreground-hsl:         29 21% 93%;     /* from --text-primary #f0ece8 */
+
+  --card-hsl:               23 24% 8%;      /* from --bg-card #1a1410 */
+  --card-foreground-hsl:    29 21% 93%;
+
+  --popover-hsl:            23 24% 8%;      /* from --bg-card */
+  --popover-foreground-hsl: 29 21% 93%;
+
+  --primary-hsl:            324 100% 73%;   /* --accent stays #ff77c9 in dark too */
+  --primary-foreground-hsl: 24 24% 4%;      /* dark text on pink reads better in dark mode */
+
+  --secondary-hsl:          28 23% 11%;     /* from --bg-card2 #231c16 */
+  --secondary-foreground-hsl: 29 21% 93%;
+
+  --muted-hsl:              28 23% 11%;     /* from --bg-card2 */
+  --muted-foreground-hsl:   26 11% 49%;     /* from --text-muted #8a7a6e */
+
+  --accent-hsl:             28 23% 11%;     /* from --bg-card2 */
+  --accent-foreground-hsl:  29 21% 93%;
+
+  --destructive-hsl:         0 70% 55%;
+  --destructive-foreground-hsl: 0 0% 100%;
+
+  --border-hsl:             27 31% 14%;     /* from --border #2e2218 */
+  --input-hsl:              23 24% 8%;      /* approx, matches --bg-card dark */
+  --ring-hsl:               324 100% 73%;
+}
+
 /* Apply globally */
 body {
   font-family: var(--font-body);
